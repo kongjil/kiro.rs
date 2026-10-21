@@ -13,7 +13,6 @@ use bytes::Bytes;
 use futures::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 use crate::admin::trace_db::TraceSink;
 
@@ -104,7 +103,7 @@ pub struct WebSearchResult {
     pub public_domain: Option<bool>,
 }
 
-fn is_native_web_search_tool(t: &crate::anthropic::types::Tool) -> bool {
+pub(crate) fn is_native_web_search_tool(t: &crate::anthropic::types::Tool) -> bool {
     t.name == "web_search"
         && t.tool_type
             .as_deref()
@@ -113,22 +112,28 @@ fn is_native_web_search_tool(t: &crate::anthropic::types::Tool) -> bool {
 
 /// 检查请求是否为纯 WebSearch 请求
 ///
-/// 条件：tools 有且只有一个，且为 Anthropic 原生 web_search 工具。
+/// 条件：tools 有且只有一个，且为 Anthropic 原生 web_search 工具；
+/// `tool_choice: none` 显式禁止工具调用，不进入搜索通道。
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
-    req.tools.as_ref().is_some_and(|tools| {
-        tools.len() == 1 && tools.first().is_some_and(is_native_web_search_tool)
-    })
+    !super::converter::tool_choice_is_none(req)
+        && req.tools.as_ref().is_some_and(|tools| {
+            tools.len() == 1 && tools.first().is_some_and(is_native_web_search_tool)
+        })
 }
 
-/// Checks whether the request is a "mixed-tools set that contains web_search" case
+/// 是否需要进入内部 agentic 循环：工具集里含 web_search 或 web_fetch。
 ///
-/// Mutually exclusive with [`has_web_search_tool`]: that one is the pure single-tool fast path, while this one detects
-/// the case where native web_search coexists with other tools (exec, etc.) - such a request falls onto the normal chat
-/// path, where the upstream may return a tool_use with name=web_search, requiring the internal agentic loop.
-pub(crate) fn has_web_search_among_tools(req: &MessagesRequest) -> bool {
-    req.tools
-        .as_ref()
-        .is_some_and(|tools| tools.len() > 1 && tools.iter().any(is_native_web_search_tool))
+/// 与 [`has_web_search_tool`] 互补——那个是「只有一个 web_search」的直连 MCP 快路径，
+/// 不进模型；这里覆盖 web_fetch 以及服务端工具与客户端工具混用的情况。
+pub(crate) fn needs_server_tool_loop(req: &MessagesRequest) -> bool {
+    if super::converter::tool_choice_is_none(req) {
+        return false;
+    }
+    req.tools.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|t| is_native_web_search_tool(t) || super::webfetch::is_native_web_fetch_tool(t))
+    })
 }
 
 /// 从消息中提取搜索查询
@@ -200,11 +205,8 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
         random_22, timestamp, random_8
     );
 
-    // tool_use_id 使用相同格式
-    let tool_use_id = format!(
-        "srvtoolu_{}",
-        Uuid::new_v4().to_string().replace('-', "")[..32].to_string()
-    );
+    // 客户端可见的 server_tool_use id，与官方 `srvtoolu_01...` 同形
+    let tool_use_id = super::ids::server_tool_use_id();
 
     let request = McpRequest {
         id: request_id,
@@ -260,10 +262,7 @@ fn generate_websearch_events(
     input_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
-    let message_id = format!(
-        "msg_{}",
-        Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
-    );
+    let message_id = super::ids::message_id();
 
     // 1. message_start
     events.push(SseEvent::new(
@@ -445,6 +444,9 @@ fn generate_websearch_events(
     events
 }
 
+/// 搜索摘要里单条结果保留的最大字符数：摘要是调用方拿到的唯一正文，过短会丢信息。
+const SEARCH_SUMMARY_SNIPPET_MAX_CHARS: usize = 1000;
+
 /// 生成搜索结果摘要
 pub(crate) fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> String {
     let mut summary = format!("Here are the search results for \"{}\":\n\n", query);
@@ -454,7 +456,7 @@ pub(crate) fn generate_search_summary(query: &str, results: &Option<WebSearchRes
             summary.push_str(&format!("{}. **{}**\n", i + 1, result.title));
             if let Some(ref snippet) = result.snippet {
                 // 截断过长的摘要（安全处理 UTF-8 多字节字符）
-                let truncated = match snippet.char_indices().nth(200) {
+                let truncated = match snippet.char_indices().nth(SEARCH_SUMMARY_SNIPPET_MAX_CHARS) {
                     Some((idx, _)) => format!("{}...", &snippet[..idx]),
                     None => snippet.clone(),
                 };
@@ -523,6 +525,11 @@ fn finish_mcp_call(
 ) -> Result<Option<WebSearchResults>, Response> {
     match result {
         Ok(response) => Ok(parse_search_results(&response)),
+        // 「无结果」是正常的搜索结论，与 agentic loop 同口径按空结果渲染，不能报 502。
+        Err(error) if is_no_results_mcp_error(&error) => {
+            tracing::info!("MCP 搜索无结果: {}", error);
+            Ok(None)
+        }
         Err(error) => {
             tracing::warn!("MCP API 调用失败: {}", error);
             Err(super::handlers::map_provider_error(error))
@@ -566,6 +573,7 @@ fn render_websearch_response(
             },
             "",
             None,
+            Default::default(),
         )
     }
 }
@@ -585,7 +593,7 @@ pub async fn handle_websearch_request(
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(
                     "invalid_request_error",
-                    "无法从消息中提取搜索查询",
+                    "messages: unable to extract a search query from the request",
                 )),
             )
                 .into_response();
@@ -676,6 +684,28 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "60");
+    }
+
+    #[test]
+    fn test_mcp_no_results_renders_as_empty_results() {
+        let error = parse_mcp_response(
+            r#"{"jsonrpc":"2.0","id":"1","error":{"code":-32602,"message":"Tool returned no results"}}"#,
+        )
+        .unwrap_err();
+        assert!(is_no_results_mcp_error(&error));
+
+        let results = finish_mcp_call(Err(error)).unwrap();
+        assert!(results.is_none());
+    }
+
+    #[test]
+    fn test_mcp_other_errors_still_fail() {
+        let error = parse_mcp_response(
+            r#"{"jsonrpc":"2.0","id":"1","error":{"code":-32603,"message":"search failed"}}"#,
+        )
+        .unwrap_err();
+
+        assert!(finish_mcp_call(Err(error)).is_err());
     }
 
     #[test]
@@ -802,9 +832,9 @@ mod tests {
             cache_control: None,
         };
 
-        // 多个工具时不应该被识别为纯 websearch 请求
+        // 多个工具时不应该被识别为纯 websearch 请求，但仍应进入内部循环
         assert!(!has_web_search_tool(&req));
-        assert!(has_web_search_among_tools(&req));
+        assert!(needs_server_tool_loop(&req));
     }
 
     #[test]
@@ -848,7 +878,7 @@ mod tests {
         // A regular client-defined tool can be named web_search, but only
         // Anthropic's native web search tool has type=web_search_*.
         assert!(!has_web_search_tool(&req));
-        assert!(!has_web_search_among_tools(&req));
+        assert!(!needs_server_tool_loop(&req));
     }
 
     #[test]

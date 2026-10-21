@@ -6,9 +6,14 @@ use std::collections::BTreeMap;
 // === 错误响应 ===
 
 /// API 错误响应
+///
+/// 与官方错误体同形：`{"type":"error","error":{"type":..,"message":..},"request_id":..}`。
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
     pub error: ErrorDetail,
+    pub request_id: String,
 }
 
 /// 错误详情
@@ -19,14 +24,36 @@ pub struct ErrorDetail {
     pub message: String,
 }
 
+/// 把内部错误类型归一为官方文档列出的错误类型。
+///
+/// 内部历史上用过 `service_unavailable` / `internal_error` / `upstream_error` /
+/// `upstream_tool_json_error` 等自定义类型；客户端（SDK 的重试逻辑、Claude Code
+/// 的错误提示）只认识官方类型，未知类型一律按 `api_error` 处理。
+pub fn anthropic_error_type(error_type: &str) -> &'static str {
+    match error_type {
+        "invalid_request_error" => "invalid_request_error",
+        "authentication_error" => "authentication_error",
+        "billing_error" => "billing_error",
+        "permission_error" => "permission_error",
+        "not_found_error" => "not_found_error",
+        "request_too_large" => "request_too_large",
+        "rate_limit_error" => "rate_limit_error",
+        "timeout_error" => "timeout_error",
+        "overloaded_error" | "service_unavailable" => "overloaded_error",
+        _ => "api_error",
+    }
+}
+
 impl ErrorResponse {
-    /// 创建新的错误响应
+    /// 创建新的错误响应（错误类型按 [`anthropic_error_type`] 归一）
     pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
+            kind: "error",
             error: ErrorDetail {
-                error_type: error_type.into(),
+                error_type: anthropic_error_type(&error_type.into()).to_string(),
                 message: message.into(),
             },
+            request_id: super::ids::request_id(),
         }
     }
 

@@ -17,6 +17,7 @@ use crate::model::config::ToolCompatibilityMode;
 
 use super::{
     cache_metering::SharedCacheMeter,
+    claude_wire::into_claude_wire,
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
     openai::post_chat_completions,
@@ -92,9 +93,14 @@ pub fn create_router_with_shared_provider(
     state = state.with_trace_store(trace_store);
 
     // 需要认证的 /v1 路由
+    // Messages 端点的响应经 `claude_wire` 整形后再发给客户端；OpenAI / Responses
+    // 端点在内部复用 post_messages，拿到的是未整形的输出。
     let v1_routes = Router::new()
         .route("/models", get(get_models))
-        .route("/messages", post(post_messages))
+        .route(
+            "/messages",
+            post(post_messages).layer(middleware::map_response(into_claude_wire)),
+        )
         .route("/messages/count_tokens", post(count_tokens))
         .route("/chat/completions", post(post_chat_completions))
         .route("/responses", post(post_responses))
@@ -106,7 +112,10 @@ pub fn create_router_with_shared_provider(
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
     // 与 /v1 的区别：流式内容即时发送，最终用量由 message_delta 更正
     let cc_v1_routes = Router::new()
-        .route("/messages", post(post_messages_cc))
+        .route(
+            "/messages",
+            post(post_messages_cc).layer(middleware::map_response(into_claude_wire)),
+        )
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             state.clone(),
