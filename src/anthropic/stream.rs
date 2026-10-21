@@ -5,22 +5,14 @@
 use std::collections::HashMap;
 
 use serde_json::json;
-use uuid::Uuid;
 
 use crate::kiro::model::events::{Event, MeteringEvent, TokenUsage};
 
-/// thinking 块的 signature 占位字符串
-///
-/// Anthropic Messages API 协议规定 thinking 模式下，assistant 消息的
-/// `{type:"thinking", ...}` 块必须带 `signature` 字段并在下一轮原样回传，
-/// 否则 SDK / 服务端会拒绝请求并报：
-/// `The content[].thinking in the thinking mode must be passed back to the API`。
-///
-/// 上游 Kiro 不下发真实签名（它本身不是 Anthropic 服务端），因此 kiro.rs 在
-/// thinking 块结束时插入一个非空占位字符串以满足客户端本地校验。
-/// converter 在解析 assistant 消息回传 Kiro 时只读 `block.thinking`，不读
-/// signature，因此该占位字符串只在客户端 ↔ kiro.rs 之间存在，不会影响转发。
-pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
+// thinking 块的 signature：Anthropic Messages API 规定 thinking 模式下 assistant
+// 消息里的 `{type:"thinking", ...}` 块必须带 `signature` 并在下一轮原样回传。
+// 上游 Kiro 通常不下发真实签名，kiro.rs 在 thinking 块结束时用
+// `ids::thinking_signature()` 生成同外形的签名以满足客户端本地校验。converter
+// 回传 Kiro 时只读 `block.thinking`，不读 signature，因此不影响转发。
 
 /// 上游内容过滤拦截（`metadataEvent.stopReason = CONTENT_FILTERED`）映射到的
 /// Anthropic `stop_reason`。一经设置即为终态，后续事件不得覆盖。
@@ -843,7 +835,7 @@ pub(crate) fn extract_invoke_content_blocks(
             let input: serde_json::Value =
                 serde_json::from_str(&input_json).unwrap_or_else(|_| serde_json::json!({}));
             // 统一还原（名字 + 入参）并统一拼块，与结构化 / websearch 路径同口径。
-            let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+            let tool_use_id = super::ids::tool_use_id();
             let completed = CompletedToolUse::from_kiro(tool_use_id, &name, input, tool_name_map);
             blocks.push(completed.to_anthropic_block());
         } else {
@@ -871,7 +863,8 @@ impl CompletedToolUse {
     /// 从 Kiro 侧 (name, input) 还原为客户端可见的完整工具调用。
     ///
     /// 这是**唯一的还原入口**：名字按 `tool_name_map` 还原、入参按 Kiro 名反向重写
-    /// （见 `converter::restore_tool_use_for_client`）。结构化事件、`<invoke>` 文本捞回、
+    /// （见 `converter::restore_tool_use_for_client`）、id 映射为 `toolu_01...` 形态
+    /// （见 `ids::tool_use_id_from_upstream`）。结构化事件、`<invoke>` 文本捞回、
     /// websearch 三条来源都经此收敛，避免各站点各自调用还原逻辑。
     pub fn from_kiro(
         id: String,
@@ -881,6 +874,7 @@ impl CompletedToolUse {
     ) -> Self {
         let (name, input) =
             super::converter::restore_tool_use_for_client(kiro_name, input, tool_name_map);
+        let id = super::ids::tool_use_id_from_upstream(&id);
         Self { id, name, input }
     }
 
@@ -903,8 +897,10 @@ impl CompletedToolUse {
 ///   0 字节的滞留缓冲是无参工具的正常形态，不算截断，见 `ToolJsonAccumulator::finish`。
 ///
 /// 两种情况都**不能**把半截 / 非法 JSON 当成完整工具调用转发给客户端——那会让
-/// 客户端拿到无法解析或语义错误的参数去执行工具。这里显式暴露为错误，由上层
-/// 决定回 502（非流式 / 缓冲流）或在 SSE 里补一个 `error` 事件（实时流）。
+/// 客户端拿到无法解析或语义错误的参数去执行工具。`InvalidJson` 由上层回 502
+/// 或在 SSE 里补一个 `error` 事件；`IncompleteJson` 是 Kiro 输出上限造成的截断，
+/// 上层先尝试让上游分段重发（见 `truncation`），无法重试时丢弃该调用并以
+/// `max_tokens` 正常收尾。
 #[derive(Debug, Clone)]
 pub enum ToolJsonAccumulatorError {
     InvalidJson {
@@ -1068,6 +1064,16 @@ impl ToolJsonAccumulator {
             })
             .collect())
     }
+
+    /// 流结束时仍未收到 `stop=true` 且累积了非空内容的那个调用 `(kiro 名, 半截 JSON)`，
+    /// 即被上游输出上限截断的工具调用。多个时取字节最多的那个（与 `finish` 同口径）。
+    pub fn truncated_call(&self) -> Option<(&str, &str)> {
+        self.buffers
+            .values()
+            .filter(|(_, input)| !input.trim().is_empty())
+            .max_by_key(|(_, input)| input.len())
+            .map(|(name, input)| (name.as_str(), input.as_str()))
+    }
 }
 
 /// SSE 事件
@@ -1126,8 +1132,8 @@ pub struct SseStateManager {
     message_started: bool,
     /// message_delta 是否已发送
     message_delta_sent: bool,
-    /// 活跃的内容块状态
-    active_blocks: HashMap<i32, BlockState>,
+    /// 活跃的内容块状态（按索引有序，收尾时按 index 升序关闭）
+    active_blocks: std::collections::BTreeMap<i32, BlockState>,
     /// 消息是否已结束
     message_ended: bool,
     /// 下一个块索引
@@ -1149,7 +1155,7 @@ impl SseStateManager {
         Self {
             message_started: false,
             message_delta_sent: false,
-            active_blocks: HashMap::new(),
+            active_blocks: std::collections::BTreeMap::new(),
             message_ended: false,
             next_block_index: 0,
             stop_reason: None,
@@ -1190,6 +1196,11 @@ impl SseStateManager {
         self.active_blocks
             .values()
             .any(|b| b.block_type != "thinking")
+    }
+
+    /// 是否已创建过任何内容块
+    fn has_any_blocks(&self) -> bool {
+        !self.active_blocks.is_empty()
     }
 
     /// 获取最终的 stop_reason
@@ -1310,6 +1321,7 @@ impl SseStateManager {
         cache_creation_input_tokens: i32,
         cache_read_input_tokens: i32,
         metering: Option<&MeteringEvent>,
+        creation: super::cache_metering::CacheCreationTtl,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -1336,8 +1348,13 @@ impl SseStateManager {
                 "cache_creation_input_tokens": cache_creation_input_tokens,
                 "cache_read_input_tokens": cache_read_input_tokens
             });
-            // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
-            // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
+            // 按 TTL 拆分的缓存写入量，下游按 5m / 1h 分别计价。
+            usage_json["cache_creation"] = json!({
+                "ephemeral_5m_input_tokens": creation.ephemeral_5m_input_tokens,
+                "ephemeral_1h_input_tokens": creation.ephemeral_1h_input_tokens
+            });
+            // 上游 meteringEvent 的 credit_* 字段（只在收到过 meteringEvent 时追加），
+            // 下游计费系统按它核算 Kiro 侧成本。
             if let Some(m) = metering {
                 usage_json["credit_usage"] = json!(m.usage);
                 usage_json["credit_unit"] = json!(m.unit);
@@ -1395,7 +1412,7 @@ impl SseStateManager {
             json!({
                 "type": "error",
                 "error": {
-                    "type": error_type,
+                    "type": super::types::anthropic_error_type(error_type),
                     "message": message
                 }
             }),
@@ -1481,6 +1498,18 @@ pub struct StreamContext {
     tool_json_error: Option<ToolJsonAccumulatorError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
+    /// 当前这次上游尝试已作为文本吐出的内容。截断重试时作为 assistant 前文带回上游。
+    attempt_text: String,
+    /// 已吐出文本的最后一个字符（跨所有尝试），用于决定重试后的段落分隔。
+    last_emitted_char: Option<char>,
+    /// 截断重试后、下一段文本吐出前是否需要补段落分隔。
+    pending_retry_separator: bool,
+    /// 之前各次尝试累计的输出 tokens。
+    carried_output_tokens: i32,
+    /// 首次尝试的输入用量；重试后锁定，避免把续写请求的输入重复计入。
+    frozen_input_usage: Option<(i32, i32, i32)>,
+    /// 之前各次尝试累计的 meteringEvent credit。
+    carried_metering_usage: f64,
 }
 
 impl StreamContext {
@@ -1489,8 +1518,11 @@ impl StreamContext {
     /// 精确 `metadataEvent.tokenUsage` 优先；只有上游未提供该事件时，才按
     /// contextUsage/请求估算总量与本地 CacheMeter 比例回退。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
+        if let Some(frozen) = self.frozen_input_usage {
+            return frozen;
+        }
         if let Some(usage) = self.provider_token_usage {
-            let usage = usage.sanitized();
+            let usage = self.cache_usage.apply_to_provider_usage(usage);
             return (
                 usage.uncached_input_tokens,
                 usage.cache_write_input_tokens,
@@ -1508,8 +1540,12 @@ impl StreamContext {
         self.cache_usage.split_against_total(total_real)
     }
 
-    /// 精确 provider 输出 token 优先，否则返回流内容的本地估算。
+    /// 精确 provider 输出 token 优先，否则返回流内容的本地估算；截断重试时累加之前各次尝试。
     pub fn resolved_output_tokens(&self) -> i32 {
+        self.carried_output_tokens + self.attempt_output_tokens()
+    }
+
+    fn attempt_output_tokens(&self) -> i32 {
         self.provider_token_usage
             .map(|usage| usage.sanitized().output_tokens)
             .unwrap_or(self.output_tokens)
@@ -1533,7 +1569,7 @@ impl StreamContext {
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
-            message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+            message_id: super::ids::message_id(),
             input_tokens,
             context_input_tokens: None,
             provider_token_usage: None,
@@ -1561,6 +1597,12 @@ impl StreamContext {
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
+            attempt_text: String::new(),
+            last_emitted_char: None,
+            pending_retry_separator: false,
+            carried_output_tokens: 0,
+            frozen_input_usage: None,
+            carried_metering_usage: 0.0,
         }
     }
 
@@ -1586,10 +1628,11 @@ impl StreamContext {
         })
     }
 
-    /// 生成初始事件序列 (message_start + 文本块 start)
+    /// 生成初始事件序列（仅 message_start）
     ///
-    /// 当 thinking 启用时，不在初始化时创建文本块，而是等到实际收到内容时再创建。
-    /// 这样可以确保 thinking 块（索引 0）在文本块（索引 1）之前。
+    /// 内容块一律按需创建：文本块在第一段文本到达时由 `emit_text_delta_raw` 创建，
+    /// thinking / tool_use 块各自在首个事件时创建。这与官方流一致——直接调用工具的
+    /// 回复第一个块就是 tool_use，不会先出现一个空文本块。
     pub fn generate_initial_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -1598,29 +1641,6 @@ impl StreamContext {
         if let Some(event) = self.state_manager.handle_message_start(msg_start) {
             events.push(event);
         }
-
-        // 如果启用了 thinking，不在这里创建文本块
-        // thinking 块和文本块会在 process_content_with_thinking 中按正确顺序创建
-        if self.thinking_enabled {
-            return events;
-        }
-
-        // 创建初始文本块（仅在未启用 thinking 时）
-        let text_block_index = self.state_manager.next_block_index();
-        self.text_block_index = Some(text_block_index);
-        let text_block_events = self.state_manager.handle_content_block_start(
-            text_block_index,
-            "text",
-            json!({
-                "type": "content_block_start",
-                "index": text_block_index,
-                "content_block": {
-                    "type": "text",
-                    "text": ""
-                }
-            }),
-        );
-        events.extend(text_block_events);
 
         events
     }
@@ -1680,7 +1700,10 @@ impl StreamContext {
                 );
                 // 保留最近一次完整 payload，用于在 message_delta 里透传 credit_*
                 // 字段；如果上游真的多次下发，则以最后一次为准（与 kiro-rs 一致）。
-                self.metering = Some(metering.clone());
+                // 截断重试时叠加之前各次尝试的 credit。
+                let mut metering = metering.clone();
+                metering.usage += self.carried_metering_usage;
+                self.metering = Some(metering);
                 Vec::new()
             }
             Event::Error {
@@ -1954,10 +1977,7 @@ impl StreamContext {
                                 // 解析完整入参 → 统一还原 → 统一发出（与结构化 toolUseEvent 同一发出口）。
                                 let input: serde_json::Value =
                                     serde_json::from_str(&input_json).unwrap_or_else(|_| json!({}));
-                                let tool_use_id = format!(
-                                    "toolu_{}",
-                                    Uuid::new_v4().to_string().replace('-', "")
-                                );
+                                let tool_use_id = super::ids::tool_use_id();
                                 let completed = CompletedToolUse::from_kiro(
                                     tool_use_id,
                                     &name,
@@ -2102,7 +2122,18 @@ impl StreamContext {
         if kept.is_empty() {
             return events;
         }
+        // 截断重试后的第一段文本：与上一次尝试吐出的文本之间补段落分隔，
+        // 客户端看到的是同一条回复里另起一段。
+        let kept = if std::mem::take(&mut self.pending_retry_separator) {
+            let separator =
+                super::truncation::continuation_separator(self.last_emitted_char, &kept);
+            format!("{separator}{kept}")
+        } else {
+            kept
+        };
         let text: &str = &kept;
+        self.attempt_text.push_str(text);
+        self.last_emitted_char = text.chars().last().or(self.last_emitted_char);
 
         // 🅱 维护跨流的代码围栏奇偶状态：所有真正作为「文本」吐出的内容都过这里，
         // 在此累进围栏状态，使后续 <invoke> 能判断自己是否落在代码块内。
@@ -2168,6 +2199,25 @@ impl StreamContext {
             .is_some_and(|idx| self.state_manager.is_block_open_of_type(idx, "thinking"))
     }
 
+    /// 发出一个没有 delta 的空文本块（start + stop）。
+    fn create_empty_text_block_events(&mut self) -> Vec<SseEvent> {
+        let idx = self.state_manager.next_block_index();
+        let mut events = self.state_manager.handle_content_block_start(
+            idx,
+            "text",
+            json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "text",
+                    "text": ""
+                }
+            }),
+        );
+        events.extend(self.state_manager.handle_content_block_stop(idx));
+        events
+    }
+
     fn close_open_text_block(&mut self) -> Vec<SseEvent> {
         let Some(idx) = self.text_block_index else {
             return Vec::new();
@@ -2224,7 +2274,7 @@ impl StreamContext {
         let signature = self
             .pending_thinking_signature
             .take()
-            .unwrap_or_else(|| THINKING_SIGNATURE_PLACEHOLDER.to_string());
+            .unwrap_or_else(super::ids::thinking_signature);
         let mut events = vec![
             self.create_thinking_delta_event(idx, ""),
             self.create_signature_delta_event_with(idx, &signature),
@@ -2322,11 +2372,11 @@ impl StreamContext {
     /// assistant 消息回传时本地校验 thinking 块必须带非空 signature，否则抛出
     /// `The content[].thinking in the thinking mode must be passed back to the API`。
     ///
-    /// 上游 Kiro 不是 Anthropic 服务端，不会下发真实签名，因此这里发一个非空
-    /// 占位字符串以满足客户端本地校验。该字段不参与转发回 Kiro 的逻辑
-    /// （converter 只读 `block.thinking`，不读 signature）。
+    /// 上游 Kiro 不是 Anthropic 服务端，通常不会下发真实签名，因此这里生成一个
+    /// 与官方签名同外形的 base64 串以满足客户端本地校验。该字段不参与转发回 Kiro
+    /// 的逻辑（converter 只读 `block.thinking`，不读 signature）。
     fn create_signature_delta_event(&self, index: i32) -> SseEvent {
-        self.create_signature_delta_event_with(index, THINKING_SIGNATURE_PLACEHOLDER)
+        self.create_signature_delta_event_with(index, &super::ids::thinking_signature())
     }
 
     fn create_signature_delta_event_with(&self, index: i32, signature: &str) -> SseEvent {
@@ -2486,8 +2536,12 @@ impl StreamContext {
         events
     }
 
-    /// 生成最终事件序列
-    pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+    /// 流结束时把所有暂存缓冲（`<tool_use>` 过滤器、thinking 缓冲、invoke 嗅探缓冲）
+    /// 作为正文吐出，并关闭已结束的 thinking 块。可重复调用：第二次调用不产出事件。
+    ///
+    /// 截断重试在发起续写前先调用它，保证上一段文本完整到达客户端，
+    /// 再由新的上游响应接着往同一个文本块里写。
+    pub fn flush_buffered_output(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
         // 收尾：flush <tool_use> XML 过滤器的残留（截断的未闭合块会被丢弃），
@@ -2571,26 +2625,89 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
-        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
-        if self.thinking_enabled
-            && self.thinking_block_index.is_some()
-            && !self.state_manager.has_non_thinking_blocks()
-        {
-            self.state_manager.set_stop_reason("max_tokens");
-            events.extend(self.create_text_delta_events(" "));
-        }
-
         // Flush invoke 嗅探缓冲区的残留：先再嗅探一次完整块（万一最后一块就是完整 invoke），
         // 剩下的走 emit_text_delta_raw flush 出去（防尾字节丢）。
         if !self.invoke_sniff_buffer.is_empty() {
             events.extend(self.drain_invoke_sniff_buffer(true));
         }
 
+        events
+    }
+
+    /// 本次上游尝试被输出上限截断的工具调用（客户端名 + 目标路径）。
+    ///
+    /// 只有「本次尝试没有任何已完成的工具调用、只剩一个写到一半的调用」才视为
+    /// 可续写的截断；拒答、上下文窗口耗尽、非法 JSON 都不重试。
+    pub(crate) fn truncated_tool_call(&self) -> Option<super::truncation::TruncatedToolCall> {
+        if self.tool_json_error.is_some() || !self.tool_block_indices.is_empty() {
+            return None;
+        }
+        if matches!(
+            self.state_manager.stop_reason.as_deref(),
+            Some(REFUSAL_STOP_REASON) | Some("model_context_window_exceeded")
+        ) {
+            return None;
+        }
+        let (kiro_name, partial) = self.tool_json_accumulator.truncated_call()?;
+        Some(super::truncation::TruncatedToolCall::from_partial(
+            kiro_name,
+            partial,
+            &self.tool_name_map,
+        ))
+    }
+
+    /// 本次上游尝试已吐出的正文（截断重试时作为 assistant 前文带回上游）。
+    pub fn attempt_text(&self) -> &str {
+        &self.attempt_text
+    }
+
+    /// 截断重试：丢弃本次尝试半截的工具调用，准备接收续写响应。
+    ///
+    /// 已发给客户端的块保持不变（文本块继续开着，续写接着往里写）；用量按
+    /// 「首次输入 + 各次输出之和」累计。调用前须先 `flush_buffered_output`。
+    pub fn prepare_for_retry(&mut self) {
+        let attempt_output = self.attempt_output_tokens();
+        if self.frozen_input_usage.is_none() {
+            self.frozen_input_usage = Some(self.resolved_usage());
+        }
+        self.carried_output_tokens += attempt_output;
+        self.carried_metering_usage = self
+            .metering
+            .as_ref()
+            .map(|m| m.usage)
+            .unwrap_or(self.carried_metering_usage);
+        self.provider_token_usage = None;
+        self.output_tokens = 0;
+
+        self.tool_json_accumulator = ToolJsonAccumulator::new();
+        self.tool_json_error = None;
+        self.state_manager.set_has_tool_use(false);
+        if matches!(
+            self.state_manager.stop_reason.as_deref(),
+            Some("max_tokens") | Some("error")
+        ) {
+            self.state_manager.stop_reason = None;
+        }
+
+        // 续写请求不再开启 thinking：后续内容一律按正文处理。
+        if self.thinking_enabled {
+            self.in_thinking_block = false;
+            self.thinking_extracted = true;
+        }
+        self.repeat_guard_tripped = false;
+        self.repeat_guard_run = 0;
+        self.attempt_text.clear();
+        self.pending_retry_separator = true;
+    }
+
+    /// 生成最终事件序列
+    pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        let mut events = self.flush_buffered_output();
+
         // 收尾检查工具调用累积器：无参工具（0 字节滞留）在此还原为 `{}` 并正常发出；
-        // 累积了非空内容却从未 stop=true 的才是上游中途截断，记为错误。
-        // process_tool_use 中已置位的错误保持不变。
+        // 累积了非空内容却从未 stop=true 的是上游输出上限造成的截断：丢弃该调用，
+        // 本次没有其它工具调用时按 max_tokens 收尾（Claude Code 会自动续写）。
+        // process_tool_use 中已置位的非法 JSON 错误保持不变。
         if self.state_manager.get_stop_reason() == REFUSAL_STOP_REASON {
             // Refused generation can end in the middle of a tool call. Drop
             // pending calls rather than recovering them or reporting JSON errors.
@@ -2601,6 +2718,16 @@ impl StreamContext {
                 Ok(recovered) => {
                     for completed in recovered {
                         events.extend(self.emit_completed_tool_use(completed));
+                    }
+                }
+                Err(e @ ToolJsonAccumulatorError::IncompleteJson { .. }) => {
+                    tracing::warn!("{}", e);
+                    self.state_manager
+                        .set_has_tool_use(!self.tool_block_indices.is_empty());
+                    if self.tool_block_indices.is_empty()
+                        && self.state_manager.stop_reason.is_none()
+                    {
+                        self.state_manager.set_stop_reason("max_tokens");
                     }
                 }
                 Err(e) => {
@@ -2620,17 +2747,37 @@ impl StreamContext {
             return events;
         }
 
+        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
+        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
+        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块。
+        // 必须放在累积器收尾之后：无参工具只在上面才被还原发出，提前判断会把
+        // 「thinking + 无参工具」误判成只有 thinking。
+        if self.thinking_enabled
+            && self.thinking_block_index.is_some()
+            && !self.state_manager.has_non_thinking_blocks()
+        {
+            self.state_manager.set_stop_reason("max_tokens");
+            events.extend(self.create_text_delta_events(" "));
+        }
+
+        // 文本块是按需创建的；上游什么都没产出时补一个空文本块，保持 content 非空。
+        if !self.state_manager.has_any_blocks() {
+            events.extend(self.create_empty_text_block_events());
+        }
+
         // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
         let final_output_tokens = self.resolved_output_tokens();
 
         // 生成最终事件（message_delta + message_stop）
+        let creation_ttl = self.cache_usage.split_creation_ttl(cache_creation);
         events.extend(self.state_manager.generate_final_events(
             final_input_tokens,
             final_output_tokens,
             cache_creation,
             cache_read,
             self.metering.as_ref(),
+            creation_ttl,
         ));
 
         events
@@ -2713,7 +2860,7 @@ mod tests {
             .push(&tool_evt("t1", "custom_tool", ".txt\"}", true), &map)
             .unwrap()
             .unwrap();
-        assert_eq!(completed.id, "t1");
+        assert_eq!(completed.id, super::super::ids::tool_use_id_from_upstream("t1"));
         assert_eq!(completed.name, "custom_tool");
         assert_eq!(completed.input, serde_json::json!({"path": "/a.txt"}));
     }
@@ -2778,7 +2925,10 @@ mod tests {
 
         let recovered = acc.finish(&HashMap::new()).unwrap();
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].id, "t1");
+        assert_eq!(
+            recovered[0].id,
+            super::super::ids::tool_use_id_from_upstream("t1")
+        );
         assert_eq!(recovered[0].name, "mcp__computer-use__list_apps");
         assert_eq!(recovered[0].input, serde_json::json!({}));
     }
@@ -2817,7 +2967,11 @@ mod tests {
 
         let recovered = acc.finish(&HashMap::new()).unwrap();
         let ids: Vec<&str> = recovered.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, ["t1", "t2", "t3"]);
+        let expected: Vec<String> = ["t1", "t2", "t3"]
+            .into_iter()
+            .map(super::super::ids::tool_use_id_from_upstream)
+            .collect();
+        assert_eq!(ids, expected);
     }
 
     /// 端到端：无参工具在实时 SSE 上必须走正常终态（tool_use + message_stop），
@@ -2867,7 +3021,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_tool_json_ends_stream_with_error_only() {
+    fn incomplete_tool_json_is_dropped_and_ends_with_max_tokens() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -2883,18 +3037,104 @@ mod tests {
             false,
         )));
         assert!(emitted.is_empty(), "partial tool JSON must remain buffered");
+        let truncated = ctx.truncated_tool_call().expect("truncated call is reported");
+        assert_eq!(truncated.name, "read_file");
+        assert_eq!(truncated.path, None, "a half-written path is not reported");
 
+        // 无法续写时：丢弃半截调用，按 max_tokens 正常收尾，不发 error 事件。
         let final_events = ctx.generate_final_events();
-        assert_eq!(final_events.last().unwrap().event, "error");
-        assert_eq!(
-            final_events.last().unwrap().data["error"]["type"],
-            json!("upstream_tool_json_error")
+        assert!(final_events.iter().all(|event| event.event != "error"));
+        assert!(ctx.tool_json_error_message().is_none());
+        assert!(!final_events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use"
+        }));
+        let stop_reason = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .map(|e| e.data["delta"]["stop_reason"].clone());
+        assert_eq!(stop_reason, Some(json!("max_tokens")));
+        assert_eq!(final_events.last().unwrap().event, "message_stop");
+    }
+
+    #[test]
+    fn truncation_retry_continues_the_same_message() {
+        use crate::kiro::model::events::MetadataEvent;
+
+        let usage = |input, output| {
+            Event::Metadata(MetadataEvent {
+                token_usage: Some(TokenUsage {
+                    uncached_input_tokens: input,
+                    output_tokens: output,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                }),
+                ..Default::default()
+            })
+        };
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
         );
-        assert!(
-            final_events
-                .iter()
-                .all(|event| event.event != "message_delta" && event.event != "message_stop")
-        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("I'll write the file."));
+        events.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "t1",
+            "write_file",
+            "{\"path\":\"/a.rs\",\"content\":\"fn",
+            false,
+        ))));
+        events.extend(ctx.process_kiro_event(&usage(10, 100)));
+        events.extend(ctx.flush_buffered_output());
+
+        let truncated = ctx.truncated_tool_call().expect("truncated call");
+        assert_eq!(truncated.name, "write_file");
+        assert_eq!(truncated.path.as_deref(), Some("/a.rs"));
+        assert_eq!(ctx.attempt_text(), "I'll write the file.");
+
+        // 续写：同一个 StreamContext 接着读第二次上游响应。
+        ctx.prepare_for_retry();
+        assert_eq!(ctx.attempt_text(), "");
+        assert!(ctx.truncated_tool_call().is_none());
+        events.extend(ctx.process_assistant_response("Starting with the first part."));
+        events.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "t2",
+            "write_file",
+            "{\"path\":\"/a.rs\",\"content\":\"fn a() {}\"}",
+            true,
+        ))));
+        events.extend(ctx.process_kiro_event(&usage(30, 40)));
+        events.extend(ctx.generate_final_events());
+
+        let count = |name: &str| events.iter().filter(|e| e.event == name).count();
+        assert_eq!(count("message_start"), 1);
+        assert_eq!(count("message_stop"), 1);
+        assert_eq!(count("error"), 0);
+
+        let text: String = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
+            .map(|e| e.data["delta"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, "I'll write the file.\n\nStarting with the first part.");
+
+        let tool_starts: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .collect();
+        assert_eq!(tool_starts.len(), 1);
+        assert_eq!(tool_starts[0].data["content_block"]["name"], json!("write_file"));
+
+        let delta = events.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], json!("tool_use"));
+        // 输入侧以首次请求为准，输出累加两次上游调用。
+        assert_eq!(delta.data["usage"]["output_tokens"], json!(140));
+        assert_eq!(ctx.resolved_usage(), (10, 0, 0));
     }
 
     #[test]
@@ -3233,8 +3473,15 @@ mod tests {
         );
 
         let initial_events = ctx.generate_initial_events();
+        // 文本块按需创建：初始事件只有 message_start
         assert!(
-            initial_events
+            !initial_events
+                .iter()
+                .any(|e| e.event == "content_block_start")
+        );
+        let first_text_events = ctx.process_assistant_response("before");
+        assert!(
+            first_text_events
                 .iter()
                 .any(|e| e.event == "content_block_start"
                     && e.data["content_block"]["type"] == "text")
@@ -4574,6 +4821,50 @@ mod tests {
     }
 
     #[test]
+    fn test_thinking_then_no_arg_tool_ends_with_tool_use() {
+        // 无参工具在上游只有一个空 input 且不带 stop 的事件，直到收尾才被累积器还原为 `{}`。
+        // 只有 thinking 的判断必须在还原之后，否则会误判为 max_tokens 并多发一个空格 text 块。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("<thinking>\nplan</thinking>"));
+        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "wait_agent".to_string(),
+            tool_use_id: "tool_noarg".to_string(),
+            input: String::new(),
+            stop: false,
+        }));
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "tool_use");
+
+        let tool_start = all_events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("no-arg tool should be emitted");
+        assert_eq!(tool_start.data["content_block"]["name"], "wait_agent");
+        assert!(
+            !all_events.iter().any(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+            }),
+            "should not pad a text block when a tool call was produced"
+        );
+    }
+
+    #[test]
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
         let mut ctx = StreamContext::new_with_thinking(
@@ -5327,7 +5618,7 @@ mod tests {
     fn test_generate_final_events_omits_credit_fields_without_metering() {
         // 没有 meteringEvent 时不应在 usage 里写 credit_* 字段。
         let mut manager = SseStateManager::new();
-        let events = manager.generate_final_events(10, 5, 0, 0, None);
+        let events = manager.generate_final_events(10, 5, 0, 0, None, Default::default());
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")
@@ -5342,7 +5633,7 @@ mod tests {
     fn test_generate_final_events_carries_credit_fields_when_metering_present() {
         let mut manager = SseStateManager::new();
         let metering = parse_metering(r#"{"unit":"credit","unitPlural":"credits","usage":0.75}"#);
-        let events = manager.generate_final_events(10, 5, 0, 0, Some(&metering));
+        let events = manager.generate_final_events(10, 5, 0, 0, Some(&metering), Default::default());
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")
@@ -5377,7 +5668,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["content_block_stop", "error"]
         );
-        assert_eq!(events[1].data["error"]["type"], json!("upstream_error"));
+        assert_eq!(events[1].data["error"]["type"], json!("api_error"));
         assert!(
             events
                 .iter()
@@ -5463,6 +5754,7 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
+            ..Default::default()
         };
 
         let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
@@ -5508,6 +5800,7 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
+            ..Default::default()
         };
 
         // context 80 - output 9 = 71；按 cache_covered_est/prompt_total_est = 50/100
@@ -5541,6 +5834,7 @@ mod tests {
                 cache_read: 25,
                 cache_covered_est: 50,
                 prompt_total_est: 100,
+                ..Default::default()
             };
             ctx.resolved_usage()
         };

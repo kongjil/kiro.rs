@@ -62,6 +62,12 @@ enum Mode {
     RefusedWithInvalidTool,
     RefusedWithEmptyTool,
     RefusedBare,
+    /// 工具调用参数写到一半被截断；收到代理的续写请求后返回完整的调用。
+    TruncatedToolThenComplete,
+    /// 每次都在工具调用参数写到一半时截断。
+    AlwaysTruncatedTool,
+    /// 正文 + 完整工具调用，带 meteringEvent。
+    Metered,
 }
 
 struct Fixture {
@@ -137,12 +143,30 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
     let close_headers = Arc::new(AtomicUsize::new(0));
     let (seen_calls, seen_connections, seen_close) =
         (calls.clone(), connections.clone(), close_headers.clone());
-    let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap| {
+    let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: String| {
         let (calls, connections, close) = (seen_calls.clone(), seen_connections.clone(), seen_close.clone());
         async move {
             calls.fetch_add(1, Ordering::Relaxed);
             connections.lock().insert(peer);
             if headers.get("connection").is_some_and(|v| v == "close") { close.fetch_add(1, Ordering::Relaxed); }
+            if matches!(mode, Mode::TruncatedToolThenComplete | Mode::AlwaysTruncatedTool) {
+                // 续写请求必须带上已吐出的正文和分段重发的说明。
+                let is_continuation = body.contains("I'll run it.") && body.contains("cut off by the output length limit");
+                let parts = if matches!(mode, Mode::TruncatedToolThenComplete) && is_continuation {
+                    [
+                        frame("assistantResponseEvent", json!({"content": "Running the short version."})),
+                        frame("toolUseEvent", json!({"name":"run","toolUseId":"run_2","input":"{\"command\":\"echo hi\"}","stop":true})),
+                        frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":40,"outputTokens":7,"cacheReadInputTokens":0,"cacheWriteInputTokens":0}})),
+                    ]
+                } else {
+                    [
+                        frame("assistantResponseEvent", json!({"content": "I'll run it."})),
+                        frame("toolUseEvent", json!({"name":"run","toolUseId":"run_1","input":"{\"command\":\"echo ","stop":false})),
+                        frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})),
+                    ]
+                };
+                return Response::new(Body::from(parts.concat()));
+            }
             if matches!(mode, Mode::Overloaded) {
                 return Response::builder().status(500).body(Body::from(r#"{"message":"high load","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#)).unwrap();
             }
@@ -169,6 +193,15 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                     frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})),
                 ] { bytes.extend_from_slice(&part); }
                 return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::Metered) {
+                let parts = [
+                    frame("assistantResponseEvent", json!({"content": "Running it."})),
+                    frame("toolUseEvent", json!({"name":"run","toolUseId":"run_1","input":"{\"command\":\"ls\"}","stop":true})),
+                    frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})),
+                    frame("meteringEvent", json!({"unit":"credit","unitPlural":"credits","usage":0.42})),
+                ];
+                return Response::new(Body::from(parts.concat()));
             }
             if matches!(mode, Mode::Refused | Mode::RefusedWithSearch | Mode::RefusedWithPartialTool | Mode::RefusedWithInvalidTool | Mode::RefusedWithEmptyTool | Mode::RefusedBare) {
                 let mut bytes = Vec::new();
@@ -249,6 +282,7 @@ fn key() -> KeyContext {
         group: None,
         key_source: TraceKeySource::MasterApiKey,
         client_ip: None,
+        cache_ratio: 1.0,
     }
 }
 async fn request(state: AppState, endpoint: &str, streaming: bool) -> Response {
@@ -588,6 +622,150 @@ async fn gateway_partial_tool_before_refusal_preserves_terminal_reason() {
                 failures.push(format!("stream={streaming}, status={status}, body={body}"));
             }
         }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// 声明了 `run` 工具的请求，返回 (状态码, 响应体)。
+async fn request_with_run_tool(
+    state: AppState,
+    endpoint: &str,
+    streaming: bool,
+) -> (StatusCode, String) {
+    let payload = json!({
+        "model":"gpt-5.6-sol","max_tokens":64,"stream":streaming,
+        "messages":[{"role":"user","content":"hello"}],
+        "tools":[{"name":"run","description":"test command","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}]
+    });
+    let payload = Json(serde_json::from_value(payload).unwrap());
+    let response = if endpoint == "cc" {
+        post_messages_cc(axum::extract::State(state), Extension(key()), payload).await
+    } else {
+        post_messages(axum::extract::State(state), Extension(key()), payload).await
+    };
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn gateway_truncated_tool_call_is_retried_within_the_same_reply() {
+    let mut failures = Vec::new();
+    for (endpoint, streaming) in [("messages", false), ("messages", true), ("cc", true)] {
+        let f = fixture(Mode::TruncatedToolThenComplete).await;
+        let (status, body) = request_with_run_tool(f.state.clone(), endpoint, streaming).await;
+        let calls = f.calls.load(Ordering::Relaxed);
+        let ok = if streaming {
+            body.matches("event: message_start").count() == 1
+                && body.matches("event: message_stop").count() == 1
+                && body.matches(r#""type":"tool_use""#).count() == 1
+                && body.contains(r#""stop_reason":"tool_use""#)
+                && body.contains("Running the short version.")
+                && !body.contains("event: error")
+        } else {
+            let message: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            message["stop_reason"] == "tool_use"
+                && message["content"]
+                    == json!([
+                        {"type":"text","text":"I'll run it.\n\nRunning the short version."},
+                        {"type":"tool_use","id":message["content"][1]["id"],"name":"run","input":{"command":"echo hi"}}
+                    ])
+                && message["usage"]["output_tokens"] == 24
+        };
+        if status != StatusCode::OK || calls != 2 || !ok {
+            failures.push(format!(
+                "{endpoint} stream={streaming}: status={status}, calls={calls}, body={body}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn gateway_truncated_tool_call_ends_with_max_tokens_after_retries() {
+    let mut failures = Vec::new();
+    for (endpoint, streaming) in [("messages", false), ("messages", true), ("cc", true)] {
+        let f = fixture(Mode::AlwaysTruncatedTool).await;
+        let (status, body) = request_with_run_tool(f.state.clone(), endpoint, streaming).await;
+        let calls = f.calls.load(Ordering::Relaxed);
+        let ok = if streaming {
+            body.contains(r#""stop_reason":"max_tokens""#)
+                && body.contains("event: message_stop")
+                && !body.contains("event: error")
+        } else {
+            let message: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            message["stop_reason"] == "max_tokens"
+        };
+        if status != StatusCode::OK
+            || calls != 1 + super::truncation::MAX_TRUNCATION_RETRIES as usize
+            || !ok
+            || body.contains(r#""type":"tool_use""#)
+            || body.contains("upstream_tool_json_error")
+        {
+            failures.push(format!(
+                "{endpoint} stream={streaming}: status={status}, calls={calls}, body={body}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// 直连 Claude 端点经 `claude_wire` 出站：键序与官方一致，计费字段一个不少
+/// （credit_* 与 cache_creation 的 TTL 拆分都要给下游）。
+#[tokio::test]
+async fn gateway_claude_wire_orders_keys_and_keeps_billing_fields() {
+    let mut failures = Vec::new();
+    for (endpoint, streaming) in [
+        ("messages", false),
+        ("messages", true),
+        ("cc", false),
+        ("cc", true),
+    ] {
+        let f = fixture(Mode::Metered).await;
+        let payload = json!({
+            "model":"gpt-5.6-sol","max_tokens":64,"stream":streaming,
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[{"name":"run","description":"test command","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}]
+        });
+        let payload = Json(serde_json::from_value(payload).unwrap());
+        let state = axum::extract::State(f.state.clone());
+        let response = if endpoint == "cc" {
+            post_messages_cc(state, Extension(key()), payload).await
+        } else {
+            post_messages(state, Extension(key()), payload).await
+        };
+        let response = super::claude_wire::into_claude_wire(response).await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        let ordered = body.contains(r#"{"input_tokens":"#);
+        let ok = if streaming {
+            ordered
+                && body.contains(r#"data: {"type":"message_start","message":{"id":"msg_"#)
+                && body.contains(r#""content_block":{"type":"tool_use","id":"#)
+                && body.contains(r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":"#)
+        } else {
+            ordered
+                && body.starts_with(r#"{"id":"msg_"#)
+                && body.contains(r#","type":"message","role":"assistant","model":"gpt-5.6-sol","content":[{"type":"text","text":"Running it."},{"type":"tool_use","id":"#)
+                && body.contains(r#""stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":"#)
+        };
+        // 计费字段必须原样到达客户端
+        let billing = body.contains(r#""credit_usage":0.42"#)
+            && body.contains(r#""credit_unit":"credit""#)
+            && body.contains(r#""credit_unit_plural":"credits""#)
+            && body.contains(r#""cache_creation":{"ephemeral_5m_input_tokens":"#);
+        if status != StatusCode::OK || !ok || !billing {
+            failures.push(format!("{endpoint} stream={streaming}: status={status}, body={body}"));
+        }
+    }
+
+    let f = fixture(Mode::Metered).await;
+    let response = request(f.state.clone(), "chat", false).await;
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let chat: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    if chat["usage"]["credit_usage"] != json!(0.42) {
+        failures.push(format!("chat completions lost credit_usage: {chat}"));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

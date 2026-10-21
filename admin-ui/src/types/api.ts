@@ -461,6 +461,8 @@ export interface ClientKeyItem {
   maxCredits?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
+  /** 缓存计费系数（0~1，1 = 满缓存，0 = 无缓存） */
+  cacheRatio: number
   /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
   isSystem: boolean
 }
@@ -476,6 +478,8 @@ export interface CreateClientKeyRequest {
   group?: string
   /** 积分使用上限（可选，不传表示不限制） */
   maxCredits?: number
+  /** 缓存计费系数（可选，0~1，不传表示满缓存） */
+  cacheRatio?: number
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -490,6 +494,8 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
+  /** 缓存计费系数（可选，0~1，不传表示不修改） */
+  cacheRatio?: number
 }
 
 // ============ 用量统计 ============

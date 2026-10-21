@@ -23,13 +23,18 @@
 //! ```
 
 pub mod cache_metering;
+mod claude_wire;
 mod converter;
 mod handlers;
+mod ids;
 mod middleware;
 mod openai;
+mod pdf_text;
 mod responses;
 mod router;
 pub mod stream;
+mod truncation;
+mod typed_tools;
 pub mod types;
 mod websearch;
 mod websearch_loop;

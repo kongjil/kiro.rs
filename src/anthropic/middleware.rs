@@ -30,6 +30,8 @@ pub struct KeyContext {
     pub key_source: TraceKeySource,
     /// 客户端 IP（转发头优先，回落到 TCP 对端），仅用于请求日志
     pub client_ip: Option<String>,
+    /// 该 Key 的缓存计费系数（0~1，1 = 满缓存），只影响上报给下游的 usage 拆分
+    pub cache_ratio: f64,
 }
 
 /// 应用共享状态
@@ -126,12 +128,14 @@ pub async fn auth_middleware(
         match mgr.verify_and_touch_ex(&presented) {
             KeyAuth::Ok(id) => {
                 let group = mgr.group_of(id);
+                let cache_ratio = mgr.cache_ratio_of(id);
                 let client_ip = auth::extract_client_ip(&request);
                 request.extensions_mut().insert(KeyContext {
                     key_id: id,
                     group,
                     key_source: TraceKeySource::ClientKey,
                     client_ip,
+                    cache_ratio,
                 });
                 return next.run(request).await;
             }

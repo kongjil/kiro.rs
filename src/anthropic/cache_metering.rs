@@ -33,6 +33,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::kiro::model::events::TokenUsage;
+
 /// 未配置时的默认条目上限。
 ///
 /// 选型公式：`C >= peak_req_per_sec * entries_per_req * TTL_secs`。
@@ -102,9 +104,64 @@ pub struct CacheUsage {
     pub cache_covered_est: i32,
     /// 整个 prompt 的 estimate token 总量（比例分摊的分母）。
     pub prompt_total_est: i32,
+    /// 其中由 1h TTL 断点覆盖、且本次新写入的 estimate token。
+    /// 用于把 `cache_creation` 拆成 5m / 1h 两档（下游按 TTL 分别计价）。
+    pub cache_creation_1h_est: i32,
+    /// 已施加的客户端 Key 缓存计费系数（0~1）；None 表示满缓存、未缩放。
+    /// 由 [`Self::with_cache_ratio`] 写入，供 provider 精确用量按同一系数缩放。
+    pub cache_ratio: Option<f64>,
+}
+
+/// `cache_creation_input_tokens` 按 TTL 的拆分，对应官方 `usage.cache_creation`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheCreationTtl {
+    pub ephemeral_5m_input_tokens: i32,
+    pub ephemeral_1h_input_tokens: i32,
 }
 
 impl CacheUsage {
+    /// 按客户端 Key 的缓存计费系数缩放本地模拟的缓存覆盖量。
+    ///
+    /// `cache_read` 与 `cache_covered_est` 同乘系数，read / creation 的相对比例不变，
+    /// 被砍掉的覆盖量在 [`Self::split_against_total`] 中自然回落为 `input_tokens`。
+    /// 系数 `>= 1`（或非有限值）时原样返回。
+    pub fn with_cache_ratio(self, ratio: f64) -> Self {
+        let r = if ratio.is_finite() {
+            ratio.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        if r >= 1.0 {
+            return self;
+        }
+        Self {
+            cache_read: ((self.cache_read as f64) * r).round() as i32,
+            cache_covered_est: ((self.cache_covered_est as f64) * r).round() as i32,
+            prompt_total_est: self.prompt_total_est,
+            cache_creation_1h_est: ((self.cache_creation_1h_est as f64) * r).round() as i32,
+            cache_ratio: Some(r),
+        }
+    }
+
+    /// 对上游 `metadataEvent.tokenUsage` 精确值施加同一缓存计费系数：
+    /// 缓存读取 / 写入各乘系数，被砍掉的部分转入 `uncached_input_tokens`，输入总量守恒。
+    pub fn apply_to_provider_usage(&self, usage: TokenUsage) -> TokenUsage {
+        let usage = usage.sanitized();
+        let Some(r) = self.cache_ratio else {
+            return usage;
+        };
+        let read = ((usage.cache_read_input_tokens as f64) * r).round() as i32;
+        let write = ((usage.cache_write_input_tokens as f64) * r).round() as i32;
+        let moved = (usage.cache_read_input_tokens - read)
+            .saturating_add(usage.cache_write_input_tokens - write);
+        TokenUsage {
+            uncached_input_tokens: usage.uncached_input_tokens.saturating_add(moved),
+            cache_read_input_tokens: read,
+            cache_write_input_tokens: write,
+            ..usage
+        }
+    }
+
     /// 按真实 total 口径把 prompt 拆成三个互斥的部分，返回
     /// `(input_tokens, cache_creation, cache_read)`，相加严格 == `total_real`。
     ///
@@ -134,6 +191,50 @@ impl CacheUsage {
 
         (uncached_tail, cache_creation, cache_read)
     }
+
+    /// 把最终上报的 `cache_creation` 总量按请求里的 TTL 断点拆成 5m / 1h 两档。
+    ///
+    /// 上游 `metadataEvent` 只给缓存写入总量，拆分比例取自本地模拟：1h 断点覆盖
+    /// 且未命中的那部分写入 / 全部写入。请求里没有 1h 断点时整笔算 5m——与官方
+    /// 默认 TTL 一致，下游按 5m 计价不会多收。
+    pub fn split_creation_ttl(&self, cache_creation: i32) -> CacheCreationTtl {
+        let cache_creation = cache_creation.max(0);
+        let creation_est = self.cache_covered_est.saturating_sub(self.cache_read);
+        if cache_creation == 0 || creation_est <= 0 || self.cache_creation_1h_est <= 0 {
+            return CacheCreationTtl {
+                ephemeral_5m_input_tokens: cache_creation,
+                ephemeral_1h_input_tokens: 0,
+            };
+        }
+        let ratio = (self.cache_creation_1h_est as f64 / creation_est as f64).clamp(0.0, 1.0);
+        let one_hour = ((cache_creation as f64) * ratio).round() as i32;
+        let one_hour = one_hour.clamp(0, cache_creation);
+        CacheCreationTtl {
+            ephemeral_5m_input_tokens: cache_creation - one_hour,
+            ephemeral_1h_input_tokens: one_hour,
+        }
+    }
+}
+
+/// 计算被 1h TTL 断点覆盖、且本次新写入的 estimate token。
+///
+/// `covered_1h` 是最深 1h 断点处的累计 token；命中（read）优先落在前缀里，
+/// 所以能确定是 1h 覆盖的那部分里，超出的才是新写入。
+fn covered_1h_creation_est(covered_1h: u32, cache_read: u32) -> u32 {
+    covered_1h.saturating_sub(cache_read.min(covered_1h))
+}
+
+/// 最深 1h TTL 断点覆盖到的累计 token；没有 1h 断点时为 0。
+fn deepest_one_hour_covered(
+    breakpoints: &[Breakpoint],
+    cum_tokens: &[u32],
+) -> u32 {
+    breakpoints
+        .iter()
+        .rev()
+        .find(|bp| bp.ttl_secs > DEFAULT_TTL_SECS)
+        .map(|bp| cum_tokens[bp.block_idx])
+        .unwrap_or(0)
 }
 
 /// 异步装箱 Future 别名
@@ -1467,11 +1568,14 @@ pub async fn compute_cache_usage(
         .last()
         .map(|bp| cum_tokens[bp.block_idx])
         .unwrap_or(0);
+    let covered_1h = deepest_one_hour_covered(&breakpoints, &cum_tokens);
 
     CacheUsage {
         cache_read: max_read_tokens as i32,
         cache_covered_est: covered_tokens as i32,
         prompt_total_est: prompt_total_est as i32,
+        cache_creation_1h_est: covered_1h_creation_est(covered_1h, max_read_tokens) as i32,
+        cache_ratio: None,
     }
 }
 
@@ -1579,11 +1683,14 @@ pub fn compute_cache_usage_sync(
         .last()
         .map(|bp| cum_tokens[bp.block_idx])
         .unwrap_or(0);
+    let covered_1h = deepest_one_hour_covered(&breakpoints, &cum_tokens);
 
     CacheUsage {
         cache_read: max_read_tokens as i32,
         cache_covered_est: covered_tokens as i32,
         prompt_total_est: prompt_total_est as i32,
+        cache_creation_1h_est: covered_1h_creation_est(covered_1h, max_read_tokens) as i32,
+        cache_ratio: None,
     }
 }
 
@@ -1883,6 +1990,7 @@ mod tests {
             cache_read: 30,
             cache_covered_est: 80,
             prompt_total_est: 100,
+            ..Default::default()
         };
         let (input, creation, read) = u.split_against_total(1000);
         assert_eq!(input + creation + read, 1000);
@@ -1897,8 +2005,70 @@ mod tests {
             cache_read: 0,
             cache_covered_est: 0,
             prompt_total_est: 100,
+            ..Default::default()
         };
         assert_eq!(u.split_against_total(500), (500, 0, 0));
+    }
+
+    #[test]
+    fn cache_ratio_scales_simulated_cache_into_input() {
+        let u = CacheUsage {
+            cache_read: 30,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+            ..Default::default()
+        };
+
+        // 满缓存：原样返回，不标记系数
+        let full = u.with_cache_ratio(1.0);
+        assert_eq!(full.cache_ratio, None);
+        assert_eq!(full.split_against_total(1000), (200, 500, 300));
+        assert_eq!(u.with_cache_ratio(f64::NAN).cache_ratio, None);
+
+        // 五折：缓存覆盖 800 → 400，read / creation 各减半，砍掉的转入 input
+        let half = u.with_cache_ratio(0.5);
+        assert_eq!(half.cache_ratio, Some(0.5));
+        assert_eq!(half.split_against_total(1000), (600, 250, 150));
+
+        // 无缓存：全部计入 input
+        let none = u.with_cache_ratio(0.0);
+        assert_eq!(none.split_against_total(1000), (1000, 0, 0));
+        assert_eq!(u.with_cache_ratio(-1.0).split_against_total(1000), (1000, 0, 0));
+    }
+
+    #[test]
+    fn cache_ratio_scales_provider_usage_and_conserves_input() {
+        let provider = TokenUsage {
+            uncached_input_tokens: 101,
+            output_tokens: 23,
+            cache_read_input_tokens: 300,
+            cache_write_input_tokens: 40,
+        };
+        let base = CacheUsage::default();
+
+        assert_eq!(base.apply_to_provider_usage(provider), provider);
+
+        let half = base.with_cache_ratio(0.5).apply_to_provider_usage(provider);
+        assert_eq!(
+            half,
+            TokenUsage {
+                uncached_input_tokens: 271,
+                output_tokens: 23,
+                cache_read_input_tokens: 150,
+                cache_write_input_tokens: 20,
+            }
+        );
+
+        let none = base.with_cache_ratio(0.0).apply_to_provider_usage(provider);
+        assert_eq!(
+            none,
+            TokenUsage {
+                uncached_input_tokens: 441,
+                output_tokens: 23,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+            }
+        );
     }
 
     #[test]
@@ -3750,6 +3920,7 @@ mod tests {
             cache_read: 100_000,
             cache_covered_est: 100_000,
             prompt_total_est: 101_000,
+            ..Default::default()
         };
 
         let (input, creation, read) = usage.split_against_total(101_000);

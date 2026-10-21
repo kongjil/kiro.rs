@@ -1011,6 +1011,8 @@ pub struct ClientKeyItem {
     pub max_credits: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// 有效缓存计费系数（0~1，1 = 满缓存）
+    pub cache_ratio: f64,
     /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
     #[serde(default)]
     pub is_system: bool,
@@ -1036,6 +1038,9 @@ pub struct CreateClientKeyRequest {
     /// 积分使用上限（可选；None / 省略表示不限制）
     #[serde(default)]
     pub max_credits: Option<f64>,
+    /// 缓存计费系数（可选，0~1；省略表示满缓存）
+    #[serde(default)]
+    pub cache_ratio: Option<f64>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -1056,6 +1061,9 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 缓存计费系数（可选，0~1；省略表示不修改）
+    #[serde(default)]
+    pub cache_ratio: Option<f64>,
 }
 
 /// 设置客户端 Key 的积分使用上限

@@ -46,6 +46,21 @@ function parseMaxCreditsInput(raw: string): number | null | 'invalid' {
   return n
 }
 
+/** 缓存计费系数展示：1 → 满，0 → 无，其余显示百分比 */
+function formatCacheRatio(ratio?: number): string {
+  const v = ratio ?? 1
+  if (v >= 1) return '满'
+  if (v <= 0) return '无'
+  return `${Math.round(v * 100)}%`
+}
+
+/** 解析缓存系数输入框：非法 / 空值回落为 1（满缓存），其余夹到 0~1 */
+function parseCacheRatio(raw: string): number {
+  const n = parseFloat(raw)
+  if (!Number.isFinite(n)) return 1
+  return Math.min(1, Math.max(0, n))
+}
+
 /** 渲染「已用积分 / 上限」列。无上限时仅显示已用量。 */
 function CreditsUsage({ used, max }: { used: number; max?: number }) {
   if (max == null) {
@@ -93,6 +108,7 @@ export function ClientKeysPage() {
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
   const [createMaxCredits, setCreateMaxCredits] = useState('')
+  const [createCacheRatio, setCreateCacheRatio] = useState('1')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -102,6 +118,7 @@ export function ClientKeysPage() {
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
   const [editMaxCredits, setEditMaxCredits] = useState('')
+  const [editCacheRatio, setEditCacheRatio] = useState('1')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -121,6 +138,7 @@ export function ClientKeysPage() {
         description: createDesc.trim() || undefined,
         group: createGroup.trim() || undefined,
         maxCredits: maxCredits ?? undefined,
+        cacheRatio: parseCacheRatio(createCacheRatio),
       })
       setCreatedKey(res)
       setCreateOpen(false)
@@ -128,6 +146,7 @@ export function ClientKeysPage() {
       setCreateDesc('')
       setCreateGroup('')
       setCreateMaxCredits('')
+      setCreateCacheRatio('1')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -210,6 +229,7 @@ export function ClientKeysPage() {
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
     setEditMaxCredits(item.maxCredits != null ? String(item.maxCredits) : '')
+    setEditCacheRatio(String(item.cacheRatio ?? 1))
     setEditOpen(true)
   }
 
@@ -224,7 +244,12 @@ export function ClientKeysPage() {
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
-        req: { name: editName.trim(), description: editDesc.trim(), group: editGroup.trim() },
+        req: {
+          name: editName.trim(),
+          description: editDesc.trim(),
+          group: editGroup.trim(),
+          cacheRatio: parseCacheRatio(editCacheRatio),
+        },
       })
       // 仅在上限发生变化时才调用额度接口，避免无谓写入
       const prev = editTarget.maxCredits ?? null
@@ -390,6 +415,21 @@ export function ClientKeysPage() {
           ) : (
             <span className="text-[12px] text-muted-foreground">全部账号</span>
           ),
+      },
+      {
+        id: 'cacheRatio',
+        header: '缓存',
+        cell: (k) => {
+          const v = k.cacheRatio ?? 1
+          return (
+            <Badge
+              variant={v >= 1 ? 'success' : v <= 0 ? 'destructive' : 'outline'}
+              title={`缓存计费系数 ${v}`}
+            >
+              {formatCacheRatio(v)}
+            </Badge>
+          )
+        },
       },
       {
         id: 'status',
@@ -643,6 +683,23 @@ export function ClientKeysPage() {
                   累计使用的 credit 达到上限后，该 Key 的请求会被拒绝（HTTP 429）。重置统计后重新计费。
                 </p>
               </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">缓存系数（0~1）</label>
+                <Input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  inputMode="decimal"
+                  placeholder="1 = 满缓存，0 = 无缓存，0.5 = 缓存红利打五折"
+                  value={createCacheRatio}
+                  onChange={(e) => setCreateCacheRatio(e.target.value)}
+                  disabled={createKey.isPending}
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  控制本 Key 请求上报给下游的缓存红利比例：1=满缓存（享 cache_read 折扣），0=无缓存（全按 input 计），0.5=缓存覆盖砍半。不影响发往上游的真实请求。
+                </p>
+              </div>
               <DialogFooter>
                 <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                   取消
@@ -755,6 +812,23 @@ export function ClientKeysPage() {
                 />
                 <p className="mt-1 text-[11px] text-muted-foreground">
                   累计 credit 达到上限后该 Key 请求会被拒绝（HTTP 429）。清空则取消限制；重置统计可清零已用量。
+                </p>
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">缓存系数（0~1）</label>
+                <Input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  inputMode="decimal"
+                  placeholder="1 = 满缓存，0 = 无缓存，0.5 = 缓存红利打五折"
+                  value={editCacheRatio}
+                  onChange={(e) => setEditCacheRatio(e.target.value)}
+                  disabled={updateKey.isPending}
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  1=满缓存，0=无缓存（缓存 token 归零，全按 input 计），0.5=缓存红利打五折。
                 </p>
               </div>
               <DialogFooter>

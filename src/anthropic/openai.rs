@@ -412,18 +412,20 @@ pub(super) fn convert_tools(tools: &[Value]) -> Vec<Tool> {
 fn convert_tool_choice(tc: &Value) -> Option<Value> {
     match tc {
         Value::String(s) => match s.as_str() {
-            "auto" => Some(json!({"type": "auto"})),
+            "none" => Some(json!({"type": "none"})),
             "required" => Some(json!({"type": "any"})),
-            "none" => None,
             _ => Some(json!({"type": "auto"})),
         },
-        Value::Object(_) => {
-            let name = tc
+        Value::Object(_) => match tc.get("type").and_then(|v| v.as_str()) {
+            Some("none") => Some(json!({"type": "none"})),
+            Some("required") => Some(json!({"type": "any"})),
+            Some("auto") => Some(json!({"type": "auto"})),
+            _ => tc
                 .get("function")
                 .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str());
-            name.map(|n| json!({"type": "tool", "name": n}))
-        }
+                .and_then(|v| v.as_str())
+                .map(|n| json!({"type": "tool", "name": n})),
+        },
         _ => None,
     }
 }
@@ -859,11 +861,15 @@ fn build_stream_sse(p: &ParsedResponse) -> String {
 
 /// 构造 OpenAI usage 对象，并按需透传 upstream meteringEvent 写入的
 /// credit_usage / credit_unit / credit_unit_plural 字段。
+///
+/// `prompt_tokens_details.cached_tokens` 是 OpenAI 口径的缓存命中量，下游
+/// （new-api / sub2api 等）据此按缓存价计费；`prompt_tokens` 已包含它。
 fn build_usage_json(p: &ParsedResponse) -> Value {
     let mut usage = json!({
         "prompt_tokens": p.prompt_tokens,
         "completion_tokens": p.completion_tokens,
         "total_tokens": p.prompt_tokens + p.completion_tokens,
+        "prompt_tokens_details": { "cached_tokens": p.cached_tokens },
     });
     if let Some(credit_usage) = p.credit_usage {
         usage["credit_usage"] = json!(credit_usage);
@@ -911,6 +917,21 @@ mod tests {
             value["prompt_cache_key"] = json!(key);
         }
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn tool_choice_maps_to_anthropic_forms() {
+        assert_eq!(convert_tool_choice(&json!("none")), Some(json!({"type": "none"})));
+        assert_eq!(convert_tool_choice(&json!("required")), Some(json!({"type": "any"})));
+        assert_eq!(convert_tool_choice(&json!("auto")), Some(json!({"type": "auto"})));
+        assert_eq!(
+            convert_tool_choice(&json!({"type": "function", "function": {"name": "exec"}})),
+            Some(json!({"type": "tool", "name": "exec"}))
+        );
+        assert_eq!(
+            convert_tool_choice(&json!({"type": "none"})),
+            Some(json!({"type": "none"}))
+        );
     }
 
     #[test]
@@ -1038,6 +1059,22 @@ mod tests {
         assert_eq!(usage["prompt_tokens"], json!(7));
         assert_eq!(usage["completion_tokens"], json!(11));
         assert_eq!(usage["total_tokens"], json!(18));
+    }
+
+    /// 下游按 `prompt_tokens_details.cached_tokens` 走缓存价计费，
+    /// 这个字段必须始终出现（无命中时为 0）。
+    #[test]
+    fn build_usage_reports_cached_tokens() {
+        let mut p = base_parsed();
+        p.cached_tokens = 5;
+        let usage = build_usage_json(&p);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], json!(5));
+        // prompt_tokens 已包含缓存部分
+        assert_eq!(usage["prompt_tokens"], json!(7));
+
+        p.cached_tokens = 0;
+        let usage = build_usage_json(&p);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], json!(0));
     }
 
     #[test]

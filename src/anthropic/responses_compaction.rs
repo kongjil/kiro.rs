@@ -271,7 +271,7 @@ async fn run_attempt(
             return Err(AttemptError::Response(responses_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "service_unavailable",
-                "Kiro API provider not configured",
+                "Service temporarily unavailable",
             )));
         }
     };
@@ -315,7 +315,8 @@ async fn run_attempt(
                 .await
         }
         None => super::super::cache_metering::CacheUsage::default(),
-    };
+    }
+    .with_cache_ratio(key_ctx.cache_ratio);
     let tracer = new_non_stream_request_tracer(&state, key_ctx.clone(), model.to_string());
     let anthropic = execute_non_stream_request(
         provider,
@@ -324,10 +325,12 @@ async fn run_attempt(
         input_tokens,
         false,
         conversion.tool_name_map,
+        std::collections::HashSet::new(),
         hook,
         cache_usage,
         tracer,
         key_ctx.group.clone(),
+        None,
     )
     .await
     .map_err(|error| match error {

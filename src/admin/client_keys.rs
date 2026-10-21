@@ -57,6 +57,13 @@ pub struct ClientKey {
     /// None 表示不绑定分组，可使用全部账号。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// 缓存计费系数（0.0~1.0）。None 等价于 1.0（满缓存）。
+    ///
+    /// 只影响本 Key 上报给下游的 usage 拆分：最终缓存量（本地 CacheMeter 模拟值或
+    /// 上游 tokenUsage 精确值）乘以此系数，被砍掉的部分转入 input 全价计；
+    /// 0 表示缓存 token 归零。不影响发往上游的真实请求与 credit 消耗。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ratio: Option<f64>,
     /// 系统 Key（由 config.json apiKey 同步，不可删除、可轮换）。
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -196,6 +203,7 @@ impl ClientKeyManager {
             total_credits: 0.0,
             max_credits: None,
             group: group.filter(|g| !g.trim().is_empty()),
+            cache_ratio: None,
             is_system: false,
         };
         inner.by_key.insert(plaintext, id);
@@ -240,6 +248,7 @@ impl ClientKeyManager {
                     total_credits: 0.0,
                     max_credits: None,
                     group: None,
+                    cache_ratio: None,
                     is_system: true,
                 },
             );
@@ -343,6 +352,11 @@ impl ClientKeyManager {
     /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
     pub fn group_of(&self, id: u64) -> Option<String> {
         self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
+    }
+
+    /// 返回指定 Key 的有效缓存计费系数（未设置或 Key 不存在时为 1.0）
+    pub fn cache_ratio_of(&self, id: u64) -> f64 {
+        normalize_cache_ratio(self.inner.read().entries.get(&id).and_then(|e| e.cache_ratio))
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
@@ -520,6 +534,30 @@ impl ClientKeyManager {
         updated
     }
 
+    /// 设置或清除单个 Key 的缓存计费系数。`None` 或 `>= 1.0` 表示满缓存（清除字段）。
+    ///
+    /// 非有限值拒绝为无效，其余值归一到 0.0~1.0。返回 `false` 表示 Key 不存在或入参非法。
+    pub fn set_cache_ratio(&self, id: u64, cache_ratio: Option<f64>) -> bool {
+        if cache_ratio.is_some_and(|v| !v.is_finite()) {
+            return false;
+        }
+        let cache_ratio = cache_ratio
+            .map(|v| v.clamp(0.0, 1.0))
+            .filter(|v| *v < 1.0);
+        let mut inner = self.inner.write();
+        let updated = match inner.entries.get_mut(&id) {
+            Some(e) => {
+                e.cache_ratio = cache_ratio;
+                true
+            }
+            None => false,
+        };
+        if updated {
+            self.save_locked(&inner);
+        }
+        updated
+    }
+
     /// 在请求结束时累计 Token 用量并落盘
     pub fn record_usage(
         &self,
@@ -558,6 +596,14 @@ impl Default for ClientKeyManager {
 
 fn is_false(b: &bool) -> bool {
     !b
+}
+
+/// 把存储的缓存计费系数归一为有效值：未设置 / 非有限值为 1.0，其余夹到 0.0~1.0。
+pub fn normalize_cache_ratio(ratio: Option<f64>) -> f64 {
+    match ratio {
+        Some(v) if v.is_finite() => v.clamp(0.0, 1.0),
+        _ => 1.0,
+    }
 }
 
 /// 生成 `sk-` 前缀 + 32 位 base62 随机字符串
@@ -667,6 +713,59 @@ mod tests {
         assert!(!mgr.set_max_credits(entry.id, Some(f64::NAN)));
         assert!(!mgr.set_max_credits(999, Some(5.0)));
         assert!(mgr.set_max_credits(entry.id, Some(0.0)));
+    }
+
+    #[test]
+    fn cache_ratio_defaults_to_full_and_round_trips() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None);
+        assert_eq!(entry.cache_ratio, None);
+        assert_eq!(mgr.cache_ratio_of(entry.id), 1.0);
+
+        assert!(mgr.set_cache_ratio(entry.id, Some(0.5)));
+        assert_eq!(mgr.cache_ratio_of(entry.id), 0.5);
+        assert!(mgr.set_cache_ratio(entry.id, Some(0.0)));
+        assert_eq!(mgr.cache_ratio_of(entry.id), 0.0);
+
+        // 越界值夹到 0~1；>= 1 视为满缓存并清除字段
+        assert!(mgr.set_cache_ratio(entry.id, Some(-3.0)));
+        assert_eq!(mgr.cache_ratio_of(entry.id), 0.0);
+        assert!(mgr.set_cache_ratio(entry.id, Some(7.0)));
+        assert_eq!(mgr.list()[0].cache_ratio, None);
+        assert_eq!(mgr.cache_ratio_of(entry.id), 1.0);
+
+        assert!(!mgr.set_cache_ratio(entry.id, Some(f64::NAN)));
+        assert!(!mgr.set_cache_ratio(999, Some(0.5)));
+        assert_eq!(mgr.cache_ratio_of(999), 1.0);
+    }
+
+    #[test]
+    fn cache_ratio_is_omitted_from_json_when_unset() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None);
+        let json = serde_json::to_value(&entry).unwrap();
+        assert!(json.get("cacheRatio").is_none());
+
+        mgr.set_cache_ratio(entry.id, Some(0.25));
+        let json = serde_json::to_value(&mgr.list()[0]).unwrap();
+        assert_eq!(json["cacheRatio"], serde_json::json!(0.25));
+
+        // 旧文件无此字段时反序列化为 None
+        let legacy: ClientKey = serde_json::from_value(serde_json::json!({
+            "id": 1, "key": "sk-x", "name": "old", "createdAt": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(legacy.cache_ratio, None);
+    }
+
+    #[test]
+    fn normalize_cache_ratio_handles_invalid_values() {
+        assert_eq!(normalize_cache_ratio(None), 1.0);
+        assert_eq!(normalize_cache_ratio(Some(f64::INFINITY)), 1.0);
+        assert_eq!(normalize_cache_ratio(Some(f64::NAN)), 1.0);
+        assert_eq!(normalize_cache_ratio(Some(-0.2)), 0.0);
+        assert_eq!(normalize_cache_ratio(Some(0.3)), 0.3);
+        assert_eq!(normalize_cache_ratio(Some(1.5)), 1.0);
     }
 
     #[test]
