@@ -2339,6 +2339,8 @@ fn convert_tools_with_appendix(
             .tool_type
             .as_deref()
             .and_then(super::typed_tools::typed_tool_spec);
+        // 原生 web_fetch 由代理自己抓取，和 web_search 一样需要给出可用 schema。
+        let is_native_web_fetch = super::webfetch::is_native_web_fetch_tool(t);
 
         let description = if let Some(spec) = &typed {
             let body = if t.description.trim().is_empty() {
@@ -2368,6 +2370,18 @@ fn convert_tools_with_appendix(
             fit_tool_description(&mapped_name, body, Some(note), &mut overflow)
         } else if is_native_web_search {
             kiro_builtin_tool_description(&mapped_name, &t.description)
+        } else if is_native_web_fetch {
+            let body = if t.description.trim().is_empty() {
+                "Fetch a web page and return its contents as plain text. \
+                 Use it when the user gives a URL, or after a search when the snippet is not enough."
+                    .to_string()
+            } else {
+                format!(
+                    "{}\n\nFetch a web page and return its contents as plain text.",
+                    t.description.trim_end()
+                )
+            };
+            fit_tool_description(&mapped_name, body, None, &mut overflow)
         } else {
             let mut description = t.description.clone();
             // 非内置（或 Raw 模式）：保留旧的 Write/Edit/Bash 后缀（按原始名匹配）。
@@ -2400,6 +2414,22 @@ fn convert_tools_with_appendix(
             })?
         } else if is_native_web_search {
             kiro_builtin_tool_schema("web_search").expect("web_search 内置 schema 必然存在")
+        } else if is_native_web_fetch {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The absolute URL to fetch, including the scheme."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Optional description of what to look for on the page."
+                    }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            })
         } else {
             normalize_json_schema(serde_json::json!(t.input_schema))
         };
@@ -3829,6 +3859,64 @@ mod tests {
         let s = serde_json::to_string(&out[0]).unwrap();
         assert!(s.contains("\"path\""), "内置 schema 应含 path");
         assert!(s.contains("\"text\""), "内置 schema 应含 text");
+    }
+
+    /// Anthropic 定义的工具（只有 type，没有 input_schema）必须补上官方 schema，
+    /// 否则转发到上游是空 schema 函数，模型无法调用。
+    #[test]
+    fn typed_tools_get_synthesized_schema_and_keep_client_name() {
+        let typed = |name: &str, ty: &str| super::super::types::Tool {
+            tool_type: Some(ty.to_string()),
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: Default::default(),
+            max_uses: None,
+            cache_control: None,
+        };
+        let tools = Some(vec![
+            typed("bash", "bash_20250124"),
+            typed("str_replace_based_edit_tool", "text_editor_20250728"),
+            typed("computer", "computer_20250124"),
+        ]);
+        let builtins = ClaudeCodeToolMapping::from_tools(&tools, ToolCompatibilityMode::Raw);
+        let mut map = HashMap::new();
+        let out = convert_tools(&tools, &mut map, ToolCompatibilityMode::Raw, &builtins).unwrap();
+
+        let names: Vec<&str> = out
+            .iter()
+            .map(|t| t.tool_specification.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["bash", "str_replace_based_edit_tool", "computer"],
+            "名字保持客户端原样，客户端才能执行返回的 tool_use"
+        );
+
+        let bash = tool_schema_json(&out[0]);
+        assert_eq!(bash["required"], serde_json::json!(["command"]));
+        let editor = tool_schema_json(&out[1]);
+        assert_eq!(editor["required"], serde_json::json!(["command", "path"]));
+        let computer = tool_schema_json(&out[2]);
+        assert_eq!(computer["required"], serde_json::json!(["action"]));
+    }
+
+    /// 没有名字的工具条目转发上去会被上游拒绝，直接跳过。
+    #[test]
+    fn nameless_tool_is_skipped() {
+        let nameless = super::super::types::Tool {
+            tool_type: Some("web_search_20250305".to_string()),
+            name: String::new(),
+            description: String::new(),
+            input_schema: Default::default(),
+            max_uses: None,
+            cache_control: None,
+        };
+        let tools = Some(vec![nameless, cc_tool("Write")]);
+        let builtins = ClaudeCodeToolMapping::from_tools(&tools, ToolCompatibilityMode::Raw);
+        let mut map = HashMap::new();
+        let out = convert_tools(&tools, &mut map, ToolCompatibilityMode::Raw, &builtins).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tool_specification.name, "Write");
     }
 
     #[test]

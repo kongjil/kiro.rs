@@ -121,16 +121,19 @@ pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
         })
 }
 
-/// Checks whether the request is a "mixed-tools set that contains web_search" case
+/// 是否需要进入内部 agentic 循环：工具集里含 web_search 或 web_fetch。
 ///
-/// Mutually exclusive with [`has_web_search_tool`]: that one is the pure single-tool fast path, while this one detects
-/// the case where native web_search coexists with other tools (exec, etc.) - such a request falls onto the normal chat
-/// path, where the upstream may return a tool_use with name=web_search, requiring the internal agentic loop.
-pub(crate) fn has_web_search_among_tools(req: &MessagesRequest) -> bool {
-    !super::converter::tool_choice_is_none(req)
-        && req.tools.as_ref().is_some_and(|tools| {
-            tools.len() > 1 && tools.iter().any(is_native_web_search_tool)
-        })
+/// 与 [`has_web_search_tool`] 互补——那个是「只有一个 web_search」的直连 MCP 快路径，
+/// 不进模型；这里覆盖 web_fetch 以及服务端工具与客户端工具混用的情况。
+pub(crate) fn needs_server_tool_loop(req: &MessagesRequest) -> bool {
+    if super::converter::tool_choice_is_none(req) {
+        return false;
+    }
+    req.tools.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|t| is_native_web_search_tool(t) || super::webfetch::is_native_web_fetch_tool(t))
+    })
 }
 
 /// 从消息中提取搜索查询
@@ -829,9 +832,9 @@ mod tests {
             cache_control: None,
         };
 
-        // 多个工具时不应该被识别为纯 websearch 请求
+        // 多个工具时不应该被识别为纯 websearch 请求，但仍应进入内部循环
         assert!(!has_web_search_tool(&req));
-        assert!(has_web_search_among_tools(&req));
+        assert!(needs_server_tool_loop(&req));
     }
 
     #[test]
@@ -875,7 +878,7 @@ mod tests {
         // A regular client-defined tool can be named web_search, but only
         // Anthropic's native web search tool has type=web_search_*.
         assert!(!has_web_search_tool(&req));
-        assert!(!has_web_search_among_tools(&req));
+        assert!(!needs_server_tool_loop(&req));
     }
 
     #[test]

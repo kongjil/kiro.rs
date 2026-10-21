@@ -223,13 +223,59 @@ fn log_normalized_web_search_query(tu: &CompletedToolUse, query: &str) {
     );
 }
 
-/// Decides whether this round should keep searching (enter the next loop round)
+/// 本轮的调用是否全部由代理内部执行（web_search / web_fetch）。
+fn is_server_tool_name(name: &str) -> bool {
+    name == "web_search" || name == "web_fetch"
+}
+
+/// Decides whether this round should keep running server tools (enter the next loop round)
 ///
-/// Continue condition: every tool_use this round is web_search (at least one) and the round limit has not been reached.
-/// As soon as a client tool such as exec is mixed in, there is no tool_use at all, or the limit is reached, it stops and flushes (exec is never swallowed).
-fn should_search_round(round_idx: usize, tool_uses: &[CompletedToolUse]) -> bool {
-    let only_web_search = !tool_uses.is_empty() && tool_uses.iter().all(|t| t.name == "web_search");
-    only_web_search && round_idx < MAX_WEB_SEARCH_ROUNDS
+/// Continue condition: every tool_use this round is a server tool executed by the
+/// proxy (web_search / web_fetch), at least one, and the round limit has not been
+/// reached. As soon as a client tool such as exec is mixed in, there is no tool_use
+/// at all, or the limit is reached, it stops and flushes (exec is never swallowed).
+fn should_server_tool_round(round_idx: usize, tool_uses: &[CompletedToolUse]) -> bool {
+    let only_server_tools = !tool_uses.is_empty()
+        && tool_uses.iter().all(|t| is_server_tool_name(&t.name));
+    only_server_tools && round_idx < MAX_WEB_SEARCH_ROUNDS
+}
+
+/// 一次服务端工具调用的执行结果，与 `round.tool_uses` 一一对应。
+enum ServerToolOutcome {
+    Search(Option<WebSearchResults>),
+    Fetch(super::webfetch::FetchOutcome),
+    /// 客户端工具（exec 等），代理不执行。
+    Client,
+}
+
+/// 执行本轮的一个服务端工具调用。
+async fn execute_server_tool(
+    provider: &Arc<KiroProvider>,
+    tool_use: &CompletedToolUse,
+    tracer: &RequestTracer,
+    group: Option<&str>,
+    final_round: bool,
+    emitter: &mut Option<&mut WebSearchSseEmitter>,
+) -> ServerToolOutcome {
+    match tool_use.name.as_str() {
+        "web_search" => ServerToolOutcome::Search(
+            execute_web_search(provider, tool_use, tracer, group, final_round, emitter).await,
+        ),
+        "web_fetch" => {
+            let pending = if let Some(emitter) = emitter.as_deref_mut() {
+                let url = super::webfetch::tool_url(tool_use).unwrap_or_default();
+                Some(emitter.begin_fetch(&url).await)
+            } else {
+                None
+            };
+            let outcome = super::webfetch::fetch(tool_use).await;
+            if let (Some(pending), Some(emitter)) = (pending, emitter.as_deref_mut()) {
+                emitter.complete_fetch(pending, &outcome).await;
+            }
+            ServerToolOutcome::Fetch(outcome)
+        }
+        _ => ServerToolOutcome::Client,
+    }
 }
 
 /// Whether the request is the continuation immediately following a tool result.
@@ -551,17 +597,18 @@ async fn run_round(
     Ok((outcome, credential_id))
 }
 
-/// Feeds one round of assistant(text + web_search tool_use) + user(tool_result) back into payload.messages,
-/// and appends server_tool_use + web_search_tool_result blocks (Contract A fields) to the presentation.
+/// Feeds one round of assistant(text + server tool_use) + user(tool_result) back into
+/// payload.messages, and appends the matching presentation blocks (Contract A fields).
 ///
-/// `searched` corresponds one-to-one (same order) to `round.tool_uses`; the search has already been completed.
-fn append_search_round(
+/// `outcomes` corresponds one-to-one (same order) to `round.tool_uses`; the server tool
+/// call has already been completed.
+fn append_server_tool_round(
     payload: &mut MessagesRequest,
     round: &RoundOutcome,
-    searched: &[Option<WebSearchResults>],
+    outcomes: &[ServerToolOutcome],
     presentation: &mut Vec<Value>,
 ) {
-    // assistant: text + this round's web_search tool_use (Kiro history requires tool_use<->tool_result pairing)
+    // assistant: text + this round's tool_use (Kiro history requires tool_use<->tool_result pairing)
     let mut assistant_content: Vec<Value> = Vec::new();
     if !round.text.is_empty() {
         assistant_content.push(json!({"type": "text", "text": round.text}));
@@ -574,37 +621,64 @@ fn append_search_round(
         content: Value::Array(assistant_content),
     });
 
-    // user: each web_search tool_use is paired with a tool_result (content = search summary, shown to the upstream)
+    // user: each tool_use is paired with a tool_result shown to the upstream
     let mut user_content: Vec<Value> = Vec::new();
-    for (tu, results) in round.tool_uses.iter().zip(searched.iter()) {
-        let query = tool_query(tu).unwrap_or_default();
-        user_content.push(match search_error_code(results) {
-            // A failed search is reported to the model as an error result so it can
-            // answer without it instead of the whole request failing.
-            Some(code) => json!({
-                "type": "tool_result", "tool_use_id": tu.id, "is_error": true,
-                "content": format!(
-                    "Web search for \"{}\" failed ({}). Continue without these results and tell the user the search could not be completed.",
-                    query, code
-                )
-            }),
-            None => json!({
-                "type": "tool_result", "tool_use_id": tu.id,
-                "content": websearch::generate_search_summary(&query, results)
-            }),
-        });
+    for (tu, outcome) in round.tool_uses.iter().zip(outcomes.iter()) {
+        match outcome {
+            ServerToolOutcome::Fetch(fetch) => {
+                user_content.push(json!({
+                    "type": "tool_result", "tool_use_id": tu.id,
+                    "is_error": fetch.is_error(),
+                    "content": fetch.model_content()
+                }));
+                let srv_id = super::ids::server_tool_use_id();
+                let mut block = fetch.client_block();
+                block["tool_use_id"] = json!(srv_id);
+                presentation.push(json!({
+                    "type": "server_tool_use", "id": srv_id, "name": "web_fetch",
+                    "input": {"url": super::webfetch::tool_url(tu).unwrap_or_default()}
+                }));
+                presentation.push(json!({
+                    "type": "web_fetch_tool_result",
+                    "tool_use_id": srv_id,
+                    "content": block
+                }));
+            }
+            _ => {
+                let results = match outcome {
+                    ServerToolOutcome::Search(results) => results,
+                    _ => &None,
+                };
+                let query = tool_query(tu).unwrap_or_default();
+                user_content.push(match search_error_code(results) {
+                    // A failed search is reported to the model as an error result so it can
+                    // answer without it instead of the whole request failing.
+                    Some(code) => json!({
+                        "type": "tool_result", "tool_use_id": tu.id, "is_error": true,
+                        "content": format!(
+                            "Web search for \"{}\" failed ({}). Continue without these results and tell the user the search could not be completed.",
+                            query, code
+                        )
+                    }),
+                    None => json!({
+                        "type": "tool_result", "tool_use_id": tu.id,
+                        "content": websearch::generate_search_summary(&query, results)
+                    }),
+                });
 
-        // Client presentation: server_tool_use + web_search_tool_result (Contract A)
-        let (srv_id, _mcp) = websearch::create_mcp_request(&query);
-        presentation.push(json!({
-            "type": "server_tool_use", "id": srv_id, "name": "web_search",
-            "input": {"query": query}
-        }));
-        presentation.push(json!({
-            "type": "web_search_tool_result",
-            "tool_use_id": srv_id,
-            "content": build_result_block(results)
-        }));
+                // Client presentation: server_tool_use + web_search_tool_result (Contract A)
+                let (srv_id, _mcp) = websearch::create_mcp_request(&query);
+                presentation.push(json!({
+                    "type": "server_tool_use", "id": srv_id, "name": "web_search",
+                    "input": {"query": query}
+                }));
+                presentation.push(json!({
+                    "type": "web_search_tool_result",
+                    "tool_use_id": srv_id,
+                    "content": build_result_block(results)
+                }));
+            }
+        }
     }
     payload.messages.push(Message {
         role: "user".to_string(),
@@ -693,24 +767,24 @@ fn build_result_block(results: &Option<WebSearchResults>) -> Value {
     }
 }
 
-/// Splits a round's tool_uses into (web_search calls, client tool calls),
+/// Splits a round's tool_uses into (server tool calls, client tool calls),
 /// preserving order within each group. This is the structural core of the
-/// invariant "web_search is always handled internally and never leaves kiro-rs
+/// invariant "server tools are always handled internally and never leave kiro-rs
 /// as a raw tool_use": every flush path partitions first, then handles each
-/// group differently (web_search -> presentation blocks, client tools -> raw).
+/// group differently (server tools -> presentation blocks, client tools -> raw).
 fn partition_tool_uses(
     tool_uses: &[CompletedToolUse],
 ) -> (Vec<&CompletedToolUse>, Vec<&CompletedToolUse>) {
-    let mut web = Vec::new();
+    let mut server = Vec::new();
     let mut client = Vec::new();
     for tu in tool_uses {
-        if tu.name == "web_search" {
-            web.push(tu);
+        if is_server_tool_name(&tu.name) {
+            server.push(tu);
         } else {
             client.push(tu);
         }
     }
-    (web, client)
+    (server, client)
 }
 
 /// Resolves the final `stop_reason` for a flushed web_search-loop response.
@@ -738,9 +812,9 @@ fn resolve_flush_stop_reason(
     if let Some(r) = override_reason {
         return r.to_string();
     }
-    let has_client_tool_use = content
-        .iter()
-        .any(|c| c["type"] == "tool_use" && c["name"] != "web_search");
+    let has_client_tool_use = content.iter().any(|c| {
+        c["type"] == "tool_use" && !is_server_tool_name(c["name"].as_str().unwrap_or_default())
+    });
     if has_client_tool_use || !client_uses_empty {
         "tool_use".to_string()
     } else {
@@ -788,7 +862,7 @@ fn build_flush_content(
     presentation: Vec<Value>,
     text: &str,
     tool_uses: &[CompletedToolUse],
-    searched: &[Option<WebSearchResults>],
+    outcomes: &[ServerToolOutcome],
     known_tool_names: &std::collections::HashSet<String>,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> Vec<Value> {
@@ -809,7 +883,7 @@ fn build_flush_content(
         // breaks the loop's core invariant.
         let reclaim_tools: std::collections::HashSet<String> = known_tool_names
             .iter()
-            .filter(|n| n.as_str() != "web_search")
+            .filter(|n| !is_server_tool_name(n))
             .cloned()
             .collect();
         // DEDUP GUARD: a degraded model can emit BOTH a leaked literal `<invoke>` in the
@@ -819,7 +893,7 @@ fn build_flush_content(
         // `tool_uses` for this round. Text blocks (and distinct tool_uses) are kept as-is.
         let structured_keys: std::collections::HashSet<(String, String)> = tool_uses
             .iter()
-            .filter(|t| t.name != "web_search")
+            .filter(|t| !is_server_tool_name(&t.name))
             .map(|t| (t.name.clone(), canonical_input_key(&t.input)))
             .collect();
         for block in
@@ -844,24 +918,46 @@ fn build_flush_content(
         }
     }
     for (idx, tu) in tool_uses.iter().enumerate() {
-        if tu.name == "web_search" {
-            // INVARIANT: present as server_tool_use + web_search_tool_result,
-            // never as a raw tool_use.
-            let query = tool_query(tu).unwrap_or_default();
-            let (srv_id, _mcp) = websearch::create_mcp_request(&query);
-            content.push(json!({
-                "type": "server_tool_use", "id": srv_id, "name": "web_search",
-                "input": {"query": query}
-            }));
-            let results: &Option<WebSearchResults> = searched.get(idx).unwrap_or(&None);
-            content.push(json!({
-                "type": "web_search_tool_result",
-                "tool_use_id": srv_id,
-                "content": build_result_block(results)
-            }));
-        } else {
-            // Client tool (exec, get_time, ...): returned to the client verbatim.
-            content.push(tu.to_anthropic_block());
+        match outcomes.get(idx) {
+            Some(ServerToolOutcome::Fetch(fetch)) => {
+                // INVARIANT: same as web_search — present as server_tool_use +
+                // web_fetch_tool_result, never as a raw tool_use.
+                let srv_id = super::ids::server_tool_use_id();
+                let mut block = fetch.client_block();
+                block["tool_use_id"] = json!(srv_id);
+                content.push(json!({
+                    "type": "server_tool_use", "id": srv_id, "name": "web_fetch",
+                    "input": {"url": super::webfetch::tool_url(tu).unwrap_or_default()}
+                }));
+                content.push(json!({
+                    "type": "web_fetch_tool_result",
+                    "tool_use_id": srv_id,
+                    "content": block
+                }));
+            }
+            _ if tu.name == "web_search" => {
+                // INVARIANT: present as server_tool_use + web_search_tool_result,
+                // never as a raw tool_use.
+                let results: &Option<WebSearchResults> = match outcomes.get(idx) {
+                    Some(ServerToolOutcome::Search(results)) => results,
+                    _ => &None,
+                };
+                let query = tool_query(tu).unwrap_or_default();
+                let (srv_id, _mcp) = websearch::create_mcp_request(&query);
+                content.push(json!({
+                    "type": "server_tool_use", "id": srv_id, "name": "web_search",
+                    "input": {"query": query}
+                }));
+                content.push(json!({
+                    "type": "web_search_tool_result",
+                    "tool_use_id": srv_id,
+                    "content": build_result_block(results)
+                }));
+            }
+            _ => {
+                // Client tool (exec, get_time, ...): returned to the client verbatim.
+                content.push(tu.to_anthropic_block());
+            }
         }
     }
     content
@@ -1022,6 +1118,12 @@ struct PendingWebSearch {
     tool_use_id: String,
 }
 
+/// 一次进行中的 web_fetch（已发出 server_tool_use，等待抓取结果）。
+struct PendingWebFetch {
+    block_index: i32,
+    tool_use_id: String,
+}
+
 /// Emits one coherent Anthropic SSE message while the agentic loop runs in a
 /// background task. Content block indexes are allocated once across all search
 /// rounds and the final assistant content, so downstream Responses translation
@@ -1106,6 +1208,77 @@ impl WebSearchSseEmitter {
                     "type": "web_search_tool_result",
                     "tool_use_id": pending.tool_use_id,
                     "content": build_result_block(results)
+                }
+            }),
+        ))
+        .await;
+        self.active_blocks.remove(&result_index);
+        self.send(SseEvent::new(
+            "content_block_stop",
+            json!({
+                "type": "content_block_stop",
+                "index": result_index
+            }),
+        ))
+        .await;
+    }
+
+    /// 发出 web_fetch 的 `server_tool_use` 块，等待抓取结果。
+    async fn begin_fetch(&mut self, url: &str) -> PendingWebFetch {
+        let block_index = self.next_block_index;
+        self.next_block_index += 1;
+        self.active_blocks.insert(block_index);
+        let tool_use_id = super::ids::server_tool_use_id();
+        self.send(SseEvent::new(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "id": tool_use_id,
+                    "type": "server_tool_use",
+                    "name": "web_fetch",
+                    "input": {"url": url}
+                }
+            }),
+        ))
+        .await;
+        PendingWebFetch {
+            block_index,
+            tool_use_id,
+        }
+    }
+
+    /// 收尾 `server_tool_use` 并发出 `web_fetch_tool_result`。
+    async fn complete_fetch(
+        &mut self,
+        pending: PendingWebFetch,
+        outcome: &super::webfetch::FetchOutcome,
+    ) {
+        self.active_blocks.remove(&pending.block_index);
+        self.send(SseEvent::new(
+            "content_block_stop",
+            json!({
+                "type": "content_block_stop",
+                "index": pending.block_index
+            }),
+        ))
+        .await;
+
+        let result_index = self.next_block_index;
+        self.next_block_index += 1;
+        self.active_blocks.insert(result_index);
+        let mut block = outcome.client_block();
+        block["tool_use_id"] = json!(pending.tool_use_id);
+        self.send(SseEvent::new(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": result_index,
+                "content_block": {
+                    "type": "web_fetch_tool_result",
+                    "tool_use_id": pending.tool_use_id,
+                    "content": block
                 }
             }),
         ))
@@ -1654,16 +1827,15 @@ async fn run_web_search_loop_inner(
             round.known_tool_names.clear();
         }
 
-        // 拒答是终态：即便本轮带了 web_search，也不再续跑搜索轮次，直接带 refusal 收尾。
+        // 拒答是终态：即便本轮带了服务端工具调用，也不再续跑，直接带 refusal 收尾。
         if !is_refusal(&round.stop_reason_override)
-            && should_search_round(round_idx, &round.tool_uses)
+            && should_server_tool_round(round_idx, &round.tool_uses)
         {
-            // A failed search is carried in-band (see execute_web_search) and never fails the request.
-            let mut searched: Vec<Option<WebSearchResults>> =
-                Vec::with_capacity(round.tool_uses.len());
+            // 抓取 / 搜索失败都在结果里带回，不会让整个请求失败。
+            let mut outcomes = Vec::with_capacity(round.tool_uses.len());
             for tu in &round.tool_uses {
-                searched.push(
-                    execute_web_search(
+                outcomes.push(
+                    execute_server_tool(
                         &provider,
                         tu,
                         tracer.as_ref(),
@@ -1674,31 +1846,31 @@ async fn run_web_search_loop_inner(
                     .await,
                 );
             }
-            append_search_round(&mut payload, &round, &searched, &mut presentation);
+            append_server_tool_round(&mut payload, &round, &outcomes, &mut presentation);
             if round_idx + 1 == MAX_WEB_SEARCH_ROUNDS {
                 append_search_limit_notice(&mut payload);
             }
             continue;
         }
 
-        // Terminate: this round is not "pure web_search", or the limit has been reached -> flush to the client.
-        // stop_reason must reflect CLIENT tools only: web_search is handled internally
+        // Terminate: this round mixes in client tools, or the limit has been reached -> flush to the client.
+        // stop_reason must reflect CLIENT tools only: server tools are handled internally
         // (presented as server_tool_use, not a pending tool_use), so a round with only
-        // web_search must end as "end_turn", not "tool_use" (otherwise the host would
+        // server tools must end as "end_turn", not "tool_use" (otherwise the host would
         // wait for a client tool call that is never emitted).
-        let (_web_uses, client_uses) = partition_tool_uses(&round.tool_uses);
-        // INVARIANT: web_search is ALWAYS executed internally and is NEVER flushed
-        // as a raw tool_use (the Codex host has no executor for it and rejects it
-        // with "unsupported call: web_search"). This covers the mixed-round case
-        // (web_search + exec) and the round-limit case: search every web_search call
-        // in this final round here, then build the flushed content with web_search
-        // presented as server_tool_use + web_search_tool_result while client tools
-        // (exec, etc.) are returned verbatim.
-        let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
+        let (_server_uses, client_uses) = partition_tool_uses(&round.tool_uses);
+        // INVARIANT: server tools are ALWAYS executed internally and are NEVER flushed
+        // as a raw tool_use (the Codex host has no executor for them and rejects the
+        // call with "unsupported call"). This covers the mixed-round case
+        // (web_search/web_fetch + exec) and the round-limit case: run every server tool
+        // call in this final round here, then build the flushed content with them
+        // presented as server_tool_use + result while client tools (exec, etc.) are
+        // returned verbatim.
+        let mut outcomes: Vec<ServerToolOutcome> = Vec::with_capacity(round.tool_uses.len());
         for tu in &round.tool_uses {
-            if tu.name == "web_search" {
-                searched.push(
-                    execute_web_search(
+            if is_server_tool_name(&tu.name) {
+                outcomes.push(
+                    execute_server_tool(
                         &provider,
                         tu,
                         tracer.as_ref(),
@@ -1709,14 +1881,14 @@ async fn run_web_search_loop_inner(
                     .await,
                 );
             } else {
-                searched.push(None);
+                outcomes.push(ServerToolOutcome::Client);
             }
         }
         let content = build_flush_content(
             presentation.clone(),
             &round.text,
             &round.tool_uses,
-            &searched,
+            &outcomes,
             &round.known_tool_names,
             &round.tool_name_map,
         );
@@ -2401,25 +2573,35 @@ mod tests {
     fn round_with_only_web_search_continues() {
         // Hit: this round is all web_search and the limit is not reached -> keep searching
         let tools = vec![tu("web_search"), tu("web_search")];
-        assert!(should_search_round(0, &tools));
-        assert!(should_search_round(MAX_WEB_SEARCH_ROUNDS - 1, &tools));
+        assert!(should_server_tool_round(0, &tools));
+        assert!(should_server_tool_round(MAX_WEB_SEARCH_ROUNDS - 1, &tools));
     }
 
     #[test]
     fn round_with_exec_does_not_enter_loop() {
         // Skip: exec mixed in (not web_search) -> terminate, exec returned to the client as-is
         let mixed = vec![tu("web_search"), tu("exec")];
-        assert!(!should_search_round(0, &mixed));
+        assert!(!should_server_tool_round(0, &mixed));
         // Same for exec-only
         let exec_only = vec![tu("exec")];
-        assert!(!should_search_round(0, &exec_only));
+        assert!(!should_server_tool_round(0, &exec_only));
     }
 
     #[test]
     fn round_with_no_tool_use_does_not_enter_loop() {
         // Skip: no tool_use at all (plain-text answer) -> terminate
         let empty: Vec<CompletedToolUse> = vec![];
-        assert!(!should_search_round(0, &empty));
+        assert!(!should_server_tool_round(0, &empty));
+    }
+
+    #[test]
+    fn round_with_web_fetch_continues() {
+        // web_fetch 与 web_search 一样由代理执行 -> 继续循环
+        assert!(should_server_tool_round(0, &[tu("web_fetch")]));
+        // 搜索 + 抓取混用，没有客户端工具 -> 仍在内部处理
+        assert!(should_server_tool_round(0, &[tu("web_search"), tu("web_fetch")]));
+        // 掺了客户端工具 -> 收尾
+        assert!(!should_server_tool_round(0, &[tu("web_fetch"), tu("exec")]));
     }
 
     fn round_outcome(text: &str, tool_uses: Vec<CompletedToolUse>) -> RoundOutcome {
@@ -2555,8 +2737,8 @@ mod tests {
     fn round_at_limit_stops_even_if_web_search() {
         // Limit reached: even if this round is all web_search, hitting the limit must stop (prevents an infinite loop)
         let tools = vec![tu("web_search")];
-        assert!(!should_search_round(MAX_WEB_SEARCH_ROUNDS, &tools));
-        assert!(!should_search_round(MAX_WEB_SEARCH_ROUNDS + 1, &tools));
+        assert!(!should_server_tool_round(MAX_WEB_SEARCH_ROUNDS, &tools));
+        assert!(!should_server_tool_round(MAX_WEB_SEARCH_ROUNDS + 1, &tools));
     }
 
     // ---- build_result_block: search results -> Contract A web_search_result fields ----
@@ -2617,10 +2799,10 @@ mod tests {
         let mut payload = payload_with_last_block(json!({"type": "text", "text": "search it"}));
         let round = round_outcome("", vec![tu_with_input(json!({"query": "rust 2026"}))]);
         let mut presentation = Vec::new();
-        append_search_round(
+        append_server_tool_round(
             &mut payload,
             &round,
-            &[failed_search("rust 2026", "unavailable")],
+            &[ServerToolOutcome::Search(failed_search("rust 2026", "unavailable"))],
             &mut presentation,
         );
 
@@ -2643,10 +2825,10 @@ mod tests {
         let mut payload = payload_with_last_block(json!({"type": "text", "text": "search it"}));
         payload.tool_choice = Some(json!({"type": "tool", "name": "web_search"}));
         let round = round_outcome("", vec![tu("web_search")]);
-        append_search_round(
+        append_server_tool_round(
             &mut payload,
             &round,
-            &[fake_results("rust 2026")],
+            &[ServerToolOutcome::Search(fake_results("rust 2026"))],
             &mut Vec::new(),
         );
         assert_eq!(payload.tool_choice, None);
@@ -2656,10 +2838,10 @@ mod tests {
     fn search_limit_notice_is_appended_after_tool_results() {
         let mut payload = payload_with_last_block(json!({"type": "text", "text": "search it"}));
         let round = round_outcome("", vec![tu("web_search")]);
-        append_search_round(
+        append_server_tool_round(
             &mut payload,
             &round,
-            &[fake_results("rust 2026")],
+            &[ServerToolOutcome::Search(fake_results("rust 2026"))],
             &mut Vec::new(),
         );
         append_search_limit_notice(&mut payload);
@@ -2762,12 +2944,15 @@ mod tests {
     #[test]
     fn flush_content_mixed_round_never_emits_raw_web_search() {
         let tool_uses = vec![tu("web_search"), tu("exec")];
-        let searched = vec![fake_results("rust 2026"), None];
+        let outcomes = vec![
+            ServerToolOutcome::Search(fake_results("rust 2026")),
+            ServerToolOutcome::Client,
+        ];
         let content = build_flush_content(
             Vec::new(),
             "answer",
             &tool_uses,
-            &searched,
+            &outcomes,
             &names(&["exec"]),
             &nomap(),
         );
@@ -2819,12 +3004,12 @@ mod tests {
     #[test]
     fn flush_content_client_tools_only_passthrough() {
         let tool_uses = vec![tu("exec")];
-        let searched: Vec<Option<WebSearchResults>> = vec![None];
+        let outcomes = vec![ServerToolOutcome::Client];
         let content = build_flush_content(
             Vec::new(),
             "",
             &tool_uses,
-            &searched,
+            &outcomes,
             &names(&["exec"]),
             &nomap(),
         );
@@ -3212,14 +3397,108 @@ mod tests {
         assert_eq!(client[0].name, "exec");
     }
 
+    fn fetch_tool(url: &str) -> CompletedToolUse {
+        CompletedToolUse {
+            id: "toolu_fetch".to_string(),
+            name: "web_fetch".to_string(),
+            input: json!({"url": url}),
+        }
+    }
+
+    fn fetched(url: &str, text: &str) -> ServerToolOutcome {
+        ServerToolOutcome::Fetch(super::super::webfetch::FetchOutcome::Fetched {
+            url: url.to_string(),
+            media_type: "text/html".to_string(),
+            text: text.to_string(),
+            truncated: false,
+        })
+    }
+
+    #[test]
+    fn flush_content_presents_web_fetch_as_server_tool() {
+        let tool_uses = vec![fetch_tool("https://example.com")];
+        let outcomes = vec![fetched("https://example.com", "page body")];
+        let content =
+            build_flush_content(Vec::new(), "", &tool_uses, &outcomes, &names(&[]), &nomap());
+
+        // 绝不能漏出原始 tool_use：客户端没有 web_fetch 执行器
+        assert!(!content.iter().any(|c| c["type"] == "tool_use"));
+        let server_use = content
+            .iter()
+            .find(|c| c["type"] == "server_tool_use")
+            .expect("server_tool_use block");
+        assert_eq!(server_use["name"], "web_fetch");
+        assert_eq!(server_use["input"]["url"], "https://example.com");
+
+        let result = content
+            .iter()
+            .find(|c| c["type"] == "web_fetch_tool_result")
+            .expect("web_fetch_tool_result block");
+        assert_eq!(result["content"]["type"], "web_fetch_result");
+        assert_eq!(result["content"]["content"]["source"]["data"], "page body");
+        assert_eq!(result["tool_use_id"], server_use["id"]);
+    }
+
+    #[test]
+    fn fetch_round_feeds_fetched_text_back_to_the_model() {
+        let mut payload = payload_with_last_block(json!({"type": "text", "text": "read it"}));
+        payload.tool_choice = Some(json!({"type": "tool", "name": "web_fetch"}));
+        let round = round_outcome("", vec![fetch_tool("https://example.com")]);
+        let mut presentation = Vec::new();
+        append_server_tool_round(
+            &mut payload,
+            &round,
+            &[fetched("https://example.com", "the page says hello")],
+            &mut presentation,
+        );
+
+        let tool_result = &payload.messages.last().unwrap().content[0];
+        assert_eq!(tool_result["type"], "tool_result");
+        assert_eq!(tool_result["is_error"], false);
+        let text = tool_result["content"].as_str().unwrap();
+        assert!(text.contains("the page says hello"), "{text}");
+        assert!(text.contains("https://example.com"), "{text}");
+        // 强制 tool_choice 已满足，必须释放，否则后续每轮都会被强制调用
+        assert_eq!(payload.tool_choice, None);
+
+        let result = presentation
+            .iter()
+            .find(|b| b["type"] == "web_fetch_tool_result")
+            .expect("presented result block");
+        assert_eq!(
+            result["content"]["content"]["source"]["data"],
+            "the page says hello"
+        );
+    }
+
+    #[test]
+    fn failed_fetch_is_reported_as_error_result() {
+        let mut payload = payload_with_last_block(json!({"type": "text", "text": "read it"}));
+        let round = round_outcome("", vec![fetch_tool("http://127.0.0.1/secret")]);
+        let outcome = ServerToolOutcome::Fetch(super::super::webfetch::FetchOutcome::Failed {
+            url: "http://127.0.0.1/secret".to_string(),
+            error_code: "url_not_accessible",
+        });
+        append_server_tool_round(&mut payload, &round, &[outcome], &mut Vec::new());
+
+        let tool_result = &payload.messages.last().unwrap().content[0];
+        assert_eq!(tool_result["is_error"], true);
+        assert!(
+            tool_result["content"]
+                .as_str()
+                .unwrap()
+                .contains("url_not_accessible")
+        );
+    }
+
     #[test]
     fn flush_content_only_web_search_has_no_client_tool() {
         // A final round that is only web_search (e.g. round limit hit) must present
         // the search and emit NO raw tool_use at all -> the caller derives end_turn.
         let tool_uses = vec![tu("web_search")];
-        let searched = vec![fake_results("q")];
+        let outcomes = vec![ServerToolOutcome::Search(fake_results("q"))];
         let content =
-            build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&[]), &nomap());
+            build_flush_content(Vec::new(), "", &tool_uses, &outcomes, &names(&[]), &nomap());
         assert!(!content.iter().any(|c| c["type"] == "tool_use"));
         assert!(
             content
@@ -3447,7 +3726,7 @@ mod tests {
             "cache_control": {"type": "ephemeral"}
         }))
         .unwrap();
-        assert!(websearch::has_web_search_among_tools(&payload));
+        assert!(websearch::needs_server_tool_loop(&payload));
 
         let first_total = token::count_all_tokens(
             payload.model.clone(),
@@ -3466,10 +3745,10 @@ mod tests {
             vec![tu_with_input(json!({"query": "latest Rust release"}))],
         );
         let mut presentation = Vec::new();
-        append_search_round(
+        append_server_tool_round(
             &mut payload,
             &search_round,
-            &[fake_results("latest Rust release")],
+            &[ServerToolOutcome::Search(fake_results("latest Rust release"))],
             &mut presentation,
         );
 

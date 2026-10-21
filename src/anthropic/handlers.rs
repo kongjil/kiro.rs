@@ -877,12 +877,10 @@ pub async fn post_messages(
     }
 
     let payload_stream = payload.stream;
-    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
-    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
-    if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!(
-            "detected mixed tools containing web_search, entering the web_search agentic loop"
-        );
+    // 服务端工具（web_search / web_fetch）与客户端工具混用，或只用了 web_fetch：
+    // 都走内部 agentic 循环——由代理执行抓取 / 搜索并把结果回喂给模型。
+    if websearch::needs_server_tool_loop(&payload) {
+        tracing::info!("detected server tools (web_search / web_fetch), entering the agentic loop");
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
@@ -2270,12 +2268,10 @@ pub async fn post_messages_cc(
     }
 
     let payload_stream = payload.stream;
-    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
-    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
-    if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!(
-            "detected mixed tools containing web_search, entering the web_search agentic loop"
-        );
+    // 服务端工具（web_search / web_fetch）与客户端工具混用，或只用了 web_fetch：
+    // 都走内部 agentic 循环——由代理执行抓取 / 搜索并把结果回喂给模型。
+    if websearch::needs_server_tool_loop(&payload) {
+        tracing::info!("detected server tools (web_search / web_fetch), entering the agentic loop");
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
