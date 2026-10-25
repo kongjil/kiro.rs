@@ -1594,17 +1594,23 @@ impl StreamContext {
             cache_write_input_tokens: creation,
             cache_read_input_tokens: read,
         };
-        let cost = super::cache_metering::token_cost_for_model(
+        let cost = super::cache_metering::configured_token_cost_for_model(
             &self.model,
             modified,
             &self.billing_prices,
         );
-        if cost > 0.0 {
+        if let Some(cost) = cost {
             metering.usage = cost;
         } else {
             metering.usage = self.billing_policy.modify_credits(metering.usage, raw, modified);
         }
         Some(metering)
+    }
+
+    pub(crate) fn resolved_credits(&self) -> f64 {
+        self.modified_metering()
+            .map(|metering| metering.usage)
+            .unwrap_or(self.credits)
     }
 
     fn attempt_output_tokens(&self) -> i32 {

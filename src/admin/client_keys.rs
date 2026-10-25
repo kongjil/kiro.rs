@@ -663,6 +663,50 @@ impl ClientKeyManager {
         updated
     }
 
+    /// 按字段增量更新计费策略；外层 None 表示保持，内层 None 表示清除该字段。
+    pub fn update_billing_policy(
+        &self,
+        id: u64,
+        input_multiplier: Option<Option<f64>>,
+        cache_creation_multiplier: Option<Option<f64>>,
+        cache_read_multiplier: Option<Option<f64>>,
+        target_effective_hit_rate: Option<Option<f64>>,
+        sell_multiplier: Option<Option<f64>>,
+    ) -> bool {
+        let valid_multiplier = |v: Option<Option<f64>>| {
+            v.flatten()
+                .map(|x| x.is_finite() && x >= 0.0)
+                .unwrap_or(true)
+        };
+        let valid_target = |v: Option<Option<f64>>| {
+            v.flatten()
+                .map(|x| x.is_finite() && (0.0..=1.0).contains(&x))
+                .unwrap_or(true)
+        };
+        if !valid_multiplier(input_multiplier)
+            || !valid_multiplier(cache_creation_multiplier)
+            || !valid_multiplier(cache_read_multiplier)
+            || !valid_multiplier(sell_multiplier)
+            || !valid_target(target_effective_hit_rate)
+        {
+            return false;
+        }
+        let mut inner = self.inner.write();
+        let updated = match inner.entries.get_mut(&id) {
+            Some(entry) => {
+                if let Some(value) = input_multiplier { entry.input_multiplier = value; }
+                if let Some(value) = cache_creation_multiplier { entry.cache_creation_multiplier = value; }
+                if let Some(value) = cache_read_multiplier { entry.cache_read_multiplier = value; }
+                if let Some(value) = target_effective_hit_rate { entry.target_effective_hit_rate = value; }
+                if let Some(value) = sell_multiplier { entry.sell_multiplier = value.unwrap_or(1.0); }
+                true
+            }
+            None => false,
+        };
+        if updated { self.save_locked(&inner); }
+        updated
+    }
+
     /// 在请求结束时累计 Token 用量并落盘
     pub fn record_usage(
         &self,

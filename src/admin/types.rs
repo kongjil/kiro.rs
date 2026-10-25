@@ -1099,15 +1099,15 @@ pub struct UpdateClientKeyRequest {
     #[serde(default)]
     pub cache_ratio: Option<f64>,
     #[serde(default)]
-    pub input_multiplier: Option<f64>,
+    pub input_multiplier: Option<Option<f64>>,
     #[serde(default)]
-    pub cache_creation_multiplier: Option<f64>,
+    pub cache_creation_multiplier: Option<Option<f64>>,
     #[serde(default)]
-    pub cache_read_multiplier: Option<f64>,
+    pub cache_read_multiplier: Option<Option<f64>>,
     #[serde(default)]
-    pub target_effective_hit_rate: Option<f64>,
+    pub target_effective_hit_rate: Option<Option<f64>>,
     #[serde(default)]
-    pub sell_multiplier: Option<f64>,
+    pub sell_multiplier: Option<Option<f64>>,
 }
 
 /// 设置客户端 Key 的积分使用上限

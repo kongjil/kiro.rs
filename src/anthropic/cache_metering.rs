@@ -307,15 +307,38 @@ pub fn token_cost_for_model(
     prices: &std::collections::HashMap<String, BillingPrice>,
 ) -> f64 {
     let key = model.to_ascii_lowercase();
-    let price = prices
+    let Some(price) = prices
         .get(&key)
-        .or_else(|| prices.get("*"));
-    let Some(price) = price else { return 0.0 };
+        .or_else(|| prices.iter().find(|(name, _)| name.eq_ignore_ascii_case(&key)).map(|(_, price)| price))
+        .or_else(|| prices.get("*"))
+    else {
+        return 0.0;
+    };
     let usage = usage.sanitized();
     usage.uncached_input_tokens as f64 * price.input
         + usage.cache_write_input_tokens as f64 * price.cache_creation
         + usage.cache_read_input_tokens as f64 * price.cache_read
         + usage.output_tokens as f64 * price.output
+}
+
+/// 与 `token_cost_for_model` 相同，但保留“价格未配置”和“价格显式为 0”的区别。
+pub fn configured_token_cost_for_model(
+    model: &str,
+    usage: TokenUsage,
+    prices: &std::collections::HashMap<String, BillingPrice>,
+) -> Option<f64> {
+    let key = model.to_ascii_lowercase();
+    let price = prices
+        .get(&key)
+        .or_else(|| prices.iter().find(|(name, _)| name.eq_ignore_ascii_case(&key)).map(|(_, price)| price))
+        .or_else(|| prices.get("*"))?;
+    let usage = usage.sanitized();
+    Some(
+        usage.uncached_input_tokens as f64 * price.input
+            + usage.cache_write_input_tokens as f64 * price.cache_creation
+            + usage.cache_read_input_tokens as f64 * price.cache_read
+            + usage.output_tokens as f64 * price.output,
+    )
 }
 
 impl CacheUsage {

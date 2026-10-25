@@ -67,6 +67,12 @@ function parseOptionalMultiplier(raw: string): number | undefined {
   return Number.isFinite(n) && n >= 0 ? n : undefined
 }
 
+function parseOptionalMultiplierForUpdate(raw: string): number | null {
+  if (!raw.trim()) return null
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : null
+}
+
 /** 渲染「已用积分 / 上限」列。无上限时仅显示已用量。 */
 function CreditsUsage({ used, max }: { used: number; max?: number }) {
   if (max == null) {
@@ -280,11 +286,11 @@ export function ClientKeysPage() {
           description: editDesc.trim(),
           group: editGroup.trim(),
           cacheRatio: parseCacheRatio(editCacheRatio),
-          inputMultiplier: parseOptionalMultiplier(editInputMultiplier),
-          cacheCreationMultiplier: parseOptionalMultiplier(editCreationMultiplier),
-          cacheReadMultiplier: parseOptionalMultiplier(editReadMultiplier),
-          targetEffectiveHitRate: parseOptionalMultiplier(editTargetRate),
-          sellMultiplier: parseOptionalMultiplier(editSellMultiplier) ?? 1,
+          inputMultiplier: parseOptionalMultiplierForUpdate(editInputMultiplier),
+          cacheCreationMultiplier: parseOptionalMultiplierForUpdate(editCreationMultiplier),
+          cacheReadMultiplier: parseOptionalMultiplierForUpdate(editReadMultiplier),
+          targetEffectiveHitRate: parseOptionalMultiplierForUpdate(editTargetRate),
+          sellMultiplier: parseOptionalMultiplierForUpdate(editSellMultiplier),
         },
       })
       // 仅在上限发生变化时才调用额度接口，避免无谓写入

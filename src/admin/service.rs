@@ -99,7 +99,10 @@ fn credential_metadata_details(
         .unwrap_or_default();
     let mut extra_keys: Vec<String> = values
         .keys()
-        .filter(|key| !properties.is_some_and(|fields| fields.contains_key(*key)))
+        .filter(|key| {
+            !key.starts_with("_billing_")
+                && !properties.is_some_and(|fields| fields.contains_key(*key))
+        })
         .cloned()
         .collect();
     extra_keys.sort();
@@ -1734,6 +1737,20 @@ impl AdminService {
                 .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
         }
         let mut metadata = req.metadata;
+        // Billing configuration is stored in private metadata keys for backward-compatible
+        // credential-file migration. Preserve those keys when the visible Metadata editor
+        // submits a replacement object that does not include them.
+        if let Some(ref mut replacement) = metadata {
+            if let Some(current) = self.token_manager.clone_credential(id) {
+                for key in ["_billing_account_cost_cny", "_billing_cost_multiplier"] {
+                    if !replacement.extra.contains_key(key) {
+                        if let Some(value) = current.metadata.extra.get(key) {
+                            replacement.extra.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+            }
+        }
         if let Some(value) = req.account_cost_cny {
             if !value.is_finite() || value < 0.0 {
                 return Err(AdminServiceError::InvalidCredential(

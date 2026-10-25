@@ -1121,13 +1121,13 @@ impl WebSearchUsageSettlement {
     /// meteringEvent 累计值，单位沿用最近一次上游事件。
     fn response_metering(&self, latest: Option<&MeteringEvent>) -> Option<MeteringEvent> {
         latest.map(|metering| {
-            let cost = super::cache_metering::token_cost_for_model(
+            let cost = super::cache_metering::configured_token_cost_for_model(
                 &self.model,
                 self.usage,
                 &self.billing_prices,
             );
             MeteringEvent {
-            usage: if cost > 0.0 {
+            usage: if let Some(cost) = cost {
                 cost
             } else {
                 self.billing_policy.modify_credits(self.raw_credits, self.raw_usage, self.usage)

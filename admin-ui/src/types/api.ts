@@ -512,11 +512,11 @@ export interface UpdateClientKeyRequest {
   group?: string
   /** 缓存计费系数（可选，0~1，不传表示不修改） */
   cacheRatio?: number
-  inputMultiplier?: number
-  cacheCreationMultiplier?: number
-  cacheReadMultiplier?: number
-  targetEffectiveHitRate?: number
-  sellMultiplier?: number
+  inputMultiplier?: number | null
+  cacheCreationMultiplier?: number | null
+  cacheReadMultiplier?: number | null
+  targetEffectiveHitRate?: number | null
+  sellMultiplier?: number | null
 }
 
 // ============ 用量统计 ============

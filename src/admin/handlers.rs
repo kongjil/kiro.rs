@@ -1073,6 +1073,26 @@ fn billing_policy_invalid(
             .unwrap_or(false)
 }
 
+fn billing_policy_patch_invalid(
+    input_multiplier: Option<Option<f64>>,
+    cache_creation_multiplier: Option<Option<f64>>,
+    cache_read_multiplier: Option<Option<f64>>,
+    target_effective_hit_rate: Option<Option<f64>>,
+    sell_multiplier: Option<Option<f64>>,
+) -> bool {
+    let valid_multiplier = |v: Option<Option<f64>>| {
+        v.flatten().map(|x| x.is_finite() && x >= 0.0).unwrap_or(true)
+    };
+    !valid_multiplier(input_multiplier)
+        || !valid_multiplier(cache_creation_multiplier)
+        || !valid_multiplier(cache_read_multiplier)
+        || !valid_multiplier(sell_multiplier)
+        || target_effective_hit_rate
+            .flatten()
+            .map(|x| !x.is_finite() || !(0.0..=1.0).contains(&x))
+            .unwrap_or(false)
+}
+
 /// GET /api/admin/client-keys
 pub async fn list_client_keys(State(state): State<AdminState>) -> impl IntoResponse {
     let keys = state.client_keys.list();
@@ -1259,7 +1279,7 @@ pub async fn update_client_key(
         )
             .into_response();
     }
-    if billing_policy_invalid(
+    if billing_policy_patch_invalid(
         payload.input_multiplier,
         payload.cache_creation_multiplier,
         payload.cache_read_multiplier,
@@ -1298,7 +1318,7 @@ pub async fn update_client_key(
             || payload.target_effective_hit_rate.is_some()
             || payload.sell_multiplier.is_some()
         {
-            state.client_keys.set_billing_policy(
+            state.client_keys.update_billing_policy(
                 id,
                 payload.input_multiplier,
                 payload.cache_creation_multiplier,

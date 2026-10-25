@@ -108,7 +108,7 @@ impl UsageRecordHook {
     ) {
         let raw = raw.sanitized();
         let modified = modified.sanitized();
-        let modified_token_cost = super::cache_metering::token_cost_for_model(
+        let modified_token_cost = super::cache_metering::configured_token_cost_for_model(
             &self.model,
             modified,
             &self.billing_prices,
@@ -118,8 +118,8 @@ impl UsageRecordHook {
         } else {
             0.0
         };
-        let modified_credits_value = if modified_token_cost > 0.0 {
-            modified_token_cost
+        let modified_credits_value = if let Some(cost) = modified_token_cost {
+            cost
         } else if modified_credits.is_finite() && modified_credits > 0.0 {
             modified_credits
         } else {
@@ -1420,6 +1420,7 @@ struct StreamSettlement {
     tracer: std::sync::Arc<RequestTracer>,
     usage: TraceUsage,
     raw_usage: (i32, i32, i32),
+    raw_credits: f64,
     sent_bytes: u64,
     settled: bool,
 }
@@ -1462,6 +1463,7 @@ impl StreamSettlement {
             tracer,
             usage: stream_trace_usage(ctx),
             raw_usage: ctx.raw_resolved_usage(),
+            raw_credits: ctx.credits,
             sent_bytes: 0,
             settled: false,
         }
@@ -1470,6 +1472,7 @@ impl StreamSettlement {
     fn update(&mut self, ctx: &StreamContext, sent_bytes: u64) {
         self.usage = stream_trace_usage(ctx);
         self.raw_usage = ctx.raw_resolved_usage();
+        self.raw_credits = ctx.credits;
         self.sent_bytes = sent_bytes;
     }
 
@@ -1512,7 +1515,7 @@ impl StreamSettlement {
             self.credential_id,
             raw,
             modified,
-            self.usage.credits,
+            self.raw_credits,
             self.usage.credits,
             status,
         );
@@ -1545,8 +1548,8 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
         source: UsageSource::resolve(ctx.provider_token_usage.is_some(), &ctx.cache_usage),
-        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
-            ctx.credits
+        credits: if ctx.resolved_credits().is_finite() && ctx.resolved_credits() > 0.0 {
+            ctx.resolved_credits()
         } else {
             0.0
         },
@@ -2141,7 +2144,7 @@ pub(crate) async fn execute_non_stream_request(
     // 上游 meteringEvent 的 credit_* 字段（只在收到过 meteringEvent 时追加），
     // 下游计费系统按它核算 Kiro 侧成本。
     if let Some(m) = &metering {
-        let modified_credit = super::cache_metering::token_cost_for_model(
+        let modified_credit = super::cache_metering::configured_token_cost_for_model(
             model,
             TokenUsage {
                 uncached_input_tokens: final_input_tokens,
@@ -2151,11 +2154,9 @@ pub(crate) async fn execute_non_stream_request(
             },
             &hook.billing_prices,
         );
-        let modified_credit = if modified_credit > 0.0 {
-            modified_credit
-        } else {
+        let modified_credit = modified_credit.unwrap_or_else(|| {
             billing_policy.modify_credits(m.usage, raw_usage_for_credit, modified_usage_for_credit)
-        };
+        });
         usage_json["credit_usage"] = json!(modified_credit);
         usage_json["credit_unit"] = json!(m.unit);
         usage_json["credit_unit_plural"] = json!(m.unit_plural);
