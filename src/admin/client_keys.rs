@@ -64,6 +64,21 @@ pub struct ClientKey {
     /// 0 表示缓存 token 归零。不影响发往上游的真实请求与 credit 消耗。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ratio: Option<f64>,
+    /// 普通 input 的计费用量倍率；空值表示 raw 模式下的默认 1.0。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_multiplier: Option<f64>,
+    /// cache creation/write 的计费用量倍率。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_multiplier: Option<f64>,
+    /// cache read 的计费用量倍率。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_multiplier: Option<f64>,
+    /// 目标有效缓存命中率（0~1）；设置后动态求解 read multiplier。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_effective_hit_rate: Option<f64>,
+    /// 下游卖出倍率；只用于内部销售统计，不改变请求响应。
+    #[serde(default, skip_serializing_if = "is_one_f64")]
+    pub sell_multiplier: f64,
     /// 系统 Key（由 config.json apiKey 同步，不可删除、可轮换）。
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -204,6 +219,11 @@ impl ClientKeyManager {
             max_credits: None,
             group: group.filter(|g| !g.trim().is_empty()),
             cache_ratio: None,
+            input_multiplier: None,
+            cache_creation_multiplier: None,
+            cache_read_multiplier: None,
+            target_effective_hit_rate: None,
+            sell_multiplier: 1.0,
             is_system: false,
         };
         inner.by_key.insert(plaintext, id);
@@ -249,6 +269,11 @@ impl ClientKeyManager {
                     max_credits: None,
                     group: None,
                     cache_ratio: None,
+                    input_multiplier: None,
+                    cache_creation_multiplier: None,
+                    cache_read_multiplier: None,
+                    target_effective_hit_rate: None,
+                    sell_multiplier: 1.0,
                     is_system: true,
                 },
             );
@@ -357,6 +382,41 @@ impl ClientKeyManager {
     /// 返回指定 Key 的有效缓存计费系数（未设置或 Key 不存在时为 1.0）
     pub fn cache_ratio_of(&self, id: u64) -> f64 {
         normalize_cache_ratio(self.inner.read().entries.get(&id).and_then(|e| e.cache_ratio))
+    }
+
+    /// 返回该 Key 的完整计费策略字段；缺省值保持 raw 行为。
+    pub fn billing_policy_of(
+        &self,
+        id: u64,
+    ) -> (
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        f64,
+    ) {
+        let inner = self.inner.read();
+        let Some(entry) = inner.entries.get(&id) else {
+            return (None, None, None, None, None, 1.0);
+        };
+        (
+            entry.cache_ratio,
+            entry.input_multiplier,
+            entry.cache_creation_multiplier,
+            entry.cache_read_multiplier,
+            entry.target_effective_hit_rate,
+            normalize_sell_multiplier(entry.sell_multiplier),
+        )
+    }
+
+    pub fn sell_multiplier_of(&self, id: u64) -> f64 {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(|entry| normalize_sell_multiplier(entry.sell_multiplier))
+            .unwrap_or(1.0)
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
@@ -558,6 +618,51 @@ impl ClientKeyManager {
         updated
     }
 
+    /// 设置 Key 的新计费策略字段。`None` 表示回到 raw 模式默认值。
+    pub fn set_billing_policy(
+        &self,
+        id: u64,
+        input_multiplier: Option<f64>,
+        cache_creation_multiplier: Option<f64>,
+        cache_read_multiplier: Option<f64>,
+        target_effective_hit_rate: Option<f64>,
+        sell_multiplier: Option<f64>,
+    ) -> bool {
+        let valid_multiplier = |v: Option<f64>| {
+            v.map(|x| x.is_finite() && x >= 0.0).unwrap_or(true)
+        };
+        let valid_target = |v: Option<f64>| {
+            v.map(|x| x.is_finite() && (0.0..=1.0).contains(&x))
+                .unwrap_or(true)
+        };
+        if !valid_multiplier(input_multiplier)
+            || !valid_multiplier(cache_creation_multiplier)
+            || !valid_multiplier(cache_read_multiplier)
+            || !valid_multiplier(sell_multiplier)
+            || !valid_target(target_effective_hit_rate)
+        {
+            return false;
+        }
+        let mut inner = self.inner.write();
+        let updated = match inner.entries.get_mut(&id) {
+            Some(entry) => {
+                entry.input_multiplier = input_multiplier;
+                entry.cache_creation_multiplier = cache_creation_multiplier;
+                entry.cache_read_multiplier = cache_read_multiplier;
+                entry.target_effective_hit_rate = target_effective_hit_rate;
+                if let Some(value) = sell_multiplier {
+                    entry.sell_multiplier = value;
+                }
+                true
+            }
+            None => false,
+        };
+        if updated {
+            self.save_locked(&inner);
+        }
+        updated
+    }
+
     /// 在请求结束时累计 Token 用量并落盘
     pub fn record_usage(
         &self,
@@ -596,6 +701,14 @@ impl Default for ClientKeyManager {
 
 fn is_false(b: &bool) -> bool {
     !b
+}
+
+fn is_one_f64(v: &f64) -> bool {
+    (*v - 1.0).abs() < f64::EPSILON
+}
+
+pub fn normalize_sell_multiplier(v: f64) -> f64 {
+    if v.is_finite() && v >= 0.0 { v } else { 1.0 }
 }
 
 /// 把存储的缓存计费系数归一为有效值：未设置 / 非有限值为 1.0，其余夹到 0.0~1.0。

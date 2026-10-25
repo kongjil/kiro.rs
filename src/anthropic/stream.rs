@@ -1476,6 +1476,10 @@ pub struct StreamContext {
     /// 做互斥分摊：`input + cache_creation + cache_read == total`，避免把被缓存
     /// 覆盖的前缀重复计进 input_tokens。
     pub cache_usage: super::cache_metering::CacheUsage,
+    /// 对下游公开的 usage 修改策略；原始 usage 仍由 provider/cache_usage 保留。
+    pub billing_policy: super::cache_metering::BillingPolicy,
+    /// 按模型计算修改后 credit 的价格表；为空时保留上游原始 credit。
+    pub billing_prices: std::sync::Arc<std::collections::HashMap<String, crate::model::config::BillingPrice>>,
     /// meteringEvent 上报的 credit 计费量（上游真实下发，多次事件累加得到本次总量）
     pub credits: f64,
     /// 最近一次 meteringEvent 完整 payload（含 unit / unit_plural / usage）。
@@ -1513,6 +1517,24 @@ pub struct StreamContext {
 }
 
 impl StreamContext {
+    /// 解析未应用 Key 计费策略的原始 usage，供管理端审计；该值不进入下游响应。
+    pub fn raw_resolved_usage(&self) -> (i32, i32, i32) {
+        if let Some(usage) = self.provider_token_usage {
+            let usage = usage.sanitized();
+            return (
+                usage.uncached_input_tokens,
+                usage.cache_write_input_tokens,
+                usage.cache_read_input_tokens,
+            );
+        }
+        let total_real = crate::token::input_tokens_excluding_output(
+            self.context_input_tokens,
+            self.input_tokens,
+            self.output_tokens,
+        );
+        self.cache_usage.split_against_total(total_real)
+    }
+
     /// 解析 Anthropic 口径的 `(uncached_input, cache_write, cache_read)`。
     ///
     /// 精确 `metadataEvent.tokenUsage` 优先；只有上游未提供该事件时，才按
@@ -1522,7 +1544,7 @@ impl StreamContext {
             return frozen;
         }
         if let Some(usage) = self.provider_token_usage {
-            let usage = self.cache_usage.apply_to_provider_usage(usage);
+            let usage = self.billing_policy.apply_to_provider_usage(usage);
             return (
                 usage.uncached_input_tokens,
                 usage.cache_write_input_tokens,
@@ -1537,12 +1559,52 @@ impl StreamContext {
             self.input_tokens,
             self.output_tokens,
         );
-        self.cache_usage.split_against_total(total_real)
+        let usage = self.billing_policy.apply_to_simulated_usage(
+            &self.cache_usage,
+            total_real,
+            self.output_tokens,
+        );
+        (
+            usage.uncached_input_tokens,
+            usage.cache_write_input_tokens,
+            usage.cache_read_input_tokens,
+        )
     }
 
     /// 精确 provider 输出 token 优先，否则返回流内容的本地估算；截断重试时累加之前各次尝试。
     pub fn resolved_output_tokens(&self) -> i32 {
         self.carried_output_tokens + self.attempt_output_tokens()
+    }
+
+    fn modified_metering(&self) -> Option<MeteringEvent> {
+        let mut metering = self.metering.clone()?;
+        let (input, creation, read) = self.resolved_usage();
+        let raw = {
+            let (raw_input, raw_creation, raw_read) = self.raw_resolved_usage();
+            TokenUsage {
+                uncached_input_tokens: raw_input,
+                output_tokens: self.resolved_output_tokens(),
+                cache_write_input_tokens: raw_creation,
+                cache_read_input_tokens: raw_read,
+            }
+        };
+        let modified = TokenUsage {
+            uncached_input_tokens: input,
+            output_tokens: self.resolved_output_tokens(),
+            cache_write_input_tokens: creation,
+            cache_read_input_tokens: read,
+        };
+        let cost = super::cache_metering::token_cost_for_model(
+            &self.model,
+            modified,
+            &self.billing_prices,
+        );
+        if cost > 0.0 {
+            metering.usage = cost;
+        } else {
+            metering.usage = self.billing_policy.modify_credits(metering.usage, raw, modified);
+        }
+        Some(metering)
     }
 
     fn attempt_output_tokens(&self) -> i32 {
@@ -1589,6 +1651,8 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
+            billing_policy: super::cache_metering::BillingPolicy::default(),
+            billing_prices: std::sync::Arc::new(std::collections::HashMap::new()),
             credits: 0.0,
             metering: None,
             repeat_guard_last_line: String::new(),
@@ -2771,12 +2835,13 @@ impl StreamContext {
 
         // 生成最终事件（message_delta + message_stop）
         let creation_ttl = self.cache_usage.split_creation_ttl(cache_creation);
+        let modified_metering = self.modified_metering();
         events.extend(self.state_manager.generate_final_events(
             final_input_tokens,
             final_output_tokens,
             cache_creation,
             cache_read,
-            self.metering.as_ref(),
+            modified_metering.as_ref(),
             creation_ttl,
         ));
 

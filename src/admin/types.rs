@@ -95,6 +95,11 @@ pub struct CredentialStatusItem {
     /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    /// 账号固定成本（CNY，按月/周期由运营约定）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_cost_cny: Option<f64>,
+    /// 原始消费的账号成本倍率。
+    pub cost_multiplier: f64,
 }
 
 /// 单个凭据 metadata 字段的可展示信息。
@@ -229,6 +234,12 @@ pub struct AddCredentialRequest {
     /// 凭据扩展元数据（默认账号类型为 normal）
     #[serde(default)]
     pub metadata: CredentialMetadata,
+    /// 账号固定成本（CNY）。
+    #[serde(default)]
+    pub account_cost_cny: Option<f64>,
+    /// 原始消费的账号成本倍率。
+    #[serde(default)]
+    pub cost_multiplier: Option<f64>,
 }
 
 fn default_auth_method() -> String {
@@ -270,6 +281,10 @@ pub struct UpdateCredentialRequest {
     /// 凭据扩展元数据（None 表示不修改）
     #[serde(default)]
     pub metadata: Option<CredentialMetadata>,
+    #[serde(default)]
+    pub account_cost_cny: Option<f64>,
+    #[serde(default)]
+    pub cost_multiplier: Option<f64>,
 }
 
 /// 添加凭据成功响应
@@ -1013,6 +1028,15 @@ pub struct ClientKeyItem {
     pub group: Option<String>,
     /// 有效缓存计费系数（0~1，1 = 满缓存）
     pub cache_ratio: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_multiplier: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_multiplier: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_multiplier: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_effective_hit_rate: Option<f64>,
+    pub sell_multiplier: f64,
     /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
     #[serde(default)]
     pub is_system: bool,
@@ -1041,6 +1065,16 @@ pub struct CreateClientKeyRequest {
     /// 缓存计费系数（可选，0~1；省略表示满缓存）
     #[serde(default)]
     pub cache_ratio: Option<f64>,
+    #[serde(default)]
+    pub input_multiplier: Option<f64>,
+    #[serde(default)]
+    pub cache_creation_multiplier: Option<f64>,
+    #[serde(default)]
+    pub cache_read_multiplier: Option<f64>,
+    #[serde(default)]
+    pub target_effective_hit_rate: Option<f64>,
+    #[serde(default)]
+    pub sell_multiplier: Option<f64>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -1064,6 +1098,16 @@ pub struct UpdateClientKeyRequest {
     /// 缓存计费系数（可选，0~1；省略表示不修改）
     #[serde(default)]
     pub cache_ratio: Option<f64>,
+    #[serde(default)]
+    pub input_multiplier: Option<f64>,
+    #[serde(default)]
+    pub cache_creation_multiplier: Option<f64>,
+    #[serde(default)]
+    pub cache_read_multiplier: Option<f64>,
+    #[serde(default)]
+    pub target_effective_hit_rate: Option<f64>,
+    #[serde(default)]
+    pub sell_multiplier: Option<f64>,
 }
 
 /// 设置客户端 Key 的积分使用上限

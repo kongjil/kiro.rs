@@ -60,6 +60,21 @@ use super::types::{
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 
+fn credential_billing_config(metadata: &CredentialMetadata) -> (Option<f64>, f64) {
+    let account_cost_cny = metadata
+        .extra
+        .get("_billing_account_cost_cny")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|v| v.is_finite() && *v >= 0.0);
+    let cost_multiplier = metadata
+        .extra
+        .get("_billing_cost_multiplier")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(1.0);
+    (account_cost_cny, cost_multiplier)
+}
+
 /// 将原始 metadata 与 schema 合并为客户端可直接消费的字段列表。
 ///
 /// Schema 字段保持其配置顺序，未登记的扩展字段按 key 排序追加；旧凭据缺失的字段
@@ -835,6 +850,8 @@ impl AdminService {
                     .map(|c| (Some(c.data.clone()), Some(c.cached_at)))
                     .unwrap_or((None, None));
                 let metadata = credential_metadata_details(&entry.metadata, &metadata_schema);
+                let (account_cost_cny, cost_multiplier) =
+                    credential_billing_config(&entry.metadata);
 
                 CredentialStatusItem {
                     id: entry.id,
@@ -866,6 +883,8 @@ impl AdminService {
                     balance,
                     balance_updated_at,
                     created_at: entry.created_at,
+                    account_cost_cny,
+                    cost_multiplier,
                 }
             })
             .collect();
@@ -1481,7 +1500,28 @@ impl AdminService {
         req: AddCredentialRequest,
         fetch_balance: bool,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
-        validate_credential_metadata(&req.metadata, &self.credential_metadata_schema.lock())
+        let mut metadata = req.metadata.clone();
+        if let Some(value) = req.account_cost_cny {
+            if !value.is_finite() || value < 0.0 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "accountCostCny 必须是非负有限数".to_string(),
+                ));
+            }
+            metadata
+                .extra
+                .insert("_billing_account_cost_cny".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = req.cost_multiplier {
+            if !value.is_finite() || value < 0.0 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "costMultiplier 必须是非负有限数".to_string(),
+                ));
+            }
+            metadata
+                .extra
+                .insert("_billing_cost_multiplier".to_string(), serde_json::json!(value));
+        }
+        validate_credential_metadata(&metadata, &self.credential_metadata_schema.lock())
             .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
         // 校验端点名：未指定则默认合法，指定则必须已注册
         if let Some(ref name) = req.endpoint {
@@ -1575,7 +1615,7 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
-            metadata: req.metadata,
+            metadata,
             // 创建时间由 token_manager.add_credential 在入库时统一写入
             created_at: None,
         };
@@ -1693,6 +1733,31 @@ impl AdminService {
             validate_credential_metadata(metadata, &self.credential_metadata_schema.lock())
                 .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
         }
+        let mut metadata = req.metadata;
+        if let Some(value) = req.account_cost_cny {
+            if !value.is_finite() || value < 0.0 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "accountCostCny 必须是非负有限数".to_string(),
+                ));
+            }
+            let metadata_ref = metadata.get_or_insert_with(CredentialMetadata::default);
+            metadata_ref.extra.insert(
+                "_billing_account_cost_cny".to_string(),
+                serde_json::json!(value),
+            );
+        }
+        if let Some(value) = req.cost_multiplier {
+            if !value.is_finite() || value < 0.0 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "costMultiplier 必须是非负有限数".to_string(),
+                ));
+            }
+            let metadata_ref = metadata.get_or_insert_with(CredentialMetadata::default);
+            metadata_ref.extra.insert(
+                "_billing_cost_multiplier".to_string(),
+                serde_json::json!(value),
+            );
+        }
         self.token_manager
             .update_credential(
                 id,
@@ -1706,7 +1771,7 @@ impl AdminService {
                 req.groups,
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
-                req.metadata,
+                metadata,
             )
             .map_err(|e| self.classify_error(e, id))
     }

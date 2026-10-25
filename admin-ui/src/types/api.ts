@@ -106,6 +106,8 @@ export interface CredentialStatusItem {
   balanceUpdatedAt?: number
   /** 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 undefined */
   createdAt?: string
+  accountCostCny?: number
+  costMultiplier?: number
 }
 
 // 余额响应
@@ -204,6 +206,8 @@ export interface AddCredentialRequest {
   groups?: string[]
   sourceChannel?: string
   metadata?: CredentialMetadata
+  accountCostCny?: number
+  costMultiplier?: number
 }
 
 // 添加凭据响应
@@ -226,6 +230,8 @@ export interface UpdateCredentialRequest {
   sourceChannel?: string
   /** 整体更新 metadata；调用方应保留不认识的扩展字段 */
   metadata?: CredentialMetadata
+  accountCostCny?: number
+  costMultiplier?: number
 }
 
 // 更新 refreshToken 请求
@@ -463,6 +469,11 @@ export interface ClientKeyItem {
   group?: string
   /** 缓存计费系数（0~1，1 = 满缓存，0 = 无缓存） */
   cacheRatio: number
+  inputMultiplier?: number
+  cacheCreationMultiplier?: number
+  cacheReadMultiplier?: number
+  targetEffectiveHitRate?: number
+  sellMultiplier: number
   /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
   isSystem: boolean
 }
@@ -480,6 +491,11 @@ export interface CreateClientKeyRequest {
   maxCredits?: number
   /** 缓存计费系数（可选，0~1，不传表示满缓存） */
   cacheRatio?: number
+  inputMultiplier?: number
+  cacheCreationMultiplier?: number
+  cacheReadMultiplier?: number
+  targetEffectiveHitRate?: number
+  sellMultiplier?: number
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -496,6 +512,11 @@ export interface UpdateClientKeyRequest {
   group?: string
   /** 缓存计费系数（可选，0~1，不传表示不修改） */
   cacheRatio?: number
+  inputMultiplier?: number
+  cacheCreationMultiplier?: number
+  cacheReadMultiplier?: number
+  targetEffectiveHitRate?: number
+  sellMultiplier?: number
 }
 
 // ============ 用量统计 ============
@@ -540,6 +561,16 @@ export interface TimeSeriesPoint {
   calls: number
   errors: number
   credits: number
+  rawInputTokens: number
+  rawOutputTokens: number
+  rawCacheCreationTokens: number
+  rawCacheReadTokens: number
+  rawTotalTokens: number
+  rawCredits: number
+  modifiedTotalTokens: number
+  modifiedCredits: number
+  accountCost: number
+  sellConsumption: number
 }
 
 export interface ModelDistribution {
@@ -556,6 +587,16 @@ export interface CredentialDistribution {
   inputTokens: number
   outputTokens: number
   errors: number
+  rawInputTokens: number
+  rawOutputTokens: number
+  rawCacheCreationTokens: number
+  rawCacheReadTokens: number
+  rawTotalTokens: number
+  rawCredits: number
+  modifiedTotalTokens: number
+  modifiedCredits: number
+  accountCost: number
+  sellConsumption: number
 }
 
 export interface KeyDistribution {
@@ -568,6 +609,16 @@ export interface KeyDistribution {
   cacheReadTokens: number
   errors: number
   credits: number
+  rawInputTokens: number
+  rawOutputTokens: number
+  rawCacheCreationTokens: number
+  rawCacheReadTokens: number
+  rawTotalTokens: number
+  rawCredits: number
+  modifiedTotalTokens: number
+  modifiedCredits: number
+  accountCost: number
+  sellConsumption: number
 }
 
 // ============ 请求链路追踪 ============

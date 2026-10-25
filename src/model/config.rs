@@ -89,6 +89,20 @@ pub struct CustomModel {
     pub owned_by: Option<String>,
 }
 
+/// 下游计费价格（每 token）。模型名按小写匹配；缺失项使用 0。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingPrice {
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub cache_creation: f64,
+    #[serde(default)]
+    pub cache_read: f64,
+    #[serde(default)]
+    pub output: f64,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -384,6 +398,10 @@ pub struct Config {
     #[serde(default)]
     pub custom_models: Vec<CustomModel>,
 
+    /// 按模型配置的 token 价格表；价格单位由运营约定，默认空表。
+    #[serde(default)]
+    pub billing_prices: HashMap<String, BillingPrice>,
+
     /// 凭据 metadata 的 JSON Schema。未配置时使用程序内置 schema。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_metadata_schema: Option<serde_json::Value>,
@@ -572,6 +590,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
+            billing_prices: HashMap::new(),
             credential_metadata_schema: None,
             config_path: None,
         }

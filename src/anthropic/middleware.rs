@@ -1,6 +1,7 @@
 //! Anthropic API 中间件
 
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use axum::{
     body::Body,
@@ -15,8 +16,9 @@ use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::BillingPrice;
 
-use super::cache_metering::SharedCacheMeter;
+use super::cache_metering::{BillingPolicy, SharedCacheMeter};
 use super::types::ErrorResponse;
 
 /// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
@@ -32,6 +34,8 @@ pub struct KeyContext {
     pub client_ip: Option<String>,
     /// 该 Key 的缓存计费系数（0~1，1 = 满缓存），只影响上报给下游的 usage 拆分
     pub cache_ratio: f64,
+    /// 新版 token 计费策略；字段全部为空时保持 raw 行为。
+    pub billing_policy: BillingPolicy,
 }
 
 /// 应用共享状态
@@ -54,6 +58,8 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// 模型 token 价格表，用于管理端修改后 token 成本统计。
+    pub billing_prices: Arc<HashMap<String, BillingPrice>>,
 }
 
 impl AppState {
@@ -72,6 +78,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            billing_prices: Arc::new(HashMap::new()),
         }
     }
 
@@ -105,6 +112,11 @@ impl AppState {
         self.trace_store = store;
         self
     }
+
+    pub fn with_billing_prices(mut self, prices: HashMap<String, BillingPrice>) -> Self {
+        self.billing_prices = Arc::new(prices);
+        self
+    }
 }
 
 /// API Key 认证中间件
@@ -129,6 +141,14 @@ pub async fn auth_middleware(
             KeyAuth::Ok(id) => {
                 let group = mgr.group_of(id);
                 let cache_ratio = mgr.cache_ratio_of(id);
+                let (
+                    legacy_cache_ratio,
+                    input_multiplier,
+                    cache_creation_multiplier,
+                    cache_read_multiplier,
+                    target_effective_hit_rate,
+                    _sell_multiplier,
+                ) = mgr.billing_policy_of(id);
                 let client_ip = auth::extract_client_ip(&request);
                 request.extensions_mut().insert(KeyContext {
                     key_id: id,
@@ -136,6 +156,13 @@ pub async fn auth_middleware(
                     key_source: TraceKeySource::ClientKey,
                     client_ip,
                     cache_ratio,
+                    billing_policy: BillingPolicy {
+                        cache_ratio: legacy_cache_ratio,
+                        input_multiplier,
+                        cache_creation_multiplier,
+                        cache_read_multiplier,
+                        target_effective_hit_rate,
+                    },
                 });
                 return next.run(request).await;
             }

@@ -84,6 +84,32 @@ pub fn create_router_with_shared_provider(
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
 ) -> Router {
+    create_router_with_shared_provider_and_billing_prices(
+        kiro_provider,
+        extract_thinking,
+        tool_compatibility_mode,
+        client_keys,
+        usage_recorder,
+        usage_aggregator,
+        cache_meter,
+        trace_store,
+        std::collections::HashMap::new(),
+    )
+}
+
+/// 创建共享 Provider 的路由，并注入模型 token 价格表。
+#[allow(clippy::too_many_arguments)]
+pub fn create_router_with_shared_provider_and_billing_prices(
+    kiro_provider: Option<Arc<KiroProvider>>,
+    extract_thinking: bool,
+    tool_compatibility_mode: ToolCompatibilityMode,
+    client_keys: Option<SharedClientKeyManager>,
+    usage_recorder: Option<SharedRecorder>,
+    usage_aggregator: Option<SharedAggregator>,
+    cache_meter: Option<SharedCacheMeter>,
+    trace_store: Option<SharedTraceStore>,
+    billing_prices: std::collections::HashMap<String, crate::model::config::BillingPrice>,
+) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
         state = state.with_shared_kiro_provider(provider);
@@ -91,6 +117,7 @@ pub fn create_router_with_shared_provider(
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
+    state = state.with_billing_prices(billing_prices);
 
     // 需要认证的 /v1 路由
     // Messages 端点的响应经 `claude_wire` 整形后再发给客户端；OpenAI / Responses

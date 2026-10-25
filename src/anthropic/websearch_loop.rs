@@ -37,7 +37,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::cache_metering::{CacheCreationTtl, CacheUsage, SharedCacheMeter};
+use super::cache_metering::{BillingPolicy, CacheCreationTtl, CacheUsage, SharedCacheMeter};
 use super::converter::{convert_request_with_mode, get_context_window_size};
 use super::handlers::{
     RequestTracer, TraceUsage, UsageRecordHook, UsageSource, last_attempt_outcome,
@@ -111,16 +111,43 @@ struct RoundOutcome {
 }
 
 impl RoundOutcome {
+    fn raw_token_usage(&self, fallback_input_tokens: i32, cache_usage: CacheUsage) -> TokenUsage {
+        if let Some(usage) = self.provider_token_usage {
+            return usage.sanitized();
+        }
+        let mut output = Vec::new();
+        if !self.thinking.is_empty() {
+            output.push(json!({"type": "thinking", "thinking": self.thinking}));
+        }
+        if !self.text.is_empty() {
+            output.push(json!({"type": "text", "text": self.text}));
+        }
+        output.extend(self.tool_uses.iter().map(CompletedToolUse::to_anthropic_block));
+        let output_tokens = token::estimate_output_tokens(&output);
+        let total_input_tokens = token::input_tokens_excluding_output(
+            self.context_input_tokens,
+            fallback_input_tokens,
+            output_tokens,
+        );
+        split_simulated_usage(
+            total_input_tokens,
+            output_tokens,
+            cache_usage,
+            BillingPolicy::default(),
+        )
+    }
+
     /// 解析本次 provider 调用的 token 用量；精确 metadata 缺失时，使用本轮
     /// CacheMeter 结果把总 prompt 拆成互斥的 input / cache-write / cache-read。
     fn resolved_token_usage(
         &self,
         fallback_input_tokens: i32,
         cache_usage: CacheUsage,
+        billing_policy: BillingPolicy,
     ) -> (TokenUsage, UsageSource) {
         if let Some(usage) = self.provider_token_usage {
             return (
-                cache_usage.apply_to_provider_usage(usage),
+                billing_policy.apply_to_provider_usage(usage),
                 UsageSource::Provider,
             );
         }
@@ -147,7 +174,7 @@ impl RoundOutcome {
             output_tokens,
         );
         (
-            split_simulated_usage(total_input_tokens, output_tokens, cache_usage),
+            split_simulated_usage(total_input_tokens, output_tokens, cache_usage, billing_policy),
             UsageSource::resolve(false, &cache_usage),
         )
     }
@@ -157,14 +184,9 @@ fn split_simulated_usage(
     total_input_tokens: i32,
     output_tokens: i32,
     cache_usage: CacheUsage,
+    billing_policy: BillingPolicy,
 ) -> TokenUsage {
-    let (input, cache_write, cache_read) = cache_usage.split_against_total(total_input_tokens);
-    TokenUsage {
-        uncached_input_tokens: input,
-        output_tokens: output_tokens.max(0),
-        cache_read_input_tokens: cache_read,
-        cache_write_input_tokens: cache_write,
-    }
+    billing_policy.apply_to_simulated_usage(&cache_usage, total_input_tokens, output_tokens)
 }
 
 /// Normalize model-produced Web Search input into one non-empty query.
@@ -488,6 +510,7 @@ async fn run_round(
     payload: &MessagesRequest,
     fallback_input_tokens: i32,
     cache_usage: CacheUsage,
+    billing_policy: BillingPolicy,
     tracer: &RequestTracer,
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
@@ -543,7 +566,12 @@ async fn run_round(
         Err(e) => {
             let error_type = last_attempt_outcome(tracer).unwrap_or(outcome::UNKNOWN);
             let error_message = e.to_string();
-            let token_usage = split_simulated_usage(fallback_input_tokens, 0, cache_usage);
+            let token_usage = split_simulated_usage(
+                fallback_input_tokens,
+                0,
+                cache_usage,
+                billing_policy,
+            );
             return Err(RoundFailure {
                 response: map_provider_error(e),
                 error_type,
@@ -575,7 +603,7 @@ async fn run_round(
         // The stream is partial and cannot re-enter the search loop, but any final metadata
         // snapshot/credits observed before the cut still belong to this real provider call.
         let (token_usage, usage_source) =
-            outcome.resolved_token_usage(fallback_input_tokens, cache_usage);
+            outcome.resolved_token_usage(fallback_input_tokens, cache_usage, billing_policy);
         return Err(RoundFailure {
             response: (
                 StatusCode::BAD_GATEWAY,
@@ -963,21 +991,21 @@ fn build_flush_content(
     content
 }
 
-fn record_aggregated_usage(
+fn record_aggregated_usage_with_raw(
     hook: &UsageRecordHook,
     credential_id: u64,
-    usage: TokenUsage,
-    credits: f64,
+    raw: TokenUsage,
+    modified: TokenUsage,
+    raw_credits: f64,
+    modified_credits: f64,
     status: &str,
 ) {
-    let usage = usage.sanitized();
-    hook.record(
+    hook.record_with_raw(
         credential_id,
-        usage.uncached_input_tokens,
-        usage.output_tokens,
-        usage.cache_write_input_tokens,
-        usage.cache_read_input_tokens,
-        credits,
+        raw,
+        modified,
+        raw_credits,
+        modified_credits,
         status,
     );
 }
@@ -991,26 +1019,37 @@ struct WebSearchUsageSettlement {
     tracer: Option<Arc<RequestTracer>>,
     credential_id: u64,
     usage: TokenUsage,
+    raw_usage: TokenUsage,
     credits: f64,
+    raw_credits: f64,
     /// 多轮累计的缓存写入 TTL 拆分，下游按 5m / 1h 分别计价。
     creation_ttl: CacheCreationTtl,
     settled: bool,
     /// 多轮聚合后的 usage 来源：全部轮次都有上游精确值才算 provider；任一轮
     /// 使用 CacheMeter 则标 simulated；其余混合回退标 none。
     source: UsageSource,
+    billing_policy: BillingPolicy,
+    model: String,
+    billing_prices: Arc<std::collections::HashMap<String, crate::model::config::BillingPrice>>,
 }
 
 impl WebSearchUsageSettlement {
-    fn new(hook: UsageRecordHook, tracer: Arc<RequestTracer>) -> Self {
+    fn new(hook: UsageRecordHook, tracer: Arc<RequestTracer>, model: String, billing_policy: BillingPolicy) -> Self {
+        let billing_prices = hook.billing_prices.clone();
         Self {
             hook,
             tracer: Some(tracer),
             credential_id: 0,
             usage: TokenUsage::default(),
+            raw_usage: TokenUsage::default(),
             credits: 0.0,
+            raw_credits: 0.0,
             creation_ttl: CacheCreationTtl::default(),
             settled: false,
             source: UsageSource::Unknown,
+            billing_policy,
+            model,
+            billing_prices,
         }
     }
 
@@ -1021,20 +1060,40 @@ impl WebSearchUsageSettlement {
             tracer: None,
             credential_id: 0,
             usage: TokenUsage::default(),
+            raw_usage: TokenUsage::default(),
             credits: 0.0,
+            raw_credits: 0.0,
             creation_ttl: CacheCreationTtl::default(),
             settled: false,
             source: UsageSource::Unknown,
+            billing_policy: BillingPolicy::default(),
+            model: "test-model".to_string(),
+            billing_prices: Arc::new(std::collections::HashMap::new()),
         }
     }
 
     fn add(&mut self, credential_id: u64, usage: TokenUsage, credits: f64) {
+        self.add_with_raw(credential_id, usage, usage, credits, credits);
+    }
+
+    fn add_with_raw(
+        &mut self,
+        credential_id: u64,
+        raw_usage: TokenUsage,
+        usage: TokenUsage,
+        raw_credits: f64,
+        credits: f64,
+    ) {
         if credential_id != 0 {
             self.credential_id = credential_id;
         }
         self.usage = self.usage.saturating_add(usage);
+        self.raw_usage = self.raw_usage.saturating_add(raw_usage);
         if credits.is_finite() && credits > 0.0 {
             self.credits += credits;
+        }
+        if raw_credits.is_finite() && raw_credits > 0.0 {
+            self.raw_credits += raw_credits;
         }
     }
 
@@ -1061,10 +1120,20 @@ impl WebSearchUsageSettlement {
     /// 构造最终响应的计费信息：费用取整条 agentic loop 中所有模型调用的
     /// meteringEvent 累计值，单位沿用最近一次上游事件。
     fn response_metering(&self, latest: Option<&MeteringEvent>) -> Option<MeteringEvent> {
-        latest.map(|metering| MeteringEvent {
-            usage: self.credits,
+        latest.map(|metering| {
+            let cost = super::cache_metering::token_cost_for_model(
+                &self.model,
+                self.usage,
+                &self.billing_prices,
+            );
+            MeteringEvent {
+            usage: if cost > 0.0 {
+                cost
+            } else {
+                self.billing_policy.modify_credits(self.raw_credits, self.raw_usage, self.usage)
+            },
             ..metering.clone()
-        })
+        }})
     }
 
     fn finish(
@@ -1077,11 +1146,14 @@ impl WebSearchUsageSettlement {
         if self.settled {
             return;
         }
-        record_aggregated_usage(
+        let modified_credit = self.response_metering(None).map(|m| m.usage).unwrap_or(self.credits);
+        record_aggregated_usage_with_raw(
             &self.hook,
             self.credential_id,
+            self.raw_usage,
             self.usage,
-            self.credits,
+            self.raw_credits,
+            modified_credit,
             usage_status,
         );
         if let Some(tracer) = &self.tracer {
@@ -1614,7 +1686,7 @@ pub(super) async fn run_web_search_loop(
     tool_compatibility_mode: ToolCompatibilityMode,
     cache_meter: Option<SharedCacheMeter>,
     key_id: u64,
-    cache_ratio: f64,
+    billing_policy: BillingPolicy,
 ) -> Response {
     if !stream_client {
         return run_web_search_loop_inner(
@@ -1626,7 +1698,7 @@ pub(super) async fn run_web_search_loop(
             tool_compatibility_mode,
             cache_meter,
             key_id,
-            cache_ratio,
+            billing_policy,
             None,
         )
         .await;
@@ -1658,7 +1730,7 @@ pub(super) async fn run_web_search_loop(
                 tool_compatibility_mode,
                 cache_meter,
                 key_id,
-                cache_ratio,
+                billing_policy,
                 Some(&mut emitter),
             ))
             .catch_unwind(),
@@ -1701,11 +1773,16 @@ async fn run_web_search_loop_inner(
     tool_compatibility_mode: ToolCompatibilityMode,
     cache_meter: Option<SharedCacheMeter>,
     key_id: u64,
-    cache_ratio: f64,
+    billing_policy: BillingPolicy,
     mut emitter: Option<&mut WebSearchSseEmitter>,
 ) -> Response {
     let mut presentation: Vec<Value> = Vec::new();
-    let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
+    let mut settlement = WebSearchUsageSettlement::new(
+        hook,
+        tracer.clone(),
+        payload.model.clone(),
+        billing_policy,
+    );
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
 
@@ -1723,13 +1800,13 @@ async fn run_web_search_loop_inner(
                     super::cache_metering::compute_cache_usage(cache, &payload, key_id).await
                 }
                 None => CacheUsage::default(),
-            }
-            .with_cache_ratio(cache_ratio);
+            };
             let (round, credential_id) = match run_round(
                 &provider,
                 &payload,
                 round_fallback_input_tokens,
                 round_cache_usage,
+                billing_policy,
                 tracer.as_ref(),
                 group.as_deref(),
                 tool_compatibility_mode,
@@ -1758,11 +1835,22 @@ async fn run_web_search_loop_inner(
                 }
             };
             let (round_usage, usage_source) =
-                round.resolved_token_usage(round_fallback_input_tokens, round_cache_usage);
+                round.resolved_token_usage(
+                    round_fallback_input_tokens,
+                    round_cache_usage,
+                    billing_policy,
+                );
+            let raw_round_usage = round.raw_token_usage(round_fallback_input_tokens, round_cache_usage);
             settlement.add_creation_ttl(
                 round_cache_usage.split_creation_ttl(round_usage.cache_write_input_tokens),
             );
-            settlement.add(credential_id, round_usage, round.credits);
+            settlement.add_with_raw(
+                credential_id,
+                raw_round_usage,
+                round_usage,
+                round.credits,
+                round.credits,
+            );
             settlement.note_source(usage_source);
             // 跨 round 保留最近一次 meteringEvent 的单位字段；最终响应中的 usage
             // 会替换为 settlement 累计的所有模型调用费用。
@@ -2437,6 +2525,8 @@ mod tests {
             key_id: 0,
             model: "test-model".to_string(),
             started_at: std::time::Instant::now(),
+            billing_prices: Arc::new(std::collections::HashMap::new()),
+            token_manager: None,
         };
         let (sender, receiver) = mpsc::channel::<Bytes>(1);
         let in_flight = async move {
@@ -3587,7 +3677,7 @@ mod tests {
             prompt_total_est: 100,
             ..Default::default()
         };
-        let (provider_usage, provider_source) = provider_round.resolved_token_usage(888, simulated);
+        let (provider_usage, provider_source) = provider_round.resolved_token_usage(888, simulated, BillingPolicy::default());
         assert_eq!(provider_source, UsageSource::Provider);
         assert_eq!(
             provider_usage,
@@ -3602,7 +3692,7 @@ mod tests {
         let mut fallback_round = round_outcome("fallback output", vec![]);
         fallback_round.context_input_tokens = Some(20);
         let (fallback_usage, fallback_source) =
-            fallback_round.resolved_token_usage(500, CacheUsage::default());
+            fallback_round.resolved_token_usage(500, CacheUsage::default(), BillingPolicy::default());
         assert_eq!(fallback_source, UsageSource::None);
         // "fallback output" = 15 个西文字符 → count_tokens 得 5 个输出 token。
         assert_eq!(fallback_usage.output_tokens, 5);
@@ -3626,7 +3716,7 @@ mod tests {
         // round_outcome 辅助函数默认不带 contextUsage。
         assert_eq!(round.context_input_tokens, None);
 
-        let (usage, source) = round.resolved_token_usage(500, CacheUsage::default());
+        let (usage, source) = round.resolved_token_usage(500, CacheUsage::default(), BillingPolicy::default());
         assert_eq!(source, UsageSource::None);
         // 回退值 500 来自 count_all_tokens 的 prompt 估算，本就不含输出，原样返回。
         assert_eq!(usage.uncached_input_tokens, 500);
@@ -3642,8 +3732,8 @@ mod tests {
         let mut round_b = round_outcome("fallback output", vec![]);
         round_b.context_input_tokens = Some(30);
 
-        let (usage_a, source_a) = round_a.resolved_token_usage(500, CacheUsage::default());
-        let (usage_b, source_b) = round_b.resolved_token_usage(500, CacheUsage::default());
+        let (usage_a, source_a) = round_a.resolved_token_usage(500, CacheUsage::default(), BillingPolicy::default());
+        let (usage_b, source_b) = round_b.resolved_token_usage(500, CacheUsage::default(), BillingPolicy::default());
         assert_eq!(source_a, UsageSource::None);
         assert_eq!(source_b, UsageSource::None);
         assert_eq!(usage_a.output_tokens, 5);
@@ -3678,7 +3768,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (usage, source) = round.resolved_token_usage(999, cache_usage);
+        let (usage, source) = round.resolved_token_usage(999, cache_usage, BillingPolicy::default());
 
         // context 105 includes 5 output tokens, leaving a 100-token prompt.
         // CacheMeter covers 80%: 60 read + 20 write + 20 ordinary input.
@@ -3735,7 +3825,7 @@ mod tests {
             payload.tools.clone(),
         ) as i32;
         let first_cache = compute_cache_usage_sync(&cache, &payload, 42);
-        let first_usage = split_simulated_usage(first_total, 0, first_cache);
+        let first_usage = split_simulated_usage(first_total, 0, first_cache, BillingPolicy::default());
         assert_eq!(first_usage.cache_read_input_tokens, 0);
         assert!(first_usage.cache_write_input_tokens > 0);
         assert_eq!(first_usage.total_input_tokens(), first_total);
@@ -3759,7 +3849,7 @@ mod tests {
             payload.tools.clone(),
         ) as i32;
         let second_cache = compute_cache_usage_sync(&cache, &payload, 42);
-        let second_usage = split_simulated_usage(second_total, 0, second_cache);
+        let second_usage = split_simulated_usage(second_total, 0, second_cache, BillingPolicy::default());
         assert_eq!(
             second_cache.cache_read, first_cache.cache_covered_est,
             "the next internal round should reuse the prefix written by round one"
@@ -3789,6 +3879,8 @@ mod tests {
             key_id: 0,
             model: "gpt-5.6-sol".to_string(),
             started_at: std::time::Instant::now(),
+            billing_prices: Arc::new(std::collections::HashMap::new()),
+            token_manager: None,
         };
         let mut settlement = WebSearchUsageSettlement::without_trace(hook);
         settlement.note_source(UsageSource::Provider);
@@ -3915,6 +4007,8 @@ mod tests {
             key_id: 0,
             model: "gpt-5.6-sol".to_string(),
             started_at: std::time::Instant::now(),
+            billing_prices: Arc::new(std::collections::HashMap::new()),
+            token_manager: None,
         };
         let mut settlement = WebSearchUsageSettlement::without_trace(hook);
         settlement.add(1, token_usage(10, 2), 0.25);

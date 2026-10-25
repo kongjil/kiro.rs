@@ -61,6 +61,12 @@ function parseCacheRatio(raw: string): number {
   return Math.min(1, Math.max(0, n))
 }
 
+function parseOptionalMultiplier(raw: string): number | undefined {
+  if (!raw.trim()) return undefined
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : undefined
+}
+
 /** 渲染「已用积分 / 上限」列。无上限时仅显示已用量。 */
 function CreditsUsage({ used, max }: { used: number; max?: number }) {
   if (max == null) {
@@ -109,6 +115,11 @@ export function ClientKeysPage() {
   const [createGroup, setCreateGroup] = useState('')
   const [createMaxCredits, setCreateMaxCredits] = useState('')
   const [createCacheRatio, setCreateCacheRatio] = useState('1')
+  const [createInputMultiplier, setCreateInputMultiplier] = useState('')
+  const [createCreationMultiplier, setCreateCreationMultiplier] = useState('')
+  const [createReadMultiplier, setCreateReadMultiplier] = useState('')
+  const [createTargetRate, setCreateTargetRate] = useState('')
+  const [createSellMultiplier, setCreateSellMultiplier] = useState('1')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -119,6 +130,11 @@ export function ClientKeysPage() {
   const [editGroup, setEditGroup] = useState('')
   const [editMaxCredits, setEditMaxCredits] = useState('')
   const [editCacheRatio, setEditCacheRatio] = useState('1')
+  const [editInputMultiplier, setEditInputMultiplier] = useState('')
+  const [editCreationMultiplier, setEditCreationMultiplier] = useState('')
+  const [editReadMultiplier, setEditReadMultiplier] = useState('')
+  const [editTargetRate, setEditTargetRate] = useState('')
+  const [editSellMultiplier, setEditSellMultiplier] = useState('1')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -139,6 +155,11 @@ export function ClientKeysPage() {
         group: createGroup.trim() || undefined,
         maxCredits: maxCredits ?? undefined,
         cacheRatio: parseCacheRatio(createCacheRatio),
+        inputMultiplier: parseOptionalMultiplier(createInputMultiplier),
+        cacheCreationMultiplier: parseOptionalMultiplier(createCreationMultiplier),
+        cacheReadMultiplier: parseOptionalMultiplier(createReadMultiplier),
+        targetEffectiveHitRate: parseOptionalMultiplier(createTargetRate),
+        sellMultiplier: parseOptionalMultiplier(createSellMultiplier) ?? 1,
       })
       setCreatedKey(res)
       setCreateOpen(false)
@@ -147,6 +168,11 @@ export function ClientKeysPage() {
       setCreateGroup('')
       setCreateMaxCredits('')
       setCreateCacheRatio('1')
+      setCreateInputMultiplier('')
+      setCreateCreationMultiplier('')
+      setCreateReadMultiplier('')
+      setCreateTargetRate('')
+      setCreateSellMultiplier('1')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -230,6 +256,11 @@ export function ClientKeysPage() {
     setEditGroup(item.group ?? '')
     setEditMaxCredits(item.maxCredits != null ? String(item.maxCredits) : '')
     setEditCacheRatio(String(item.cacheRatio ?? 1))
+    setEditInputMultiplier(item.inputMultiplier != null ? String(item.inputMultiplier) : '')
+    setEditCreationMultiplier(item.cacheCreationMultiplier != null ? String(item.cacheCreationMultiplier) : '')
+    setEditReadMultiplier(item.cacheReadMultiplier != null ? String(item.cacheReadMultiplier) : '')
+    setEditTargetRate(item.targetEffectiveHitRate != null ? String(item.targetEffectiveHitRate) : '')
+    setEditSellMultiplier(String(item.sellMultiplier ?? 1))
     setEditOpen(true)
   }
 
@@ -249,6 +280,11 @@ export function ClientKeysPage() {
           description: editDesc.trim(),
           group: editGroup.trim(),
           cacheRatio: parseCacheRatio(editCacheRatio),
+          inputMultiplier: parseOptionalMultiplier(editInputMultiplier),
+          cacheCreationMultiplier: parseOptionalMultiplier(editCreationMultiplier),
+          cacheReadMultiplier: parseOptionalMultiplier(editReadMultiplier),
+          targetEffectiveHitRate: parseOptionalMultiplier(editTargetRate),
+          sellMultiplier: parseOptionalMultiplier(editSellMultiplier) ?? 1,
         },
       })
       // 仅在上限发生变化时才调用额度接口，避免无谓写入
@@ -700,6 +736,13 @@ export function ClientKeysPage() {
                   控制本 Key 请求上报给下游的缓存红利比例：1=满缓存（享 cache_read 折扣），0=无缓存（全按 input 计），0.5=缓存覆盖砍半。不影响发往上游的真实请求。
                 </p>
               </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className="text-[12px] text-muted-foreground">Input 倍率（无目标时）</label><Input type="number" min="0" step="0.05" placeholder="留空=原始" value={createInputMultiplier} onChange={(e) => setCreateInputMultiplier(e.target.value)} /></div>
+                <div><label className="text-[12px] text-muted-foreground">Cache 创建倍率（无目标时）</label><Input type="number" min="0" step="0.05" placeholder="留空=原始" value={createCreationMultiplier} onChange={(e) => setCreateCreationMultiplier(e.target.value)} /></div>
+                <div><label className="text-[12px] text-muted-foreground">Cache 读取倍率（无目标时）</label><Input type="number" min="0" step="0.05" placeholder="留空=原始" value={createReadMultiplier} onChange={(e) => setCreateReadMultiplier(e.target.value)} /></div>
+                <div><label className="text-[12px] text-muted-foreground">目标命中率</label><Input type="number" min="0" max="1" step="0.05" placeholder="留空=倍率模式" value={createTargetRate} onChange={(e) => setCreateTargetRate(e.target.value)} /></div>
+                <div><label className="text-[12px] text-muted-foreground">卖出倍率</label><Input type="number" min="0" step="0.05" value={createSellMultiplier} onChange={(e) => setCreateSellMultiplier(e.target.value)} /></div>
+              </div>
               <DialogFooter>
                 <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                   取消
@@ -830,6 +873,13 @@ export function ClientKeysPage() {
                 <p className="mt-1 text-[11px] text-muted-foreground">
                   1=满缓存，0=无缓存（缓存 token 归零，全按 input 计），0.5=缓存红利打五折。
                 </p>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className="text-[12px] text-muted-foreground">Input 倍率（无目标时）</label><Input type="number" min="0" step="0.05" placeholder="留空=原始" value={editInputMultiplier} onChange={(e) => setEditInputMultiplier(e.target.value)} /></div>
+                <div><label className="text-[12px] text-muted-foreground">Cache 创建倍率（无目标时）</label><Input type="number" min="0" step="0.05" placeholder="留空=原始" value={editCreationMultiplier} onChange={(e) => setEditCreationMultiplier(e.target.value)} /></div>
+                <div><label className="text-[12px] text-muted-foreground">Cache 读取倍率（无目标时）</label><Input type="number" min="0" step="0.05" placeholder="留空=原始" value={editReadMultiplier} onChange={(e) => setEditReadMultiplier(e.target.value)} /></div>
+                <div><label className="text-[12px] text-muted-foreground">目标命中率</label><Input type="number" min="0" max="1" step="0.05" placeholder="留空=倍率模式" value={editTargetRate} onChange={(e) => setEditTargetRate(e.target.value)} /></div>
+                <div><label className="text-[12px] text-muted-foreground">卖出倍率</label><Input type="number" min="0" step="0.05" value={editSellMultiplier} onChange={(e) => setEditSellMultiplier(e.target.value)} /></div>
               </div>
               <DialogFooter>
                 <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>

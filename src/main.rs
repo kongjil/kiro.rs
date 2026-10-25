@@ -344,7 +344,7 @@ async fn main() {
         });
     }
 
-    let anthropic_app = anthropic::create_router_with_shared_provider(
+    let anthropic_app = anthropic::create_router_with_shared_provider_and_billing_prices(
         Some(kiro_provider.clone()),
         config.extract_thinking,
         config.tool_compatibility_mode,
@@ -353,6 +353,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        config.billing_prices.clone(),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）

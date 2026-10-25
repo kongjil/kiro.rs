@@ -24,7 +24,7 @@ const HOUR_BUCKETS: usize = 24 * 31;
 const DAY_BUCKETS: usize = 31;
 
 /// 单次请求的用量记录（与 JSONL 一行一一对应）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecord {
     /// 请求结束时间（RFC3339）
@@ -44,6 +44,27 @@ pub struct UsageRecord {
     /// 上游 meteringEvent.usage 上报的 credit 计费量（浮点）
     #[serde(default)]
     pub credits: f64,
+    /// 原始 usage（仅管理端统计；下游响应只使用上面的修改后字段）。
+    #[serde(default)]
+    pub raw_input_tokens: u64,
+    #[serde(default)]
+    pub raw_output_tokens: u64,
+    #[serde(default)]
+    pub raw_cache_creation_tokens: u64,
+    #[serde(default)]
+    pub raw_cache_read_tokens: u64,
+    #[serde(default)]
+    pub raw_total_tokens: u64,
+    #[serde(default)]
+    pub raw_credits: f64,
+    #[serde(default)]
+    pub modified_total_tokens: u64,
+    #[serde(default)]
+    pub modified_credits: f64,
+    #[serde(default)]
+    pub account_cost: f64,
+    #[serde(default)]
+    pub sell_consumption: f64,
     /// 端到端耗时（毫秒）
     #[serde(default)]
     pub duration_ms: u64,
@@ -180,6 +201,16 @@ pub struct BucketStats {
     pub calls: u64,
     pub errors: u64,
     pub credits: f64,
+    pub raw_input_tokens: u64,
+    pub raw_output_tokens: u64,
+    pub raw_cache_creation_tokens: u64,
+    pub raw_cache_read_tokens: u64,
+    pub raw_total_tokens: u64,
+    pub raw_credits: f64,
+    pub modified_total_tokens: u64,
+    pub modified_credits: f64,
+    pub account_cost: f64,
+    pub sell_consumption: f64,
 }
 
 impl BucketStats {
@@ -189,6 +220,16 @@ impl BucketStats {
         self.cache_creation_tokens += rec.cache_creation_tokens;
         self.cache_read_tokens += rec.cache_read_tokens;
         self.credits += rec.credits;
+        self.raw_input_tokens += rec.raw_input_tokens;
+        self.raw_output_tokens += rec.raw_output_tokens;
+        self.raw_cache_creation_tokens += rec.raw_cache_creation_tokens;
+        self.raw_cache_read_tokens += rec.raw_cache_read_tokens;
+        self.raw_total_tokens += rec.raw_total_tokens;
+        self.raw_credits += rec.raw_credits;
+        self.modified_total_tokens += rec.modified_total_tokens;
+        self.modified_credits += rec.modified_credits;
+        self.account_cost += rec.account_cost;
+        self.sell_consumption += rec.sell_consumption;
         self.calls += 1;
         if rec.status != "success" {
             self.errors += 1;
@@ -202,6 +243,16 @@ impl BucketStats {
         self.cache_creation_tokens += other.cache_creation_tokens;
         self.cache_read_tokens += other.cache_read_tokens;
         self.credits += other.credits;
+        self.raw_input_tokens += other.raw_input_tokens;
+        self.raw_output_tokens += other.raw_output_tokens;
+        self.raw_cache_creation_tokens += other.raw_cache_creation_tokens;
+        self.raw_cache_read_tokens += other.raw_cache_read_tokens;
+        self.raw_total_tokens += other.raw_total_tokens;
+        self.raw_credits += other.raw_credits;
+        self.modified_total_tokens += other.modified_total_tokens;
+        self.modified_credits += other.modified_credits;
+        self.account_cost += other.account_cost;
+        self.sell_consumption += other.sell_consumption;
         self.calls += other.calls;
         self.errors += other.errors;
     }
@@ -303,6 +354,16 @@ pub struct TimeSeriesPoint {
     pub calls: u64,
     pub errors: u64,
     pub credits: f64,
+    pub raw_input_tokens: u64,
+    pub raw_output_tokens: u64,
+    pub raw_cache_creation_tokens: u64,
+    pub raw_cache_read_tokens: u64,
+    pub raw_total_tokens: u64,
+    pub raw_credits: f64,
+    pub modified_total_tokens: u64,
+    pub modified_credits: f64,
+    pub account_cost: f64,
+    pub sell_consumption: f64,
 }
 
 /// 模型分布
@@ -324,6 +385,16 @@ pub struct CredentialDistribution {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub errors: u64,
+    pub raw_input_tokens: u64,
+    pub raw_output_tokens: u64,
+    pub raw_cache_creation_tokens: u64,
+    pub raw_cache_read_tokens: u64,
+    pub raw_total_tokens: u64,
+    pub raw_credits: f64,
+    pub modified_total_tokens: u64,
+    pub modified_credits: f64,
+    pub account_cost: f64,
+    pub sell_consumption: f64,
 }
 
 /// 入口 Key 分布
@@ -338,6 +409,16 @@ pub struct KeyDistribution {
     pub cache_read_tokens: u64,
     pub errors: u64,
     pub credits: f64,
+    pub raw_input_tokens: u64,
+    pub raw_output_tokens: u64,
+    pub raw_cache_creation_tokens: u64,
+    pub raw_cache_read_tokens: u64,
+    pub raw_total_tokens: u64,
+    pub raw_credits: f64,
+    pub modified_total_tokens: u64,
+    pub modified_credits: f64,
+    pub account_cost: f64,
+    pub sell_consumption: f64,
 }
 
 /// 概览：今日 + 累计
@@ -483,6 +564,16 @@ impl UsageAggregator {
                     calls: stats.calls,
                     errors: stats.errors,
                     credits: stats.credits,
+                    raw_input_tokens: stats.raw_input_tokens,
+                    raw_output_tokens: stats.raw_output_tokens,
+                    raw_cache_creation_tokens: stats.raw_cache_creation_tokens,
+                    raw_cache_read_tokens: stats.raw_cache_read_tokens,
+                    raw_total_tokens: stats.raw_total_tokens,
+                    raw_credits: stats.raw_credits,
+                    modified_total_tokens: stats.modified_total_tokens,
+                    modified_credits: stats.modified_credits,
+                    account_cost: stats.account_cost,
+                    sell_consumption: stats.sell_consumption,
                 }
             })
             .collect();
@@ -544,10 +635,7 @@ impl UsageAggregator {
                     }
                 }
                 let entry = acc.entry(*id).or_default();
-                entry.input_tokens += stats.input_tokens;
-                entry.output_tokens += stats.output_tokens;
-                entry.calls += stats.calls;
-                entry.errors += stats.errors;
+                entry.add_stats(stats);
             }
         }
         let mut out: Vec<CredentialDistribution> = acc
@@ -558,6 +646,16 @@ impl UsageAggregator {
                 input_tokens: stats.input_tokens,
                 output_tokens: stats.output_tokens,
                 errors: stats.errors,
+                raw_input_tokens: stats.raw_input_tokens,
+                raw_output_tokens: stats.raw_output_tokens,
+                raw_cache_creation_tokens: stats.raw_cache_creation_tokens,
+                raw_cache_read_tokens: stats.raw_cache_read_tokens,
+                raw_total_tokens: stats.raw_total_tokens,
+                raw_credits: stats.raw_credits,
+                modified_total_tokens: stats.modified_total_tokens,
+                modified_credits: stats.modified_credits,
+                account_cost: stats.account_cost,
+                sell_consumption: stats.sell_consumption,
             })
             .collect();
         out.sort_by(|a, b| b.calls.cmp(&a.calls));
@@ -607,6 +705,16 @@ impl UsageAggregator {
                 cache_read_tokens: stats.cache_read_tokens,
                 errors: stats.errors,
                 credits: stats.credits,
+                raw_input_tokens: stats.raw_input_tokens,
+                raw_output_tokens: stats.raw_output_tokens,
+                raw_cache_creation_tokens: stats.raw_cache_creation_tokens,
+                raw_cache_read_tokens: stats.raw_cache_read_tokens,
+                raw_total_tokens: stats.raw_total_tokens,
+                raw_credits: stats.raw_credits,
+                modified_total_tokens: stats.modified_total_tokens,
+                modified_credits: stats.modified_credits,
+                account_cost: stats.account_cost,
+                sell_consumption: stats.sell_consumption,
             })
             .collect();
         out.sort_by(|a, b| b.calls.cmp(&a.calls));
@@ -796,6 +904,7 @@ mod tests {
             credits: 0.05,
             duration_ms: 1500,
             status: "success".to_string(),
+            ..Default::default()
         };
         agg.ingest(&rec);
         agg.ingest(&rec);
@@ -840,6 +949,7 @@ mod tests {
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
+            ..Default::default()
         };
         agg.ingest(&mk(1, 5, 100));
         agg.ingest(&mk(2, 6, 300));
@@ -878,6 +988,7 @@ mod tests {
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
+            ..Default::default()
         };
         let rec_b = UsageRecord {
             ts: now,
@@ -891,6 +1002,7 @@ mod tests {
             credits: 0.02,
             duration_ms: 200,
             status: "error".to_string(),
+            ..Default::default()
         };
         agg.ingest(&rec_a);
         agg.ingest(&rec_b);
@@ -945,6 +1057,7 @@ mod tests {
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
+            ..Default::default()
         };
         let rec_today = UsageRecord {
             ts: today_noon,
@@ -958,6 +1071,7 @@ mod tests {
             credits: 0.02,
             duration_ms: 100,
             status: "success".to_string(),
+            ..Default::default()
         };
         agg.ingest(&rec_yesterday);
         agg.ingest(&rec_today);
@@ -1007,6 +1121,7 @@ mod tests {
             credits: 0.0,
             duration_ms: 100,
             status: "error".to_string(),
+            ..Default::default()
         };
         agg.ingest(&rec);
         let ov = agg.overview();

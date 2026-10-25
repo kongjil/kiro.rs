@@ -315,8 +315,7 @@ async fn run_attempt(
                 .await
         }
         None => super::super::cache_metering::CacheUsage::default(),
-    }
-    .with_cache_ratio(key_ctx.cache_ratio);
+    };
     let tracer = new_non_stream_request_tracer(&state, key_ctx.clone(), model.to_string());
     let anthropic = execute_non_stream_request(
         provider,
@@ -328,6 +327,7 @@ async fn run_attempt(
         std::collections::HashSet::new(),
         hook,
         cache_usage,
+        key_ctx.billing_policy,
         tracer,
         key_ctx.group.clone(),
         None,

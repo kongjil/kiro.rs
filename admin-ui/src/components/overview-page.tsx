@@ -697,7 +697,7 @@ function KeyPanel({
 function KeyTable({ data }: { data: KeyDistribution[] }) {
   return (
     <div className="mt-3 max-h-40 overflow-auto text-[12px]">
-      <table className="min-w-[520px] w-full">
+      <table className="min-w-[760px] w-full">
         <thead className="text-muted-foreground">
           <tr>
             <th className="text-left font-medium pb-1">Key</th>
@@ -706,6 +706,8 @@ function KeyTable({ data }: { data: KeyDistribution[] }) {
             <th className="text-right font-medium">输出</th>
             <th className="text-right font-medium">异常</th>
             <th className="text-right font-medium">Credit</th>
+            <th className="text-right font-medium">原始 Credit</th>
+            <th className="text-right font-medium">卖出消费</th>
           </tr>
         </thead>
         <tbody>
@@ -725,6 +727,8 @@ function KeyTable({ data }: { data: KeyDistribution[] }) {
                 )}
               </td>
               <td className="text-right tabular-nums">{formatCredits(k.credits)}</td>
+              <td className="text-right tabular-nums">{formatCredits(k.rawCredits)}</td>
+              <td className="text-right tabular-nums">{formatCredits(k.sellConsumption)}</td>
             </tr>
           ))}
         </tbody>

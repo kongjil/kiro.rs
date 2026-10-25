@@ -20,5 +20,13 @@
   "cacheMeteringMissDiagnostics": true,
   "traceEnabled": true,
   "traceRetentionDays": 7,
-  "usageLogRetentionDays": 31
+  "usageLogRetentionDays": 31,
+  "billingPrices": {
+    "*": {
+      "input": 0,
+      "cacheCreation": 0,
+      "cacheRead": 0,
+      "output": 0
+    }
+  }
 }

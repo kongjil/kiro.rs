@@ -57,6 +57,8 @@ pub(crate) struct UsageRecordHook {
     pub key_id: u64,
     pub model: String,
     pub started_at: Instant,
+    pub billing_prices: std::sync::Arc<std::collections::HashMap<String, crate::model::config::BillingPrice>>,
+    pub token_manager: Option<std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>>,
 }
 
 impl UsageRecordHook {
@@ -68,6 +70,11 @@ impl UsageRecordHook {
             key_id,
             model,
             started_at: Instant::now(),
+            billing_prices: state.billing_prices.clone(),
+            token_manager: state
+                .kiro_provider
+                .as_ref()
+                .map(|provider| provider.token_manager().clone()),
         }
     }
 
@@ -81,20 +88,81 @@ impl UsageRecordHook {
         credits: f64,
         status: &str,
     ) {
+        let usage = TokenUsage {
+            uncached_input_tokens: input_tokens,
+            output_tokens,
+            cache_write_input_tokens: cache_creation_tokens,
+            cache_read_input_tokens: cache_read_tokens,
+        };
+        self.record_with_raw(credential_id, usage, usage, credits, credits, status);
+    }
+
+    pub fn record_with_raw(
+        &self,
+        credential_id: u64,
+        raw: TokenUsage,
+        modified: TokenUsage,
+        raw_credits: f64,
+        modified_credits: f64,
+        status: &str,
+    ) {
+        let raw = raw.sanitized();
+        let modified = modified.sanitized();
+        let modified_token_cost = super::cache_metering::token_cost_for_model(
+            &self.model,
+            modified,
+            &self.billing_prices,
+        );
+        let raw_credits_value = if raw_credits.is_finite() && raw_credits > 0.0 {
+            raw_credits
+        } else {
+            0.0
+        };
+        let modified_credits_value = if modified_token_cost > 0.0 {
+            modified_token_cost
+        } else if modified_credits.is_finite() && modified_credits > 0.0 {
+            modified_credits
+        } else {
+            0.0
+        };
+        let sell_multiplier = self
+            .client_keys
+            .as_ref()
+            .map(|manager| manager.sell_multiplier_of(self.key_id))
+            .unwrap_or(1.0);
+        let cost_multiplier = self
+            .token_manager
+            .as_ref()
+            .and_then(|manager| manager.clone_credential(credential_id))
+            .and_then(|credential| {
+                credential
+                    .metadata
+                    .extra
+                    .get("_billing_cost_multiplier")
+                    .and_then(serde_json::Value::as_f64)
+            })
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(1.0);
         let rec = UsageRecord {
             ts: Utc::now().to_rfc3339(),
             key_id: self.key_id,
             credential_id,
             model: self.model.clone(),
-            input_tokens: input_tokens.max(0) as u64,
-            output_tokens: output_tokens.max(0) as u64,
-            cache_creation_tokens: cache_creation_tokens.max(0) as u64,
-            cache_read_tokens: cache_read_tokens.max(0) as u64,
-            credits: if credits.is_finite() && credits > 0.0 {
-                credits
-            } else {
-                0.0
-            },
+            input_tokens: modified.uncached_input_tokens as u64,
+            output_tokens: modified.output_tokens as u64,
+            cache_creation_tokens: modified.cache_write_input_tokens as u64,
+            cache_read_tokens: modified.cache_read_input_tokens as u64,
+            credits: modified_credits_value,
+            raw_input_tokens: raw.uncached_input_tokens as u64,
+            raw_output_tokens: raw.output_tokens as u64,
+            raw_cache_creation_tokens: raw.cache_write_input_tokens as u64,
+            raw_cache_read_tokens: raw.cache_read_input_tokens as u64,
+            raw_total_tokens: raw.total_input_tokens().saturating_add(raw.output_tokens) as u64,
+            raw_credits: raw_credits_value,
+            modified_total_tokens: modified.total_input_tokens().saturating_add(modified.output_tokens) as u64,
+            modified_credits: modified_credits_value,
+            account_cost: raw_credits_value * cost_multiplier,
+            sell_consumption: modified_credits_value * sell_multiplier,
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             status: status.to_string(),
         };
@@ -575,15 +643,16 @@ pub(super) fn map_provider_error(err: Error) -> Response {
 ///
 /// 返回 `(uncached_input, output, cache_write, cache_read)`。精确 provider 快照优先；
 /// 缺失时才使用 contextUsage/输入估算和本地 CacheMeter 分摊。
-fn resolve_non_stream_usage(
+fn resolve_non_stream_usage_with_policy(
     fallback_total_input_tokens: i32,
     context_total_input_tokens: Option<i32>,
     fallback_output_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
+    billing_policy: super::cache_metering::BillingPolicy,
     provider_usage: Option<TokenUsage>,
 ) -> (i32, i32, i32, i32) {
     if let Some(usage) = provider_usage {
-        let usage = cache_usage.apply_to_provider_usage(usage);
+        let usage = billing_policy.apply_to_provider_usage(usage);
         return (
             usage.uncached_input_tokens,
             usage.output_tokens,
@@ -598,12 +667,30 @@ fn resolve_non_stream_usage(
         fallback_total_input_tokens,
         fallback_output_tokens,
     );
-    let (input, cache_write, cache_read) = cache_usage.split_against_total(total_input);
+    let usage = billing_policy.apply_to_simulated_usage(&cache_usage, total_input, fallback_output_tokens);
     (
-        input,
-        fallback_output_tokens.max(0),
-        cache_write,
-        cache_read,
+        usage.uncached_input_tokens,
+        usage.output_tokens,
+        usage.cache_write_input_tokens,
+        usage.cache_read_input_tokens,
+    )
+}
+
+#[cfg(test)]
+fn resolve_non_stream_usage(
+    fallback_total_input_tokens: i32,
+    context_total_input_tokens: Option<i32>,
+    fallback_output_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
+    provider_usage: Option<TokenUsage>,
+) -> (i32, i32, i32, i32) {
+    resolve_non_stream_usage_with_policy(
+        fallback_total_input_tokens,
+        context_total_input_tokens,
+        fallback_output_tokens,
+        cache_usage,
+        super::cache_metering::BillingPolicy::default(),
+        provider_usage,
     )
 }
 
@@ -899,7 +986,7 @@ pub async fn post_messages(
             state.tool_compatibility_mode,
             state.cache_meter.clone(),
             key_ctx.key_id,
-            key_ctx.cache_ratio,
+            key_ctx.billing_policy,
         )
         .await;
     }
@@ -963,14 +1050,13 @@ pub async fn post_messages(
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    // 再按客户端 Key 的缓存计费系数缩放（只影响上报给下游的拆分）。
+    // 保留原始 CacheMeter 结果；客户端策略在响应结算时统一应用。
     let cache_usage = match state.cache_meter.as_ref() {
         Some(cache) => {
             super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
         }
         None => super::cache_metering::CacheUsage::default(),
-    }
-    .with_cache_ratio(key_ctx.cache_ratio);
+    };
 
     let model = payload.model.clone();
     let is_stream = payload.stream;
@@ -1003,6 +1089,7 @@ pub async fn post_messages(
             known_tool_names,
             hook,
             cache_usage,
+            key_ctx.billing_policy,
             tracer,
             key_ctx.group.clone(),
             retry,
@@ -1032,6 +1119,7 @@ pub async fn post_messages(
             known_tool_names,
             hook,
             cache_usage,
+            key_ctx.billing_policy,
             tracer,
             key_ctx.group.clone(),
             retry,
@@ -1051,6 +1139,7 @@ async fn handle_stream_request(
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
+    billing_policy: super::cache_metering::BillingPolicy,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     retry: Option<TruncationRetry>,
@@ -1087,6 +1176,8 @@ async fn handle_stream_request(
         known_tool_names,
     );
     ctx.cache_usage = cache_usage;
+    ctx.billing_policy = billing_policy;
+    ctx.billing_prices = hook.billing_prices.clone();
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1328,6 +1419,7 @@ struct StreamSettlement {
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
     usage: TraceUsage,
+    raw_usage: (i32, i32, i32),
     sent_bytes: u64,
     settled: bool,
 }
@@ -1369,6 +1461,7 @@ impl StreamSettlement {
             credential_id,
             tracer,
             usage: stream_trace_usage(ctx),
+            raw_usage: ctx.raw_resolved_usage(),
             sent_bytes: 0,
             settled: false,
         }
@@ -1376,6 +1469,7 @@ impl StreamSettlement {
 
     fn update(&mut self, ctx: &StreamContext, sent_bytes: u64) {
         self.usage = stream_trace_usage(ctx);
+        self.raw_usage = ctx.raw_resolved_usage();
         self.sent_bytes = sent_bytes;
     }
 
@@ -1402,12 +1496,23 @@ impl StreamSettlement {
     }
 
     fn record_usage(&self, status: &str) {
-        self.hook.record(
+        let raw = crate::kiro::model::events::TokenUsage {
+            uncached_input_tokens: self.raw_usage.0,
+            output_tokens: self.usage.output_tokens.min(i32::MAX as u64) as i32,
+            cache_write_input_tokens: self.raw_usage.1,
+            cache_read_input_tokens: self.raw_usage.2,
+        };
+        let modified = crate::kiro::model::events::TokenUsage {
+            uncached_input_tokens: self.usage.input_tokens.min(i32::MAX as u64) as i32,
+            output_tokens: self.usage.output_tokens.min(i32::MAX as u64) as i32,
+            cache_write_input_tokens: self.usage.cache_creation_tokens.min(i32::MAX as u64) as i32,
+            cache_read_input_tokens: self.usage.cache_read_tokens.min(i32::MAX as u64) as i32,
+        };
+        self.hook.record_with_raw(
             self.credential_id,
-            self.usage.input_tokens.min(i32::MAX as u64) as i32,
-            self.usage.output_tokens.min(i32::MAX as u64) as i32,
-            self.usage.cache_creation_tokens.min(i32::MAX as u64) as i32,
-            self.usage.cache_read_tokens.min(i32::MAX as u64) as i32,
+            raw,
+            modified,
+            self.usage.credits,
             self.usage.credits,
             status,
         );
@@ -1479,6 +1584,7 @@ async fn handle_non_stream_request(
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
+    billing_policy: super::cache_metering::BillingPolicy,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     retry: Option<TruncationRetry>,
@@ -1493,6 +1599,7 @@ async fn handle_non_stream_request(
         known_tool_names,
         hook,
         cache_usage,
+        billing_policy,
         tracer,
         group,
         retry,
@@ -1775,6 +1882,7 @@ pub(crate) async fn execute_non_stream_request(
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
+    billing_policy: super::cache_metering::BillingPolicy,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     mut retry: Option<TruncationRetry>,
@@ -1986,13 +2094,36 @@ pub(crate) async fn execute_non_stream_request(
     // provider 未下发 metadataEvent 时才使用本地输出估算。
     let fallback_output_tokens = token::estimate_output_tokens(&content);
     let (final_input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) =
-        resolve_non_stream_usage(
+        resolve_non_stream_usage_with_policy(
             input_tokens,
             context_input_tokens,
             fallback_output_tokens,
             cache_usage,
+            billing_policy,
             provider_token_usage,
         );
+    let raw_usage_for_credit = provider_token_usage
+        .map(|usage| usage.sanitized())
+        .unwrap_or_else(|| {
+            let total_input = token::input_tokens_excluding_output(
+                context_input_tokens,
+                input_tokens,
+                fallback_output_tokens,
+            );
+            let (input, creation, read) = cache_usage.split_against_total(total_input);
+            TokenUsage {
+                uncached_input_tokens: input,
+                output_tokens: fallback_output_tokens.max(0),
+                cache_write_input_tokens: creation,
+                cache_read_input_tokens: read,
+            }
+        });
+    let modified_usage_for_credit = TokenUsage {
+        uncached_input_tokens: final_input_tokens,
+        output_tokens,
+        cache_write_input_tokens: cache_creation_tokens,
+        cache_read_input_tokens: cache_read_tokens,
+    };
 
     // 构建 Anthropic 响应
     let mut usage_json = json!({
@@ -2010,7 +2141,22 @@ pub(crate) async fn execute_non_stream_request(
     // 上游 meteringEvent 的 credit_* 字段（只在收到过 meteringEvent 时追加），
     // 下游计费系统按它核算 Kiro 侧成本。
     if let Some(m) = &metering {
-        usage_json["credit_usage"] = json!(m.usage);
+        let modified_credit = super::cache_metering::token_cost_for_model(
+            model,
+            TokenUsage {
+                uncached_input_tokens: final_input_tokens,
+                output_tokens,
+                cache_write_input_tokens: cache_creation_tokens,
+                cache_read_input_tokens: cache_read_tokens,
+            },
+            &hook.billing_prices,
+        );
+        let modified_credit = if modified_credit > 0.0 {
+            modified_credit
+        } else {
+            billing_policy.modify_credits(m.usage, raw_usage_for_credit, modified_usage_for_credit)
+        };
+        usage_json["credit_usage"] = json!(modified_credit);
         usage_json["credit_unit"] = json!(m.unit);
         usage_json["credit_unit_plural"] = json!(m.unit_plural);
     }
@@ -2025,12 +2171,17 @@ pub(crate) async fn execute_non_stream_request(
         "usage": usage_json
     });
 
-    hook.record(
+    let raw_usage = raw_usage_for_credit;
+    hook.record_with_raw(
         credential_id,
-        final_input_tokens,
-        output_tokens,
-        cache_creation_tokens,
-        cache_read_tokens,
+        raw_usage,
+        TokenUsage {
+            uncached_input_tokens: final_input_tokens,
+            output_tokens,
+            cache_write_input_tokens: cache_creation_tokens,
+            cache_read_input_tokens: cache_read_tokens,
+        },
+        credits,
         credits,
         "success",
     );
@@ -2290,7 +2441,7 @@ pub async fn post_messages_cc(
             state.tool_compatibility_mode,
             state.cache_meter.clone(),
             key_ctx.key_id,
-            key_ctx.cache_ratio,
+            key_ctx.billing_policy,
         )
         .await;
     }
@@ -2353,14 +2504,13 @@ pub async fn post_messages_cc(
     let known_tool_names = conversion_result.known_tool_names;
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径），
-    // 再按客户端 Key 的缓存计费系数缩放。
+    // 保留原始 CacheMeter 结果；策略在结算阶段统一应用。
     let cache_usage = match state.cache_meter.as_ref() {
         Some(cache) => {
             super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
         }
         None => super::cache_metering::CacheUsage::default(),
-    }
-    .with_cache_ratio(key_ctx.cache_ratio);
+    };
 
     // 原始请求移交给截断续写上下文，之后只用到模型名等少数字段。
     let model = payload.model.clone();
@@ -2392,6 +2542,7 @@ pub async fn post_messages_cc(
             hook,
             total_input_tokens,
             cache_usage,
+            key_ctx.billing_policy,
             tracer,
             key_ctx.group.clone(),
             retry,
@@ -2418,6 +2569,7 @@ pub async fn post_messages_cc(
             known_tool_names,
             hook,
             cache_usage,
+            key_ctx.billing_policy,
             tracer,
             key_ctx.group.clone(),
             retry,
@@ -2438,6 +2590,7 @@ async fn handle_cc_stream_request(
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
+    billing_policy: super::cache_metering::BillingPolicy,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     retry: Option<TruncationRetry>,
@@ -2452,6 +2605,7 @@ async fn handle_cc_stream_request(
         known_tool_names,
         hook,
         cache_usage,
+        billing_policy,
         tracer,
         group,
         retry,
@@ -2482,6 +2636,7 @@ mod tests {
                     key_source: TraceKeySource::MasterApiKey,
                     client_ip: None,
                     cache_ratio: 1.0,
+                    billing_policy: crate::anthropic::cache_metering::BillingPolicy::default(),
                 },
                 model: "test-model".to_string(),
                 is_stream: true,
@@ -2530,6 +2685,7 @@ mod tests {
                     key_source: TraceKeySource::MasterApiKey,
                     client_ip: None,
                     cache_ratio: 1.0,
+                    billing_policy: crate::anthropic::cache_metering::BillingPolicy::default(),
                 },
                 model: "test-model".to_string(),
                 is_stream: true,

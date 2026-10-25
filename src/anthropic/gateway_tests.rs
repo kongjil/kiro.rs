@@ -283,6 +283,7 @@ fn key() -> KeyContext {
         key_source: TraceKeySource::MasterApiKey,
         client_ip: None,
         cache_ratio: 1.0,
+        billing_policy: crate::anthropic::cache_metering::BillingPolicy::default(),
     }
 }
 async fn request(state: AppState, endpoint: &str, streaming: bool) -> Response {

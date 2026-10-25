@@ -1013,6 +1013,16 @@ pub async fn update_admin_key(
 // ============ 客户端 API Key 分发 ============
 
 fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
+    let (
+        _legacy_cache_ratio,
+        input_multiplier,
+        cache_creation_multiplier,
+        cache_read_multiplier,
+        target_effective_hit_rate,
+        sell_multiplier,
+    ) = (k.cache_ratio, k.input_multiplier, k.cache_creation_multiplier,
+        k.cache_read_multiplier, k.target_effective_hit_rate,
+        super::client_keys::normalize_sell_multiplier(k.sell_multiplier));
     ClientKeyItem {
         id: k.id,
         masked_key: mask_client_key(&k.key),
@@ -1030,6 +1040,11 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         max_credits: k.max_credits,
         group: k.group.clone(),
         cache_ratio: super::client_keys::normalize_cache_ratio(k.cache_ratio),
+        input_multiplier,
+        cache_creation_multiplier,
+        cache_read_multiplier,
+        target_effective_hit_rate,
+        sell_multiplier,
         is_system: k.is_system,
     }
 }
@@ -1037,6 +1052,25 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
 /// 缓存计费系数（若提供）必须在 0~1 之间
 fn cache_ratio_out_of_range(cache_ratio: Option<f64>) -> bool {
     cache_ratio.is_some_and(|v| !(0.0..=1.0).contains(&v))
+}
+
+fn billing_policy_invalid(
+    input_multiplier: Option<f64>,
+    cache_creation_multiplier: Option<f64>,
+    cache_read_multiplier: Option<f64>,
+    target_effective_hit_rate: Option<f64>,
+    sell_multiplier: Option<f64>,
+) -> bool {
+    let valid_multiplier = |v: Option<f64>| {
+        v.map(|x| x.is_finite() && x >= 0.0).unwrap_or(true)
+    };
+    !valid_multiplier(input_multiplier)
+        || !valid_multiplier(cache_creation_multiplier)
+        || !valid_multiplier(cache_read_multiplier)
+        || !valid_multiplier(sell_multiplier)
+        || target_effective_hit_rate
+            .map(|x| !x.is_finite() || !(0.0..=1.0).contains(&x))
+            .unwrap_or(false)
 }
 
 /// GET /api/admin/client-keys
@@ -1086,6 +1120,21 @@ pub async fn create_client_key(
         )
             .into_response();
     }
+    if billing_policy_invalid(
+        payload.input_multiplier,
+        payload.cache_creation_multiplier,
+        payload.cache_read_multiplier,
+        payload.target_effective_hit_rate,
+        payload.sell_multiplier,
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "计费倍率必须是非负有限数，目标命中率必须在 0~1 之间",
+            )),
+        )
+            .into_response();
+    }
     let entry = state.client_keys.create(
         name.to_string(),
         payload
@@ -1103,6 +1152,21 @@ pub async fn create_client_key(
     }
     if let Some(r) = payload.cache_ratio {
         state.client_keys.set_cache_ratio(entry.id, Some(r));
+    }
+    if payload.input_multiplier.is_some()
+        || payload.cache_creation_multiplier.is_some()
+        || payload.cache_read_multiplier.is_some()
+        || payload.target_effective_hit_rate.is_some()
+        || payload.sell_multiplier.is_some()
+    {
+        state.client_keys.set_billing_policy(
+            entry.id,
+            payload.input_multiplier,
+            payload.cache_creation_multiplier,
+            payload.cache_read_multiplier,
+            payload.target_effective_hit_rate,
+            payload.sell_multiplier,
+        );
     }
     Json(CreateClientKeyResponse {
         id: entry.id,
@@ -1195,6 +1259,21 @@ pub async fn update_client_key(
         )
             .into_response();
     }
+    if billing_policy_invalid(
+        payload.input_multiplier,
+        payload.cache_creation_multiplier,
+        payload.cache_read_multiplier,
+        payload.target_effective_hit_rate,
+        payload.sell_multiplier,
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "计费倍率必须是非负有限数，目标命中率必须在 0~1 之间",
+            )),
+        )
+            .into_response();
+    }
     let description = payload
         .description
         .map(|d| if d.is_empty() { None } else { Some(d) });
@@ -1212,6 +1291,21 @@ pub async fn update_client_key(
     {
         if let Some(r) = payload.cache_ratio {
             state.client_keys.set_cache_ratio(id, Some(r));
+        }
+        if payload.input_multiplier.is_some()
+            || payload.cache_creation_multiplier.is_some()
+            || payload.cache_read_multiplier.is_some()
+            || payload.target_effective_hit_rate.is_some()
+            || payload.sell_multiplier.is_some()
+        {
+            state.client_keys.set_billing_policy(
+                id,
+                payload.input_multiplier,
+                payload.cache_creation_multiplier,
+                payload.cache_read_multiplier,
+                payload.target_effective_hit_rate,
+                payload.sell_multiplier,
+            );
         }
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
@@ -1504,6 +1598,26 @@ pub async fn stats_by_credential(
                 "calls": d.calls,
                 "inputTokens": d.input_tokens,
                 "outputTokens": d.output_tokens,
+                "rawInputTokens": d.raw_input_tokens,
+                "rawOutputTokens": d.raw_output_tokens,
+                "rawCacheCreationTokens": d.raw_cache_creation_tokens,
+                "rawCacheReadTokens": d.raw_cache_read_tokens,
+                "rawTotalTokens": d.raw_total_tokens,
+                "rawCredits": d.raw_credits,
+                "modifiedTotalTokens": d.modified_total_tokens,
+                "modifiedCredits": d.modified_credits,
+                "accountCost": d.account_cost,
+                "accountCostCny": email_map
+                    .get(&d.credential_id)
+                    .and_then(|_| snapshot.credentials.iter().find(|c| c.id == d.credential_id))
+                    .and_then(|c| c.account_cost_cny),
+                "costMultiplier": snapshot
+                    .credentials
+                    .iter()
+                    .find(|c| c.id == d.credential_id)
+                    .map(|c| c.cost_multiplier)
+                    .unwrap_or(1.0),
+                "sellConsumption": d.sell_consumption,
                 "errors": d.errors,
             })
         })
@@ -1546,6 +1660,17 @@ pub async fn stats_by_key(
                 "outputTokens": d.output_tokens,
                 "cacheCreationTokens": d.cache_creation_tokens,
                 "cacheReadTokens": d.cache_read_tokens,
+                "rawInputTokens": d.raw_input_tokens,
+                "rawOutputTokens": d.raw_output_tokens,
+                "rawCacheCreationTokens": d.raw_cache_creation_tokens,
+                "rawCacheReadTokens": d.raw_cache_read_tokens,
+                "rawTotalTokens": d.raw_total_tokens,
+                "rawCredits": d.raw_credits,
+                "modifiedTotalTokens": d.modified_total_tokens,
+                "modifiedCredits": d.modified_credits,
+                "accountCost": d.account_cost,
+                "sellMultiplier": state.client_keys.sell_multiplier_of(d.key_id),
+                "sellConsumption": d.sell_consumption,
                 "errors": d.errors,
                 "credits": d.credits,
             })

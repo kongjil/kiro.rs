@@ -54,6 +54,8 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
   const [endpoint, setEndpoint] = useState('')
   const [groups, setGroups] = useState<string[]>([])
   const [sourceChannel, setSourceChannel] = useState('')
+  const [accountCostCny, setAccountCostCny] = useState('')
+  const [costMultiplier, setCostMultiplier] = useState('1')
   const [metadata, setMetadata] = useState<CredentialMetadata>({
     type: 'normal',
     saleStatus: 'not_for_sale',
@@ -87,6 +89,8 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
     setEndpoint('')
     setGroups([])
     setSourceChannel('')
+    setAccountCostCny('')
+    setCostMultiplier('1')
     setMetadata(metadataDefaults(metadataSchema))
   }
 
@@ -139,6 +143,8 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
         endpoint: endpoint.trim() || undefined,
         groups: groups,
         sourceChannel: sourceChannel.trim() || undefined,
+        accountCostCny: accountCostCny.trim() ? Number(accountCostCny) : undefined,
+        costMultiplier: costMultiplier.trim() ? Number(costMultiplier) : undefined,
         metadata,
       },
       {
@@ -209,6 +215,17 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                   <SelectItem value="api_key">API Key</SelectItem>
                 </SelectContent>
               </Select>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <label className="text-sm font-medium">账号成本（CNY）</label>
+                <Input type="number" min="0" step="0.01" placeholder="例如 50" value={accountCostCny} onChange={(e) => setAccountCostCny(e.target.value)} disabled={isPending} />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">成本倍率</label>
+                <Input type="number" min="0" step="0.05" value={costMultiplier} onChange={(e) => setCostMultiplier(e.target.value)} disabled={isPending} />
+              </div>
             </div>
 
             {/* Kiro API Key (API Key 模式) */}
