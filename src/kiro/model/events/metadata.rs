@@ -39,7 +39,6 @@ impl TokenUsage {
         }
     }
 
-    #[cfg(test)]
     /// OpenAI 口径的总输入 token（缓存读取是其中的子集）。
     pub fn total_input_tokens(self) -> i32 {
         let usage = self.sanitized();
