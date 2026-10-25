@@ -18,7 +18,7 @@ import {
   useRotateClientKey, useSetClientKeyMaxCredits,
 } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
-import { GroupSingleSelect } from '@/components/group-select'
+import { GroupMultiSelect } from '@/components/group-select'
 import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
 import { extractErrorMessage, formatCredits } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
@@ -105,7 +105,7 @@ function formatRelative(ts?: string): string {
 export function ClientKeysPage() {
   const { data, isLoading, isFetching, refetch } = useClientKeys()
   // 已注册分组列表（来自 groups.json 注册表，与凭据的 groups 字段解耦）
-  const groupOptions = useGroupOptions()
+  const groupOptions = Array.from(new Set(['default', ...useGroupOptions()]))
   const createKey = useCreateClientKey()
   const deleteKey = useDeleteClientKey()
   const setDisabled = useSetClientKeyDisabled()
@@ -118,7 +118,7 @@ export function ClientKeysPage() {
   const [createOpen, setCreateOpen] = useState(false)
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
-  const [createGroup, setCreateGroup] = useState('')
+  const [createGroups, setCreateGroups] = useState<string[]>(['default'])
   const [createMaxCredits, setCreateMaxCredits] = useState('')
   const [createCacheRatio, setCreateCacheRatio] = useState('1')
   const [createInputMultiplier, setCreateInputMultiplier] = useState('')
@@ -133,7 +133,7 @@ export function ClientKeysPage() {
   const [editTarget, setEditTarget] = useState<ClientKeyItem | null>(null)
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
-  const [editGroup, setEditGroup] = useState('')
+  const [editGroups, setEditGroups] = useState<string[]>(['default'])
   const [editMaxCredits, setEditMaxCredits] = useState('')
   const [editCacheRatio, setEditCacheRatio] = useState('1')
   const [editInputMultiplier, setEditInputMultiplier] = useState('')
@@ -158,7 +158,7 @@ export function ClientKeysPage() {
       const res = await createKey.mutateAsync({
         name,
         description: createDesc.trim() || undefined,
-        group: createGroup.trim() || undefined,
+        groups: createGroups,
         maxCredits: maxCredits ?? undefined,
         cacheRatio: parseCacheRatio(createCacheRatio),
         inputMultiplier: parseOptionalMultiplier(createInputMultiplier),
@@ -171,7 +171,7 @@ export function ClientKeysPage() {
       setCreateOpen(false)
       setCreateName('')
       setCreateDesc('')
-      setCreateGroup('')
+      setCreateGroups(['default'])
       setCreateMaxCredits('')
       setCreateCacheRatio('1')
       setCreateInputMultiplier('')
@@ -259,7 +259,7 @@ export function ClientKeysPage() {
     setEditTarget(item)
     setEditName(item.name)
     setEditDesc(item.description ?? '')
-    setEditGroup(item.group ?? '')
+    setEditGroups(item.groups?.length ? item.groups : ['default'])
     setEditMaxCredits(item.maxCredits != null ? String(item.maxCredits) : '')
     setEditCacheRatio(String(item.cacheRatio ?? 1))
     setEditInputMultiplier(item.inputMultiplier != null ? String(item.inputMultiplier) : '')
@@ -284,7 +284,7 @@ export function ClientKeysPage() {
         req: {
           name: editName.trim(),
           description: editDesc.trim(),
-          group: editGroup.trim(),
+          groups: editGroups,
           cacheRatio: parseCacheRatio(editCacheRatio),
           inputMultiplier: parseOptionalMultiplierForUpdate(editInputMultiplier),
           cacheCreationMultiplier: parseOptionalMultiplierForUpdate(editCreationMultiplier),
@@ -452,8 +452,8 @@ export function ClientKeysPage() {
         id: 'group',
         header: '分组',
         cell: (k) =>
-          k.group ? (
-            <Badge variant="outline">{k.group}</Badge>
+          k.groups?.length ? (
+            <Badge variant="outline">{k.groups.join(' + ')}</Badge>
           ) : (
             <span className="text-[12px] text-muted-foreground">全部账号</span>
           ),
@@ -698,15 +698,14 @@ export function ClientKeysPage() {
               </div>
               <div>
                 <label className="text-[12px] text-muted-foreground">绑定分组（可选）</label>
-                <GroupSingleSelect
-                  value={createGroup}
+                <GroupMultiSelect
+                  value={createGroups}
                   options={groupOptions}
-                  onChange={setCreateGroup}
+                  onChange={setCreateGroups}
                   disabled={createKey.isPending}
-                  noneLabel="（不绑定，可用全部账号）"
                 />
                 <p className="mt-1 text-[11px] text-muted-foreground">
-                  绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
+                  default 始终生效；额外分组会扩大可调用账号范围。未分组账号按 default 处理。
                 </p>
               </div>
               <div>
@@ -836,15 +835,14 @@ export function ClientKeysPage() {
               </div>
               <div>
                 <label className="text-[12px] text-muted-foreground">绑定分组</label>
-                <GroupSingleSelect
-                  value={editGroup}
+                <GroupMultiSelect
+                  value={editGroups}
                   options={groupOptions}
-                  onChange={setEditGroup}
+                  onChange={setEditGroups}
                   disabled={updateKey.isPending}
-                  noneLabel="（不绑定，可用全部账号）"
                 />
                 <p className="mt-1 text-[11px] text-muted-foreground">
-                  绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
+                  default 始终生效；选择 A 后可调用 default 或 A 账号。
                 </p>
               </div>
               <div>

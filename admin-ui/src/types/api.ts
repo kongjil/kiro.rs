@@ -467,6 +467,7 @@ export interface ClientKeyItem {
   maxCredits?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
+  groups: string[]
   /** 缓存计费系数（0~1，1 = 满缓存，0 = 无缓存） */
   cacheRatio: number
   inputMultiplier?: number
@@ -487,6 +488,7 @@ export interface CreateClientKeyRequest {
   name: string
   description?: string
   group?: string
+  groups?: string[]
   /** 积分使用上限（可选，不传表示不限制） */
   maxCredits?: number
   /** 缓存计费系数（可选，0~1，不传表示满缓存） */
@@ -510,6 +512,7 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
+  groups?: string[]
   /** 缓存计费系数（可选，0~1，不传表示不修改） */
   cacheRatio?: number
   inputMultiplier?: number | null

@@ -1039,6 +1039,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_credits: k.total_credits,
         max_credits: k.max_credits,
         group: k.group.clone(),
+        groups: super::client_keys::split_group_scope(k.group.as_deref()),
         cache_ratio: super::client_keys::normalize_cache_ratio(k.cache_ratio),
         input_multiplier,
         cache_creation_multiplier,
@@ -1155,16 +1156,17 @@ pub async fn create_client_key(
         )
             .into_response();
     }
+    let group_scope = Some(super::client_keys::normalize_group_scope(
+        payload.groups.clone(),
+        payload.group.clone(),
+    ));
     let entry = state.client_keys.create(
         name.to_string(),
         payload
             .description
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty()),
-        payload
-            .group
-            .map(|g| g.trim().to_string())
-            .filter(|g| !g.is_empty()),
+        group_scope,
     );
     // 创建后若指定了上限则应用
     if let Some(v) = payload.max_credits {
@@ -1297,14 +1299,14 @@ pub async fn update_client_key(
     let description = payload
         .description
         .map(|d| if d.is_empty() { None } else { Some(d) });
-    let group = payload.group.map(|g| {
-        let t = g.trim();
-        if t.is_empty() {
-            None
-        } else {
-            Some(t.to_string())
-        }
-    });
+    let group = if payload.groups.is_some() || payload.group.is_some() {
+        Some(Some(super::client_keys::normalize_group_scope(
+            payload.groups.clone(),
+            payload.group.clone(),
+        )))
+    } else {
+        None
+    };
     if state
         .client_keys
         .update_meta(id, payload.name, description, group)

@@ -1026,6 +1026,7 @@ pub struct ClientKeyItem {
     pub max_credits: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    pub groups: Vec<String>,
     /// 有效缓存计费系数（0~1，1 = 满缓存）
     pub cache_ratio: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1059,6 +1060,8 @@ pub struct CreateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
     /// 积分使用上限（可选；None / 省略表示不限制）
     #[serde(default)]
     pub max_credits: Option<f64>,
@@ -1095,6 +1098,8 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
     /// 缓存计费系数（可选，0~1；省略表示不修改）
     #[serde(default)]
     pub cache_ratio: Option<f64>,

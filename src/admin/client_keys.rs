@@ -376,7 +376,8 @@ impl ClientKeyManager {
 
     /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
     pub fn group_of(&self, id: u64) -> Option<String> {
-        self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
+        let legacy = self.inner.read().entries.get(&id).and_then(|e| e.group.clone());
+        Some(normalize_group_scope(None, legacy))
     }
 
     /// 返回指定 Key 的有效缓存计费系数（未设置或 Key 不存在时为 1.0）
@@ -425,7 +426,7 @@ impl ClientKeyManager {
         let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
         for e in inner.entries.values() {
             if let Some(g) = &e.group {
-                set.insert(g.clone());
+                for group in split_group_scope(Some(g)) { set.insert(group); }
             }
         }
         let mut list: Vec<String> = set.into_iter().collect();
@@ -439,7 +440,7 @@ impl ClientKeyManager {
             .read()
             .entries
             .values()
-            .filter(|e| e.group.as_deref() == Some(group))
+            .filter(|e| split_group_scope(e.group.as_deref()).iter().any(|g| g == group))
             .count()
     }
 
@@ -459,8 +460,15 @@ impl ClientKeyManager {
         let mut inner = self.inner.write();
         let mut affected = 0usize;
         for entry in inner.entries.values_mut() {
-            if entry.group.as_deref() == Some(old) {
-                entry.group = Some(new.to_string());
+            let groups = split_group_scope(entry.group.as_deref());
+            if groups.iter().any(|g| g == old) {
+                entry.group = Some(
+                    groups
+                        .into_iter()
+                        .map(|g| if g == old { new.to_string() } else { g })
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                );
                 affected += 1;
             }
         }
@@ -476,8 +484,10 @@ impl ClientKeyManager {
         let mut inner = self.inner.write();
         let mut affected = 0usize;
         for entry in inner.entries.values_mut() {
-            if entry.group.as_deref() == Some(name) {
-                entry.group = None;
+            let groups = split_group_scope(entry.group.as_deref());
+            if groups.iter().any(|g| g == name) {
+                let kept: Vec<String> = groups.into_iter().filter(|g| g != name).collect();
+                entry.group = Some(if kept.is_empty() { "default".to_string() } else { kept.join("|") });
                 affected += 1;
             }
         }
@@ -735,6 +745,38 @@ impl ClientKeyManager {
     pub fn active_count(&self) -> usize {
         self.inner.read().entries.values().filter(|e| !e.disabled).count()
     }
+}
+
+/// 规范化 Key 的分组 scope：default 始终包含，额外分组用 `|` 连接以兼容
+/// 旧版单字符串 `group` 持久化字段。
+pub fn normalize_group_scope(groups: Option<Vec<String>>, legacy: Option<String>) -> String {
+    let mut out = vec!["default".to_string()];
+    let mut add = |value: String| {
+        let value = value.trim().to_string();
+        if !value.is_empty() && !out.iter().any(|g| g == &value) {
+            out.push(value);
+        }
+    };
+    if let Some(values) = groups {
+        for value in values { add(value); }
+    }
+    if let Some(value) = legacy {
+        for part in value.split('|') { add(part.to_string()); }
+    }
+    out.join("|")
+}
+
+pub fn split_group_scope(scope: Option<&str>) -> Vec<String> {
+    let scope = scope.unwrap_or("default");
+    let mut out: Vec<String> = scope
+        .split('|')
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if out.is_empty() { out.push("default".to_string()); }
+    if !out.iter().any(|g| g == "default") { out.insert(0, "default".to_string()); }
+    out
 }
 
 impl Default for ClientKeyManager {

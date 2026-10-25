@@ -61,7 +61,7 @@ export function EditCredentialDialog({
   const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl ?? '')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
-  const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
+  const [groups, setGroups] = useState<string[]>(credential.groups?.length ? credential.groups : ['default'])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
   const [metadata, setMetadata] = useState<CredentialMetadata>(
     { ...metadataDefaults(metadataSchema), ...metadataValues(credential.metadata) },
@@ -84,7 +84,7 @@ export function EditCredentialDialog({
       setProxyUrl(credential.proxyUrl ?? '')
       setProxyUsername('')
       setProxyPassword('')
-      setGroups(credential.groups ?? [])
+      setGroups(credential.groups?.length ? credential.groups : ['default'])
       setSourceChannel(credential.sourceChannel ?? '')
       setMetadata({
         ...metadataDefaults(metadataSchema),

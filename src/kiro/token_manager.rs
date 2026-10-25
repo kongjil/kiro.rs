@@ -1327,13 +1327,23 @@ pub struct IdcReloginCredentials {
 
 /// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
 ///
-/// - `group = None`：Key 未绑定分组（含 master apiKey），匹配所有账号。
-/// - `group = Some(g)`：仅匹配 `cred_groups` 包含 `g` 的账号。
+/// - 未分组账号按 `default` 处理。
+/// - 请求分组 scope 使用 `|` 分隔；任一请求分组命中账号分组即可调用。
 fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
-    match group {
-        None => true,
-        Some(g) => cred_groups.iter().any(|cg| cg == g),
-    }
+    let requested: Vec<&str> = group
+        .unwrap_or("default")
+        .split('|')
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .collect();
+    let effective_credentials: Vec<&str> = if cred_groups.is_empty() {
+        vec!["default"]
+    } else {
+        cred_groups.iter().map(String::as_str).collect()
+    };
+    requested
+        .iter()
+        .any(|requested_group| effective_credentials.iter().any(|g| g == requested_group))
 }
 
 fn credential_matches_request(
@@ -7649,16 +7659,17 @@ mod tests {
 
     #[test]
     fn test_group_matches_helper() {
-        // 未绑定分组(None)匹配任何账号
+        // 未分组账号按 default 处理；请求未显式指定分组也只访问 default。
         assert!(group_matches(&[], None));
-        assert!(group_matches(&["g1".to_string()], None));
-        // 绑定分组时只匹配 groups 含该名的账号
+        assert!(!group_matches(&["g1".to_string()], None));
+        assert!(group_matches(&["default".to_string()], None));
+        // 多分组 scope 任一命中即可。
         assert!(group_matches(
-            &["g1".to_string(), "g2".to_string()],
-            Some("g1")
+            &["default".to_string(), "g1".to_string()],
+            Some("default|g1")
         ));
         assert!(!group_matches(&["g2".to_string()], Some("g1")));
-        assert!(!group_matches(&[], Some("g1")));
+        assert!(group_matches(&["default".to_string()], Some("default|g1")));
     }
 
     #[test]
@@ -7955,7 +7966,7 @@ mod tests {
 
         assert_eq!(manager.total_count_in_group(Some("g1")), 2); // A,B
         assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
-        assert_eq!(manager.total_count_in_group(None), 3); // 全部
+        assert_eq!(manager.total_count_in_group(None), 1); // default：无分组账号 C
         assert_eq!(manager.total_count_in_group(Some("none")), 0);
     }
 

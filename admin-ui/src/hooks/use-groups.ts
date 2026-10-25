@@ -23,7 +23,7 @@ export function useGroups() {
  */
 export function useGroupOptions(): string[] {
   const { data } = useGroups()
-  return (data?.groups ?? []).map((g) => g.name)
+  return Array.from(new Set(['default', ...(data?.groups ?? []).map((g) => g.name)]))
 }
 
 export function useCreateGroup() {
