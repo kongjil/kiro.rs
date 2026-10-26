@@ -34,7 +34,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::kiro::model::events::TokenUsage;
-use crate::model::config::BillingPrice;
 
 /// 未配置时的默认条目上限。
 ///
@@ -108,9 +107,6 @@ pub struct CacheUsage {
     /// 其中由 1h TTL 断点覆盖、且本次新写入的 estimate token。
     /// 用于把 `cache_creation` 拆成 5m / 1h 两档（下游按 TTL 分别计价）。
     pub cache_creation_1h_est: i32,
-    /// 已施加的客户端 Key 缓存计费系数（0~1）；None 表示满缓存、未缩放。
-    /// 由 [`Self::with_cache_ratio`] 写入，供 provider 精确用量按同一系数缩放。
-    pub cache_ratio: Option<f64>,
 }
 
 /// `cache_creation_input_tokens` 按 TTL 的拆分，对应官方 `usage.cache_creation`。
@@ -120,270 +116,7 @@ pub struct CacheCreationTtl {
     pub ephemeral_1h_input_tokens: i32,
 }
 
-/// 下游计费用量策略。
-///
-/// 原始 provider usage / CacheMeter 结果始终保留；该策略只生成对下游公开的
-/// modified usage。所有字段为空时表示 raw 模式，原始 usage 原样透传。
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct BillingPolicy {
-    /// 兼容旧版 cache_ratio：把缓存读/写按比例保留，剩余转回普通 input。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_ratio: Option<f64>,
-    /// 普通 input 的计费用量倍率。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_multiplier: Option<f64>,
-    /// cache creation/write 的计费用量倍率。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_multiplier: Option<f64>,
-    /// cache read 的计费用量倍率。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_read_multiplier: Option<f64>,
-    /// 目标有效命中率；设置后按实际原始 token 动态求解 read multiplier。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_effective_hit_rate: Option<f64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct ResolvedBillingMultipliers {
-    input: f64,
-    creation: f64,
-    read: f64,
-}
-
-impl BillingPolicy {
-    /// 没有任何新策略字段时使用 raw 模式；旧 cache_ratio 仍保持兼容。
-    pub fn is_raw(&self) -> bool {
-        self.cache_ratio.is_none()
-            && self.input_multiplier.is_none()
-            && self.cache_creation_multiplier.is_none()
-            && self.cache_read_multiplier.is_none()
-            && self.target_effective_hit_rate.is_none()
-    }
-
-    fn non_negative(value: Option<f64>) -> f64 {
-        value
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(1.0)
-    }
-
-    fn target(value: Option<f64>) -> Option<f64> {
-        value.filter(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
-    }
-
-    fn multipliers_for(&self, usage: TokenUsage) -> ResolvedBillingMultipliers {
-        let input = Self::non_negative(self.input_multiplier);
-        let creation = Self::non_negative(self.cache_creation_multiplier);
-        if let Some(target) = Self::target(self.target_effective_hit_rate) {
-            // 目标模式默认自动求 read multiplier。显式 read multiplier 仍可作为
-            // 已求解结果回显，但目标值优先保证输出命中率精确成立。
-            let numerator = target * (usage.uncached_input_tokens.max(0) as f64 * input
-                + usage.cache_write_input_tokens.max(0) as f64 * creation);
-            let denominator = (1.0 - target) * usage.cache_read_input_tokens.max(0) as f64;
-            let read = if denominator <= 0.0 {
-                1.0
-            } else {
-                (numerator / denominator).max(0.0)
-            };
-            return ResolvedBillingMultipliers {
-                input,
-                creation,
-                read,
-            };
-        }
-        ResolvedBillingMultipliers {
-            input,
-            creation,
-            read: Self::non_negative(self.cache_read_multiplier),
-        }
-    }
-
-    /// 目标命中率模式：在保持总 input token 守恒的前提下重新分流 read/write/input。
-    fn apply_target_rate(&self, usage: TokenUsage, target: f64) -> TokenUsage {
-        let usage = usage.sanitized();
-        let total = usage.total_input_tokens().max(0);
-        if total == 0 {
-            return usage;
-        }
-        let read = ((total as f64) * target.clamp(0.0, 1.0)).round() as i32;
-        let remaining = total.saturating_sub(read);
-        // 上游已经给出 creation 时保留其在非 read 输入中的比例；Kiro 只给
-        // input/output 时该比例为 0，剩余量全部落入普通 input。
-        let non_read = usage
-            .uncached_input_tokens
-            .saturating_add(usage.cache_write_input_tokens)
-            .max(0);
-        let creation_share = if non_read > 0 {
-            usage.cache_write_input_tokens.max(0) as f64 / non_read as f64
-        } else {
-            0.0
-        };
-        let creation = ((remaining as f64) * creation_share).round() as i32;
-        TokenUsage {
-            uncached_input_tokens: remaining.saturating_sub(creation),
-            cache_write_input_tokens: creation,
-            cache_read_input_tokens: read.clamp(0, total),
-            ..usage
-        }
-    }
-
-    /// 对上游精确 usage 生成修改后的 usage。raw usage 不在此处改变。
-    pub fn apply_to_provider_usage(&self, usage: TokenUsage) -> TokenUsage {
-        let usage = usage.sanitized();
-        if self.is_raw() {
-            return usage;
-        }
-        if let Some(target) = Self::target(self.target_effective_hit_rate) {
-            return self.apply_target_rate(usage, target);
-        }
-        if let Some(ratio) = self.cache_ratio.filter(|_| {
-            self.input_multiplier.is_none()
-                && self.cache_creation_multiplier.is_none()
-                && self.cache_read_multiplier.is_none()
-                && self.target_effective_hit_rate.is_none()
-        }) {
-            let r = if ratio.is_finite() { ratio.clamp(0.0, 1.0) } else { 1.0 };
-            let read = ((usage.cache_read_input_tokens as f64) * r).round() as i32;
-            let write = ((usage.cache_write_input_tokens as f64) * r).round() as i32;
-            let moved = (usage.cache_read_input_tokens - read)
-                .saturating_add(usage.cache_write_input_tokens - write);
-            return TokenUsage {
-                uncached_input_tokens: usage.uncached_input_tokens.saturating_add(moved),
-                cache_read_input_tokens: read,
-                cache_write_input_tokens: write,
-                ..usage
-            };
-        }
-        let m = self.multipliers_for(usage);
-        TokenUsage {
-            uncached_input_tokens: ((usage.uncached_input_tokens.max(0) as f64) * m.input)
-                .round()
-                .clamp(0.0, i32::MAX as f64) as i32,
-            cache_write_input_tokens: ((usage.cache_write_input_tokens.max(0) as f64)
-                * m.creation)
-                .round()
-                .clamp(0.0, i32::MAX as f64) as i32,
-            cache_read_input_tokens: ((usage.cache_read_input_tokens.max(0) as f64) * m.read)
-                .round()
-                .clamp(0.0, i32::MAX as f64) as i32,
-            ..usage
-        }
-    }
-
-    /// 根据原始 CacheMeter 分摊结果生成下游可见的修改 usage。
-    pub fn apply_to_simulated_usage(
-        &self,
-        cache_usage: &CacheUsage,
-        total_input_tokens: i32,
-        output_tokens: i32,
-    ) -> TokenUsage {
-        let (input, creation, read) = cache_usage.split_against_total(total_input_tokens);
-        self.apply_to_provider_usage(TokenUsage {
-            uncached_input_tokens: input,
-            output_tokens: output_tokens.max(0),
-            cache_write_input_tokens: creation,
-            cache_read_input_tokens: read,
-        })
-    }
-
-    /// 没有价格表时的兼容 credit 调整：按修改后总 prompt/output token 与原始值的
-    /// 比例缩放上游 credits，保证策略开启后下游也不会继续看到原始消费值。
-    pub fn modify_credits(&self, raw_credits: f64, raw: TokenUsage, modified: TokenUsage) -> f64 {
-        if !raw_credits.is_finite() || raw_credits <= 0.0 {
-            return 0.0;
-        }
-        let raw_total = raw.total_input_tokens().saturating_add(raw.output_tokens).max(1) as f64;
-        let modified_total = modified
-            .total_input_tokens()
-            .saturating_add(modified.output_tokens) as f64;
-        raw_credits * (modified_total / raw_total)
-    }
-}
-
-/// 按修改后的 token 计算可卖出/可展示的 token 价格成本。
-pub fn token_cost_for_model(
-    model: &str,
-    usage: TokenUsage,
-    prices: &std::collections::HashMap<String, BillingPrice>,
-) -> f64 {
-    let key = model.to_ascii_lowercase();
-    let Some(price) = prices
-        .get(&key)
-        .or_else(|| prices.iter().find(|(name, _)| name.eq_ignore_ascii_case(&key)).map(|(_, price)| price))
-        .or_else(|| prices.get("*"))
-    else {
-        return 0.0;
-    };
-    let usage = usage.sanitized();
-    usage.uncached_input_tokens as f64 * price.input
-        + usage.cache_write_input_tokens as f64 * price.cache_creation
-        + usage.cache_read_input_tokens as f64 * price.cache_read
-        + usage.output_tokens as f64 * price.output
-}
-
-/// 与 `token_cost_for_model` 相同，但保留“价格未配置”和“价格显式为 0”的区别。
-pub fn configured_token_cost_for_model(
-    model: &str,
-    usage: TokenUsage,
-    prices: &std::collections::HashMap<String, BillingPrice>,
-) -> Option<f64> {
-    let key = model.to_ascii_lowercase();
-    let price = prices
-        .get(&key)
-        .or_else(|| prices.iter().find(|(name, _)| name.eq_ignore_ascii_case(&key)).map(|(_, price)| price))
-        .or_else(|| prices.get("*"))?;
-    let usage = usage.sanitized();
-    Some(
-        usage.uncached_input_tokens as f64 * price.input
-            + usage.cache_write_input_tokens as f64 * price.cache_creation
-            + usage.cache_read_input_tokens as f64 * price.cache_read
-            + usage.output_tokens as f64 * price.output,
-    )
-}
-
 impl CacheUsage {
-    /// 按客户端 Key 的缓存计费系数缩放本地模拟的缓存覆盖量。
-    ///
-    /// `cache_read` 与 `cache_covered_est` 同乘系数，read / creation 的相对比例不变，
-    /// 被砍掉的覆盖量在 [`Self::split_against_total`] 中自然回落为 `input_tokens`。
-    /// 系数 `>= 1`（或非有限值）时原样返回。
-    pub fn with_cache_ratio(self, ratio: f64) -> Self {
-        let r = if ratio.is_finite() {
-            ratio.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        if r >= 1.0 {
-            return self;
-        }
-        Self {
-            cache_read: ((self.cache_read as f64) * r).round() as i32,
-            cache_covered_est: ((self.cache_covered_est as f64) * r).round() as i32,
-            prompt_total_est: self.prompt_total_est,
-            cache_creation_1h_est: ((self.cache_creation_1h_est as f64) * r).round() as i32,
-            cache_ratio: Some(r),
-        }
-    }
-
-    /// 对上游 `metadataEvent.tokenUsage` 精确值施加同一缓存计费系数：
-    /// 缓存读取 / 写入各乘系数，被砍掉的部分转入 `uncached_input_tokens`，输入总量守恒。
-    pub fn apply_to_provider_usage(&self, usage: TokenUsage) -> TokenUsage {
-        let usage = usage.sanitized();
-        let Some(r) = self.cache_ratio else {
-            return usage;
-        };
-        let read = ((usage.cache_read_input_tokens as f64) * r).round() as i32;
-        let write = ((usage.cache_write_input_tokens as f64) * r).round() as i32;
-        let moved = (usage.cache_read_input_tokens - read)
-            .saturating_add(usage.cache_write_input_tokens - write);
-        TokenUsage {
-            uncached_input_tokens: usage.uncached_input_tokens.saturating_add(moved),
-            cache_read_input_tokens: read,
-            cache_write_input_tokens: write,
-            ..usage
-        }
-    }
-
     /// 按真实 total 口径把 prompt 拆成三个互斥的部分，返回
     /// `(input_tokens, cache_creation, cache_read)`，相加严格 == `total_real`。
     ///
@@ -412,6 +145,17 @@ impl CacheUsage {
         let cache_creation = cache_total - cache_read;
 
         (uncached_tail, cache_creation, cache_read)
+    }
+
+    /// [`Self::split_against_total`] 的 `TokenUsage` 形式（原始口径，未应用计费策略）。
+    pub fn simulated_usage(&self, total_real: i32, output_tokens: i32) -> TokenUsage {
+        let (input, creation, read) = self.split_against_total(total_real);
+        TokenUsage {
+            uncached_input_tokens: input,
+            output_tokens: output_tokens.max(0),
+            cache_write_input_tokens: creation,
+            cache_read_input_tokens: read,
+        }
     }
 
     /// 把最终上报的 `cache_creation` 总量按请求里的 TTL 断点拆成 5m / 1h 两档。
@@ -1797,7 +1541,6 @@ pub async fn compute_cache_usage(
         cache_covered_est: covered_tokens as i32,
         prompt_total_est: prompt_total_est as i32,
         cache_creation_1h_est: covered_1h_creation_est(covered_1h, max_read_tokens) as i32,
-        cache_ratio: None,
     }
 }
 
@@ -1912,7 +1655,6 @@ pub fn compute_cache_usage_sync(
         cache_covered_est: covered_tokens as i32,
         prompt_total_est: prompt_total_est as i32,
         cache_creation_1h_est: covered_1h_creation_est(covered_1h, max_read_tokens) as i32,
-        cache_ratio: None,
     }
 }
 
@@ -2230,138 +1972,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(u.split_against_total(500), (500, 0, 0));
-    }
-
-    #[test]
-    fn cache_ratio_scales_simulated_cache_into_input() {
-        let u = CacheUsage {
-            cache_read: 30,
-            cache_covered_est: 80,
-            prompt_total_est: 100,
-            ..Default::default()
-        };
-
-        // 满缓存：原样返回，不标记系数
-        let full = u.with_cache_ratio(1.0);
-        assert_eq!(full.cache_ratio, None);
-        assert_eq!(full.split_against_total(1000), (200, 500, 300));
-        assert_eq!(u.with_cache_ratio(f64::NAN).cache_ratio, None);
-
-        // 五折：缓存覆盖 800 → 400，read / creation 各减半，砍掉的转入 input
-        let half = u.with_cache_ratio(0.5);
-        assert_eq!(half.cache_ratio, Some(0.5));
-        assert_eq!(half.split_against_total(1000), (600, 250, 150));
-
-        // 无缓存：全部计入 input
-        let none = u.with_cache_ratio(0.0);
-        assert_eq!(none.split_against_total(1000), (1000, 0, 0));
-        assert_eq!(u.with_cache_ratio(-1.0).split_against_total(1000), (1000, 0, 0));
-    }
-
-    #[test]
-    fn cache_ratio_scales_provider_usage_and_conserves_input() {
-        let provider = TokenUsage {
-            uncached_input_tokens: 101,
-            output_tokens: 23,
-            cache_read_input_tokens: 300,
-            cache_write_input_tokens: 40,
-        };
-        let base = CacheUsage::default();
-
-        assert_eq!(base.apply_to_provider_usage(provider), provider);
-
-        let half = base.with_cache_ratio(0.5).apply_to_provider_usage(provider);
-        assert_eq!(
-            half,
-            TokenUsage {
-                uncached_input_tokens: 271,
-                output_tokens: 23,
-                cache_read_input_tokens: 150,
-                cache_write_input_tokens: 20,
-            }
-        );
-
-        let none = base.with_cache_ratio(0.0).apply_to_provider_usage(provider);
-        assert_eq!(
-            none,
-            TokenUsage {
-                uncached_input_tokens: 441,
-                output_tokens: 23,
-                cache_read_input_tokens: 0,
-                cache_write_input_tokens: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn billing_policy_multiplier_and_target_modes() {
-        let raw = TokenUsage {
-            uncached_input_tokens: 250,
-            output_tokens: 100,
-            cache_write_input_tokens: 500,
-            cache_read_input_tokens: 500,
-        };
-        let multiplier = BillingPolicy {
-            input_multiplier: Some(1.2),
-            cache_creation_multiplier: Some(0.8),
-            cache_read_multiplier: Some(2.0),
-            ..Default::default()
-        };
-        let modified = multiplier.apply_to_provider_usage(raw);
-        assert_eq!(modified.uncached_input_tokens, 300);
-        assert_eq!(modified.cache_write_input_tokens, 400);
-        assert_eq!(modified.cache_read_input_tokens, 1000);
-
-        let target = BillingPolicy {
-            target_effective_hit_rate: Some(0.8),
-            ..Default::default()
-        };
-        let modified = target.apply_to_provider_usage(raw);
-        let denominator = modified.uncached_input_tokens
-            + modified.cache_write_input_tokens
-            + modified.cache_read_input_tokens;
-        assert!((modified.cache_read_input_tokens as f64 / denominator as f64 - 0.8).abs() < 0.001);
-
-        let input_only = TokenUsage {
-            uncached_input_tokens: 1000,
-            output_tokens: 500,
-            cache_write_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        };
-        let ninety = BillingPolicy {
-            target_effective_hit_rate: Some(0.9),
-            ..Default::default()
-        }
-        .apply_to_provider_usage(input_only);
-        assert_eq!(ninety.uncached_input_tokens, 100);
-        assert_eq!(ninety.cache_write_input_tokens, 0);
-        assert_eq!(ninety.cache_read_input_tokens, 900);
-        assert_eq!(ninety.total_input_tokens(), 1000);
-        assert_eq!(ninety.output_tokens, 500);
-    }
-
-    #[test]
-    fn token_cost_uses_modified_categories() {
-        let prices = std::collections::HashMap::from([(
-            "model".to_string(),
-            BillingPrice {
-                input: 1.0,
-                cache_creation: 2.0,
-                cache_read: 0.1,
-                output: 3.0,
-            },
-        )]);
-        let cost = token_cost_for_model(
-            "MODEL",
-            TokenUsage {
-                uncached_input_tokens: 10,
-                output_tokens: 4,
-                cache_write_input_tokens: 5,
-                cache_read_input_tokens: 20,
-            },
-            &prices,
-        );
-        assert!((cost - 34.0).abs() < f64::EPSILON);
     }
 
     #[test]

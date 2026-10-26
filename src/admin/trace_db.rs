@@ -119,9 +119,20 @@ pub struct TraceRecord {
     /// 缓存读取 token
     #[serde(default)]
     pub cache_read_tokens: u64,
-    /// 费用（上游 meteringEvent 累计的 credits）
+    /// 费用（计费后口径：下游看到的 credit）
     #[serde(default)]
     pub credits: f64,
+    /// 原始口径（未应用 Key 计费策略）。None = 加列之前写入的老记录。
+    #[serde(default)]
+    pub raw_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub raw_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub raw_cache_creation_tokens: Option<u64>,
+    #[serde(default)]
+    pub raw_cache_read_tokens: Option<u64>,
+    #[serde(default)]
+    pub raw_credits: Option<f64>,
     /// 首 Token 延迟（毫秒，仅流式有值；非流式为 None）
     #[serde(default)]
     pub first_token_ms: Option<u64>,
@@ -144,6 +155,16 @@ pub struct TraceRecord {
     pub client_ip: Option<String>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
+}
+
+/// 一条 trace 的原始口径用量（未应用 Key 计费策略）。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TraceRawUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub credits: f64,
 }
 
 /// 会话粘性路由结果（record.sticky_outcome 取值）
@@ -325,7 +346,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 12] = [
+        let columns: [(&str, &str); 17] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -338,6 +359,12 @@ impl TraceStore {
             ("previous_credential_id", "INTEGER"),
             ("usage_source", "TEXT"),
             ("client_ip", "TEXT"),
+            // 原始口径：老行保持 NULL，前端据此回退到计费后口径
+            ("raw_input_tokens", "INTEGER"),
+            ("raw_output_tokens", "INTEGER"),
+            ("raw_cache_creation_tokens", "INTEGER"),
+            ("raw_cache_read_tokens", "INTEGER"),
+            ("raw_credits", "REAL"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -408,9 +435,10 @@ impl TraceStore {
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
                  credits, first_token_ms, session_id, sticky_outcome, previous_credential_id, \
-                 usage_source, client_ip) \
+                 usage_source, client_ip, raw_input_tokens, raw_output_tokens, \
+                 raw_cache_creation_tokens, raw_cache_read_tokens, raw_credits) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,\
-                 ?21,?22,?23,?24,?25)",
+                 ?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -437,6 +465,11 @@ impl TraceStore {
                     rec.previous_credential_id.map(|v| v as i64),
                     rec.usage_source,
                     rec.client_ip,
+                    rec.raw_input_tokens.map(|v| v as i64),
+                    rec.raw_output_tokens.map(|v| v as i64),
+                    rec.raw_cache_creation_tokens.map(|v| v as i64),
+                    rec.raw_cache_read_tokens.map(|v| v as i64),
+                    rec.raw_credits,
                 ],
             )?;
             for a in &rec.attempts {
@@ -607,7 +640,9 @@ impl TraceStore {
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
-             session_id, sticky_outcome, previous_credential_id, usage_source, client_ip \
+             session_id, sticky_outcome, previous_credential_id, usage_source, client_ip, \
+             raw_input_tokens, raw_output_tokens, raw_cache_creation_tokens, raw_cache_read_tokens, \
+             raw_credits \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -633,6 +668,11 @@ impl TraceStore {
                 cache_creation_tokens: row.get::<_, i64>(15)? as u64,
                 cache_read_tokens: row.get::<_, i64>(16)? as u64,
                 credits: row.get::<_, f64>(17)?,
+                raw_input_tokens: row.get::<_, Option<i64>>(24)?.map(|v| v as u64),
+                raw_output_tokens: row.get::<_, Option<i64>>(25)?.map(|v| v as u64),
+                raw_cache_creation_tokens: row.get::<_, Option<i64>>(26)?.map(|v| v as u64),
+                raw_cache_read_tokens: row.get::<_, Option<i64>>(27)?.map(|v| v as u64),
+                raw_credits: row.get::<_, Option<f64>>(28)?,
                 first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
                 session_id: row.get(19)?,
                 sticky_outcome: row.get(20)?,
@@ -820,7 +860,12 @@ CREATE TABLE IF NOT EXISTS traces (
     sticky_outcome    TEXT,
     previous_credential_id INTEGER,
     usage_source      TEXT,
-    client_ip         TEXT
+    client_ip         TEXT,
+    raw_input_tokens  INTEGER,
+    raw_output_tokens INTEGER,
+    raw_cache_creation_tokens INTEGER,
+    raw_cache_read_tokens INTEGER,
+    raw_credits       REAL
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -879,6 +924,11 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 101760,
             credits: 0.0,
+            raw_input_tokens: Some(5000),
+            raw_output_tokens: Some(779),
+            raw_cache_creation_tokens: Some(0),
+            raw_cache_read_tokens: Some(97853),
+            raw_credits: Some(0.0),
             first_token_ms: None,
             session_id: Some("sess-1".to_string()),
             sticky_outcome: Some(sticky::HIT.to_string()),
@@ -1298,6 +1348,37 @@ mod tests {
         assert_eq!(out[0].session_id.as_deref(), Some("sess-1"));
         assert_eq!(out[0].sticky_outcome.as_deref(), Some(sticky::HIT));
         assert_eq!(out[0].client_ip.as_deref(), Some("203.0.113.9"));
+        // 原始口径列也随迁移补齐并写入
+        assert_eq!(out[0].raw_input_tokens, Some(5000));
+        assert_eq!(out[0].raw_cache_read_tokens, Some(97853));
+    }
+
+    /// 加列之前写入的老行原始口径为 NULL，读出为 None，前端据此回退。
+    #[test]
+    fn rows_written_before_raw_columns_read_back_as_none() {
+        let store = mem_store();
+        store.insert(&sample(TraceSample {
+            trace_id: "old",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
+        store
+            .conn
+            .lock()
+            .execute_batch(
+                "UPDATE traces SET raw_input_tokens = NULL, raw_output_tokens = NULL, \
+                 raw_cache_creation_tokens = NULL, raw_cache_read_tokens = NULL, raw_credits = NULL",
+            )
+            .unwrap();
+        let out = store.query(&TraceQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(out[0].raw_input_tokens, None);
+        assert_eq!(out[0].raw_credits, None);
+        // 计费后口径不受影响
+        assert_eq!(out[0].input_tokens, 1093);
     }
 
     #[test]

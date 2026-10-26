@@ -2,10 +2,12 @@ import { useCallback, useMemo, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Activity, Calendar, Coins, Cpu, KeyRound, Server } from 'lucide-react'
+import { Activity, Calendar, Coins, Cpu, KeyRound, Percent, Server } from 'lucide-react'
 import { useByCredential, useByKey, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
+import { useStatsView } from '@/hooks/use-stats-view'
 import { AutoRefreshControl } from '@/components/console/auto-refresh-control'
 import { PageHeader } from '@/components/console/page-header'
+import { StatsViewToggle } from '@/components/console/stats-view-toggle'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import type {
@@ -17,6 +19,7 @@ import type {
   StatsGranularity,
   StatsRange,
   StatsTimeFilter,
+  StatsView,
   TimeSeriesPoint,
 } from '@/types/api'
 import { TimeSeriesChart } from '@/components/charts/time-series-chart'
@@ -81,7 +84,7 @@ function timeLabel(filter: StatsTimeFilter): string {
 
 export function OverviewPage() {
   const filters = useOverviewFilters()
-  const overviewQuery = useOverview()
+  const overviewQuery = useOverview(filters.view)
   const keysQuery = useClientKeys()
   const groupOptions = useGroupOptions()
   const seriesQuery = useTimeSeries(filters.timeFilter, filters.statsFilter)
@@ -147,8 +150,11 @@ export function OverviewPage() {
         activeKeys={overview?.activeClientKeys ?? 0}
         stats={rangeStats}
         timeText={timeLabel(filters.timeFilter)}
+        view={filters.view}
       />
       <StatsFilters
+        view={filters.view}
+        onViewChange={filters.setView}
         keyFilter={filters.keyFilter}
         keys={keysData?.keys ?? []}
         selectedLabel={selectedKeyLabel}
@@ -197,12 +203,13 @@ function useOverviewFilters() {
   const [draftRange, setDraftRange] = useState<StatsRange | undefined>('24h')
   const [keyFilter, setKeyFilter] = useState('all')
   const [groupFilter, setGroupFilter] = useState('all')
+  const [view, setView] = useStatsView()
   const statsFilter = useMemo<StatsFilter>(() => {
-    const f: StatsFilter = {}
+    const f: StatsFilter = { view }
     if (keyFilter !== 'all') f.keyId = Number(keyFilter)
     if (groupFilter !== 'all') f.group = groupFilter
     return f
-  }, [keyFilter, groupFilter])
+  }, [keyFilter, groupFilter, view])
   const applyCustomRange = () => {
     setTimeFilter(customTimeFilter(customStartDate, customEndDate, draftGranularity))
   }
@@ -234,8 +241,10 @@ function useOverviewFilters() {
     setDraftGranularity,
     setKeyFilter,
     setGroupFilter,
+    setView,
     statsFilter,
     timeFilter,
+    view,
   }
 }
 
@@ -250,6 +259,8 @@ interface RangeStats {
   errors: number
   inputTokens: number
   outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
 }
 
 function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
@@ -260,9 +271,25 @@ function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
       errors: acc.errors + p.errors,
       inputTokens: acc.inputTokens + p.inputTokens,
       outputTokens: acc.outputTokens + p.outputTokens,
+      cacheCreationTokens: acc.cacheCreationTokens + (p.cacheCreationTokens ?? 0),
+      cacheReadTokens: acc.cacheReadTokens + (p.cacheReadTokens ?? 0),
     }),
-    { calls: 0, credits: 0, errors: 0, inputTokens: 0, outputTokens: 0 },
+    {
+      calls: 0,
+      credits: 0,
+      errors: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+    },
   )
+}
+
+/** 缓存命中率 = 读取 / (input + 创建 + 读取)，与趋势图同一公式；按 token 加权 */
+function cacheHitRate(stats: RangeStats): number | null {
+  const prompt = stats.inputTokens + stats.cacheCreationTokens + stats.cacheReadTokens
+  return prompt > 0 ? (stats.cacheReadTokens / prompt) * 100 : null
 }
 
 function StatsCards({
@@ -270,12 +297,15 @@ function StatsCards({
   activeKeys,
   stats,
   timeText,
+  view,
 }: {
   activeCredentials: number
   activeKeys: number
   stats: RangeStats
   timeText: string
+  view: StatsView
 }) {
+  const hitRate = cacheHitRate(stats)
   const cards = [
     {
       icon: <Activity className="h-4 w-4" />,
@@ -288,10 +318,20 @@ function StatsCards({
     { icon: <Cpu className="h-4 w-4" />, label: '输入 Token', value: formatNumber(stats.inputTokens) },
     { icon: <Cpu className="h-4 w-4" />, label: '输出 Token', value: formatNumber(stats.outputTokens) },
     {
+      icon: <Percent className="h-4 w-4" />,
+      label: '缓存命中率',
+      value: hitRate === null ? '—' : `${hitRate.toFixed(1)}%`,
+      extra: <span className="text-[11px] text-muted-foreground">读取 / 全部输入</span>,
+    },
+    {
       icon: <Coins className="h-4 w-4" />,
       label: 'Credit',
       value: formatCredits(stats.credits),
-      extra: <span className="text-[11px] text-muted-foreground">上游计费量</span>,
+      extra: (
+        <span className="text-[11px] text-muted-foreground">
+          {view === 'raw' ? '上游原始' : '计费后'}
+        </span>
+      ),
     },
     {
       icon: <KeyRound className="h-4 w-4" />,
@@ -308,7 +348,7 @@ function StatsCards({
   ]
 
   return (
-    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-5">
+    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-6">
       {cards.map((card) => (
         <StatCard key={card.label} meta={card.meta ?? timeText} {...card} />
       ))}
@@ -317,6 +357,8 @@ function StatsCards({
 }
 
 function StatsFilters({
+  view,
+  onViewChange,
   keyFilter,
   keys,
   onChange,
@@ -325,6 +367,8 @@ function StatsFilters({
   groupOptions,
   onGroupChange,
 }: {
+  view: StatsView
+  onViewChange: (value: StatsView) => void
   keyFilter: string
   keys: ClientKeyItem[]
   onChange: (value: string) => void
@@ -340,9 +384,11 @@ function StatsFilters({
         <div className="truncate text-[12px] text-muted-foreground">
           {selectedLabel}
           {groupFilter !== 'all' && ` · 分组：${groupFilter}`}
+          {view === 'raw' ? ' · 原始口径（未应用 Key 计费策略）' : ' · 计费后口径（下游看到的用量）'}
         </div>
       </div>
-      <div className="flex flex-col gap-2 sm:flex-row">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <StatsViewToggle value={view} onChange={onViewChange} />
         {/* 入口 Key 筛选 */}
         <Select value={keyFilter} onValueChange={onChange}>
           <SelectTrigger className="h-8 w-full sm:w-[180px]">
@@ -706,8 +752,8 @@ function KeyTable({ data }: { data: KeyDistribution[] }) {
             <th className="text-right font-medium">输出</th>
             <th className="text-right font-medium">异常</th>
             <th className="text-right font-medium">Credit</th>
-            <th className="text-right font-medium">原始 Credit</th>
-            <th className="text-right font-medium">卖出消费</th>
+            <th className="text-right font-medium" title="原始 credit × 凭据成本倍率">账号成本</th>
+            <th className="text-right font-medium" title="计费后 credit × Key 卖出倍率">卖出消费</th>
           </tr>
         </thead>
         <tbody>
@@ -727,7 +773,7 @@ function KeyTable({ data }: { data: KeyDistribution[] }) {
                 )}
               </td>
               <td className="text-right tabular-nums">{formatCredits(k.credits)}</td>
-              <td className="text-right tabular-nums">{formatCredits(k.rawCredits)}</td>
+              <td className="text-right tabular-nums">{formatCredits(k.accountCost)}</td>
               <td className="text-right tabular-nums">{formatCredits(k.sellConsumption)}</td>
             </tr>
           ))}

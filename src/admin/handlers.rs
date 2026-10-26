@@ -35,7 +35,7 @@ use super::{
         UpdateRefreshTokenRequest,
         SetCustomModelsRequest,
     },
-    usage_stats::{Range, StatsGranularity, StatsQueryWindow},
+    usage_stats::{Range, StatsGranularity, StatsQueryWindow, StatsView},
 };
 
 // Path 元组提取：(credential_id, session_id)
@@ -1013,16 +1013,6 @@ pub async fn update_admin_key(
 // ============ 客户端 API Key 分发 ============
 
 fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
-    let (
-        _legacy_cache_ratio,
-        input_multiplier,
-        cache_creation_multiplier,
-        cache_read_multiplier,
-        target_effective_hit_rate,
-        sell_multiplier,
-    ) = (k.cache_ratio, k.input_multiplier, k.cache_creation_multiplier,
-        k.cache_read_multiplier, k.target_effective_hit_rate,
-        super::client_keys::normalize_sell_multiplier(k.sell_multiplier));
     ClientKeyItem {
         id: k.id,
         masked_key: mask_client_key(&k.key),
@@ -1040,58 +1030,21 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         max_credits: k.max_credits,
         group: k.group.clone(),
         groups: super::client_keys::split_group_scope(k.group.as_deref()),
-        cache_ratio: super::client_keys::normalize_cache_ratio(k.cache_ratio),
-        input_multiplier,
-        cache_creation_multiplier,
-        cache_read_multiplier,
-        target_effective_hit_rate,
-        sell_multiplier,
+        billing: super::types::BillingPolicyDto::from_policy(&k.billing_policy()),
+        sell_multiplier: super::client_keys::normalize_sell_multiplier(k.sell_multiplier),
         is_system: k.is_system,
     }
 }
 
-/// 缓存计费系数（若提供）必须在 0~1 之间
-fn cache_ratio_out_of_range(cache_ratio: Option<f64>) -> bool {
-    cache_ratio.is_some_and(|v| !(0.0..=1.0).contains(&v))
-}
-
-fn billing_policy_invalid(
-    input_multiplier: Option<f64>,
-    cache_creation_multiplier: Option<f64>,
-    cache_read_multiplier: Option<f64>,
-    target_effective_hit_rate: Option<f64>,
+/// 校验创建 / 更新请求里的计费字段，返回解析后的策略（未提供时为 None）。
+fn parse_billing_payload(
+    billing: Option<&super::types::BillingPolicyDto>,
     sell_multiplier: Option<f64>,
-) -> bool {
-    let valid_multiplier = |v: Option<f64>| {
-        v.map(|x| x.is_finite() && x >= 0.0).unwrap_or(true)
-    };
-    !valid_multiplier(input_multiplier)
-        || !valid_multiplier(cache_creation_multiplier)
-        || !valid_multiplier(cache_read_multiplier)
-        || !valid_multiplier(sell_multiplier)
-        || target_effective_hit_rate
-            .map(|x| !x.is_finite() || !(0.0..=1.0).contains(&x))
-            .unwrap_or(false)
-}
-
-fn billing_policy_patch_invalid(
-    input_multiplier: Option<Option<f64>>,
-    cache_creation_multiplier: Option<Option<f64>>,
-    cache_read_multiplier: Option<Option<f64>>,
-    target_effective_hit_rate: Option<Option<f64>>,
-    sell_multiplier: Option<Option<f64>>,
-) -> bool {
-    let valid_multiplier = |v: Option<Option<f64>>| {
-        v.flatten().map(|x| x.is_finite() && x >= 0.0).unwrap_or(true)
-    };
-    !valid_multiplier(input_multiplier)
-        || !valid_multiplier(cache_creation_multiplier)
-        || !valid_multiplier(cache_read_multiplier)
-        || !valid_multiplier(sell_multiplier)
-        || target_effective_hit_rate
-            .flatten()
-            .map(|x| !x.is_finite() || !(0.0..=1.0).contains(&x))
-            .unwrap_or(false)
+) -> Result<Option<crate::anthropic::billing::BillingPolicy>, String> {
+    if sell_multiplier.is_some_and(|v| !v.is_finite() || v < 0.0) {
+        return Err("卖出倍率必须是非负有限数".to_string());
+    }
+    billing.map(|dto| dto.to_policy()).transpose()
 }
 
 /// GET /api/admin/client-keys
@@ -1132,30 +1085,16 @@ pub async fn create_client_key(
                 .into_response();
         }
     }
-    if cache_ratio_out_of_range(payload.cache_ratio) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(super::types::AdminErrorResponse::invalid_request(
-                "cacheRatio 必须在 0~1 之间",
-            )),
-        )
-            .into_response();
-    }
-    if billing_policy_invalid(
-        payload.input_multiplier,
-        payload.cache_creation_multiplier,
-        payload.cache_read_multiplier,
-        payload.target_effective_hit_rate,
-        payload.sell_multiplier,
-    ) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(super::types::AdminErrorResponse::invalid_request(
-                "计费倍率必须是非负有限数，目标命中率必须在 0~1 之间",
-            )),
-        )
-            .into_response();
-    }
+    let billing = match parse_billing_payload(payload.billing.as_ref(), payload.sell_multiplier) {
+        Ok(billing) => billing,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(message)),
+            )
+                .into_response();
+        }
+    };
     let group_scope = Some(super::client_keys::normalize_group_scope(
         payload.groups.clone(),
         payload.group.clone(),
@@ -1172,23 +1111,13 @@ pub async fn create_client_key(
     if let Some(v) = payload.max_credits {
         state.client_keys.set_max_credits(entry.id, Some(v));
     }
-    if let Some(r) = payload.cache_ratio {
-        state.client_keys.set_cache_ratio(entry.id, Some(r));
+    if let Some(policy) = &billing {
+        state.client_keys.set_billing_policy(entry.id, policy);
     }
-    if payload.input_multiplier.is_some()
-        || payload.cache_creation_multiplier.is_some()
-        || payload.cache_read_multiplier.is_some()
-        || payload.target_effective_hit_rate.is_some()
-        || payload.sell_multiplier.is_some()
-    {
-        state.client_keys.set_billing_policy(
-            entry.id,
-            payload.input_multiplier,
-            payload.cache_creation_multiplier,
-            payload.cache_read_multiplier,
-            payload.target_effective_hit_rate,
-            payload.sell_multiplier,
-        );
+    if payload.sell_multiplier.is_some() {
+        state
+            .client_keys
+            .set_sell_multiplier(entry.id, payload.sell_multiplier);
     }
     Json(CreateClientKeyResponse {
         id: entry.id,
@@ -1272,30 +1201,19 @@ pub async fn update_client_key(
     Json(payload): Json<UpdateClientKeyRequest>,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
-    if cache_ratio_out_of_range(payload.cache_ratio) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(super::types::AdminErrorResponse::invalid_request(
-                "cacheRatio 必须在 0~1 之间",
-            )),
-        )
-            .into_response();
-    }
-    if billing_policy_patch_invalid(
-        payload.input_multiplier,
-        payload.cache_creation_multiplier,
-        payload.cache_read_multiplier,
-        payload.target_effective_hit_rate,
-        payload.sell_multiplier,
+    let billing = match parse_billing_payload(
+        payload.billing.as_ref(),
+        payload.sell_multiplier.flatten(),
     ) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(super::types::AdminErrorResponse::invalid_request(
-                "计费倍率必须是非负有限数，目标命中率必须在 0~1 之间",
-            )),
-        )
-            .into_response();
-    }
+        Ok(billing) => billing,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(message)),
+            )
+                .into_response();
+        }
+    };
     let description = payload
         .description
         .map(|d| if d.is_empty() { None } else { Some(d) });
@@ -1311,23 +1229,11 @@ pub async fn update_client_key(
         .client_keys
         .update_meta(id, payload.name, description, group)
     {
-        if let Some(r) = payload.cache_ratio {
-            state.client_keys.set_cache_ratio(id, Some(r));
+        if let Some(policy) = &billing {
+            state.client_keys.set_billing_policy(id, policy);
         }
-        if payload.input_multiplier.is_some()
-            || payload.cache_creation_multiplier.is_some()
-            || payload.cache_read_multiplier.is_some()
-            || payload.target_effective_hit_rate.is_some()
-            || payload.sell_multiplier.is_some()
-        {
-            state.client_keys.update_billing_policy(
-                id,
-                payload.input_multiplier,
-                payload.cache_creation_multiplier,
-                payload.cache_read_multiplier,
-                payload.target_effective_hit_rate,
-                payload.sell_multiplier,
-            );
+        if let Some(sell_multiplier) = payload.sell_multiplier {
+            state.client_keys.set_sell_multiplier(id, sell_multiplier);
         }
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
@@ -1520,6 +1426,16 @@ fn stats_query_parts(
     Ok((parse_stats_window(params)?, parse_key_id(params)?))
 }
 
+/// `view=raw|billed`：统计口径，缺省为计费后（下游看到的值）。
+fn parse_stats_view(params: &HashMap<String, String>) -> Result<StatsView, String> {
+    match params.get("view").map(|v| v.trim()) {
+        None | Some("") => Ok(StatsView::default()),
+        Some(value) => {
+            StatsView::parse(value).ok_or_else(|| format!("view 只能是 raw 或 billed：{value}"))
+        }
+    }
+}
+
 fn stats_bad_request(message: String) -> axum::response::Response {
     (
         StatusCode::BAD_REQUEST,
@@ -1529,8 +1445,15 @@ fn stats_bad_request(message: String) -> axum::response::Response {
 }
 
 /// GET /api/admin/stats/overview
-pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoResponse {
-    let overview = state.usage_aggregator.overview();
+pub async fn stats_overview(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let view = match parse_stats_view(&params) {
+        Ok(view) => view,
+        Err(message) => return stats_bad_request(message),
+    };
+    let overview = state.usage_aggregator.overview(view);
     // 附加：当前活跃 Key / 凭据数
     let active_keys = state.client_keys.active_count() as u64;
     let snapshot = state.service.get_all_credentials();
@@ -1548,7 +1471,7 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
         "activeClientKeys": active_keys,
         "activeCredentials": active_credentials,
     });
-    Json(response)
+    Json(response).into_response()
 }
 
 /// GET /api/admin/stats/timeseries?range=24h|7d|30d&granularity=hour|day&group=...
@@ -1560,11 +1483,15 @@ pub async fn stats_timeseries(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
+    let view = match parse_stats_view(&params) {
+        Ok(view) => view,
+        Err(message) => return stats_bad_request(message),
+    };
     let group = parse_group_filter(&params);
     let cred_ids = group_to_cred_ids(&state, group.as_deref());
     let points = state
         .usage_aggregator
-        .query_timeseries(window, key_id, cred_ids.as_ref());
+        .query_timeseries(window, key_id, cred_ids.as_ref(), view);
     Json(points).into_response()
 }
 
@@ -1577,7 +1504,11 @@ pub async fn stats_by_model(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
-    let data = state.usage_aggregator.query_by_model(window, key_id);
+    let view = match parse_stats_view(&params) {
+        Ok(view) => view,
+        Err(message) => return stats_bad_request(message),
+    };
+    let data = state.usage_aggregator.query_by_model(window, key_id, view);
     Json(data).into_response()
 }
 
@@ -1588,6 +1519,10 @@ pub async fn stats_by_credential(
 ) -> axum::response::Response {
     let (window, key_id) = match stats_query_parts(&params) {
         Ok(parts) => parts,
+        Err(message) => return stats_bad_request(message),
+    };
+    let view = match parse_stats_view(&params) {
+        Ok(view) => view,
         Err(message) => return stats_bad_request(message),
     };
     let group = parse_group_filter(&params);
@@ -1609,7 +1544,7 @@ pub async fn stats_by_credential(
     });
     let data = state
         .usage_aggregator
-        .query_by_credential(window, key_id, cred_ids.as_ref());
+        .query_by_credential(window, key_id, cred_ids.as_ref(), view);
     let enriched: Vec<serde_json::Value> = data
         .into_iter()
         .map(|d| {
@@ -1620,14 +1555,9 @@ pub async fn stats_by_credential(
                 "calls": d.calls,
                 "inputTokens": d.input_tokens,
                 "outputTokens": d.output_tokens,
-                "rawInputTokens": d.raw_input_tokens,
-                "rawOutputTokens": d.raw_output_tokens,
-                "rawCacheCreationTokens": d.raw_cache_creation_tokens,
-                "rawCacheReadTokens": d.raw_cache_read_tokens,
-                "rawTotalTokens": d.raw_total_tokens,
-                "rawCredits": d.raw_credits,
-                "modifiedTotalTokens": d.modified_total_tokens,
-                "modifiedCredits": d.modified_credits,
+                "cacheCreationTokens": d.cache_creation_tokens,
+                "cacheReadTokens": d.cache_read_tokens,
+                "credits": d.credits,
                 "accountCost": d.account_cost,
                 "accountCostCny": email_map
                     .get(&d.credential_id)
@@ -1657,9 +1587,15 @@ pub async fn stats_by_key(
         Ok(w) => w,
         Err(message) => return stats_bad_request(message),
     };
+    let view = match parse_stats_view(&params) {
+        Ok(view) => view,
+        Err(message) => return stats_bad_request(message),
+    };
     let group = parse_group_filter(&params);
     let cred_ids = group_to_cred_ids(&state, group.as_deref());
-    let data = state.usage_aggregator.query_by_key(window, cred_ids.as_ref());
+    let data = state
+        .usage_aggregator
+        .query_by_key(window, cred_ids.as_ref(), view);
     // Key 名称解析：命中客户端 Key 名称表则取名称，否则回退 #id
     let key_name_map: HashMap<u64, String> = state
         .client_keys
@@ -1682,14 +1618,6 @@ pub async fn stats_by_key(
                 "outputTokens": d.output_tokens,
                 "cacheCreationTokens": d.cache_creation_tokens,
                 "cacheReadTokens": d.cache_read_tokens,
-                "rawInputTokens": d.raw_input_tokens,
-                "rawOutputTokens": d.raw_output_tokens,
-                "rawCacheCreationTokens": d.raw_cache_creation_tokens,
-                "rawCacheReadTokens": d.raw_cache_read_tokens,
-                "rawTotalTokens": d.raw_total_tokens,
-                "rawCredits": d.raw_credits,
-                "modifiedTotalTokens": d.modified_total_tokens,
-                "modifiedCredits": d.modified_credits,
                 "accountCost": d.account_cost,
                 "sellMultiplier": state.client_keys.sell_multiplier_of(d.key_id),
                 "sellConsumption": d.sell_consumption,
@@ -1841,6 +1769,11 @@ pub async fn list_traces(
                 "cacheReadTokens": r.cache_read_tokens,
                 "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
                 "credits": r.credits,
+                "rawInputTokens": r.raw_input_tokens,
+                "rawOutputTokens": r.raw_output_tokens,
+                "rawCacheCreationTokens": r.raw_cache_creation_tokens,
+                "rawCacheReadTokens": r.raw_cache_read_tokens,
+                "rawCredits": r.raw_credits,
                 "firstTokenMs": r.first_token_ms,
                 "sessionId": r.session_id,
                 "stickyOutcome": r.sticky_outcome,

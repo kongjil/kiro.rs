@@ -23,6 +23,7 @@
 //! ```
 
 pub mod cache_metering;
+pub mod billing;
 mod claude_wire;
 mod converter;
 mod handlers;

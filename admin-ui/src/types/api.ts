@@ -468,12 +468,8 @@ export interface ClientKeyItem {
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   groups: string[]
-  /** 缓存计费系数（0~1，1 = 满缓存，0 = 无缓存） */
-  cacheRatio: number
-  inputMultiplier?: number
-  cacheCreationMultiplier?: number
-  cacheReadMultiplier?: number
-  targetEffectiveHitRate?: number
+  /** 下游计费策略 */
+  billing: BillingPolicy
   sellMultiplier: number
   /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
   isSystem: boolean
@@ -491,12 +487,8 @@ export interface CreateClientKeyRequest {
   groups?: string[]
   /** 积分使用上限（可选，不传表示不限制） */
   maxCredits?: number
-  /** 缓存计费系数（可选，0~1，不传表示满缓存） */
-  cacheRatio?: number
-  inputMultiplier?: number
-  cacheCreationMultiplier?: number
-  cacheReadMultiplier?: number
-  targetEffectiveHitRate?: number
+  /** 下游计费策略（不传表示原始模式） */
+  billing?: BillingPolicy
   sellMultiplier?: number
 }
 
@@ -513,13 +505,34 @@ export interface UpdateClientKeyRequest {
   description?: string
   group?: string
   groups?: string[]
-  /** 缓存计费系数（可选，0~1，不传表示不修改） */
-  cacheRatio?: number
-  inputMultiplier?: number | null
-  cacheCreationMultiplier?: number | null
-  cacheReadMultiplier?: number | null
-  targetEffectiveHitRate?: number | null
+  /** 下游计费策略（不传表示不修改；传入则整体替换） */
+  billing?: BillingPolicy
   sellMultiplier?: number | null
+}
+
+/**
+ * 计费模式：
+ * - raw：原样透传
+ * - redistribute：输入总量不变，重新分配读取 / 创建 / input
+ * - inflate：输入总量乘以 inputScale（output 乘以 outputScale）后再分配
+ * - legacy_multipliers：旧版分类倍率，只读回显，不能新设
+ */
+export type BillingMode = 'raw' | 'redistribute' | 'inflate' | 'legacy_multipliers'
+
+export interface BillingPolicy {
+  mode: BillingMode
+  /** 目标命中率（0~1），与 cacheScale 二选一；都不填则保持原始比例 */
+  targetHitRate?: number
+  /** 缓存缩放系数（0~1），读取与创建按原始比例乘以该值，砍掉的部分算 input */
+  cacheScale?: number
+  /** 非命中部分里缓存创建的占比（0~1）；不填沿用原始比例 */
+  creationShare?: number
+  /** 加量模式：输入总量倍率（1~10） */
+  inputScale?: number
+  /** 加量模式：output 倍率（1~10） */
+  outputScale?: number
+  /** 旧版分类倍率 [input, 创建, 读取]，只读 */
+  legacyMultipliers?: [number, number, number]
 }
 
 // ============ 用量统计 ============
@@ -534,11 +547,16 @@ export interface StatsTimeFilter {
   granularity: StatsGranularity
 }
 
+/** 统计口径：raw = 原始（未应用 Key 计费策略），billed = 计费后（下游看到的值） */
+export type StatsView = 'raw' | 'billed'
+
 export interface StatsFilter {
   /** 不传 = 全部；其它值 = 客户端 Key id */
   keyId?: number
   /** 按账号分组筛选（仅影响 timeseries / by-credential，by-model 不支持） */
   group?: string
+  /** 统计口径，不传为计费后 */
+  view?: StatsView
 }
 
 export interface OverviewStats {
@@ -564,15 +582,9 @@ export interface TimeSeriesPoint {
   calls: number
   errors: number
   credits: number
-  rawInputTokens: number
-  rawOutputTokens: number
-  rawCacheCreationTokens: number
-  rawCacheReadTokens: number
-  rawTotalTokens: number
-  rawCredits: number
-  modifiedTotalTokens: number
-  modifiedCredits: number
+  /** 账号成本：原始 credit × 凭据成本倍率（与口径无关） */
   accountCost: number
+  /** 卖出消费：计费后 credit × Key 卖出倍率（与口径无关） */
   sellConsumption: number
 }
 
@@ -581,6 +593,9 @@ export interface ModelDistribution {
   calls: number
   inputTokens: number
   outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  credits: number
 }
 
 export interface CredentialDistribution {
@@ -589,15 +604,10 @@ export interface CredentialDistribution {
   calls: number
   inputTokens: number
   outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  credits: number
   errors: number
-  rawInputTokens: number
-  rawOutputTokens: number
-  rawCacheCreationTokens: number
-  rawCacheReadTokens: number
-  rawTotalTokens: number
-  rawCredits: number
-  modifiedTotalTokens: number
-  modifiedCredits: number
   accountCost: number
   sellConsumption: number
 }
@@ -612,14 +622,6 @@ export interface KeyDistribution {
   cacheReadTokens: number
   errors: number
   credits: number
-  rawInputTokens: number
-  rawOutputTokens: number
-  rawCacheCreationTokens: number
-  rawCacheReadTokens: number
-  rawTotalTokens: number
-  rawCredits: number
-  modifiedTotalTokens: number
-  modifiedCredits: number
   accountCost: number
   sellConsumption: number
 }
@@ -672,8 +674,14 @@ export interface TraceRecord {
   cacheReadTokens?: number
   /** 总 token = input + output + cache_creation + cache_read */
   totalTokens?: number
-  /** 费用（credits） */
+  /** 费用（credits，计费后口径） */
   credits?: number
+  /** 原始口径（未应用 Key 计费策略）；加列之前的老记录为 null */
+  rawInputTokens?: number | null
+  rawOutputTokens?: number | null
+  rawCacheCreationTokens?: number | null
+  rawCacheReadTokens?: number | null
+  rawCredits?: number | null
   /** 首 Token 延迟（毫秒，仅流式有值） */
   firstTokenMs?: number | null
   /** 发给上游的 conversationId；同一会话多轮共享，可据此串起整个会话 */

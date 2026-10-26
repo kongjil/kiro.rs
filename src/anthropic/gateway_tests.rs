@@ -282,8 +282,7 @@ fn key() -> KeyContext {
         group: None,
         key_source: TraceKeySource::MasterApiKey,
         client_ip: None,
-        cache_ratio: 1.0,
-        billing_policy: crate::anthropic::cache_metering::BillingPolicy::default(),
+        billing_policy: crate::anthropic::billing::BillingPolicy::default(),
     }
 }
 async fn request(state: AppState, endpoint: &str, streaming: bool) -> Response {
@@ -767,6 +766,128 @@ async fn gateway_claude_wire_orders_keys_and_keeps_billing_fields() {
     let chat: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
     if chat["usage"]["credit_usage"] != json!(0.42) {
         failures.push(format!("chat completions lost credit_usage: {chat}"));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// 按 Key 的计费策略：下游拿到的是计费后用量（message_start、message_delta、非流式
+/// body 都是），管理端统计与 trace 同时保留原始与计费后两套，三处的计费后 credit 一致。
+#[tokio::test]
+async fn gateway_billing_policy_settles_response_stats_and_trace_together() {
+    use crate::admin::usage_stats::{
+        Range, StatsGranularity, StatsQueryWindow, StatsView, UsageAggregator,
+    };
+    use crate::anthropic::billing::{BillingMode, BillingPolicy, Composition};
+
+    // Metered 夹具的上游真值：input 13 / 创建 2 / 读取 3 / 输出 17，credit 0.42。
+    // 加量 2 倍 + 命中率 50%：输入总量 18 → 36，读取 18，剩余 18 按原始 创建:input=2:13 分。
+    let policy = BillingPolicy {
+        mode: BillingMode::Inflate,
+        composition: Composition::TargetHitRate(0.5),
+        input_scale: 2.0,
+        ..Default::default()
+    };
+    let expected_billed_credits = 0.42 * (36.0 + 17.0) / (18.0 + 17.0);
+
+    let mut failures = Vec::new();
+    for (endpoint, streaming) in [("messages", false), ("messages", true), ("cc", true)] {
+        let f = fixture(Mode::Metered).await;
+        let aggregator = Arc::new(UsageAggregator::new());
+        let store = Arc::new(TraceStore::open_in_memory().unwrap());
+        let state = f
+            .state
+            .clone()
+            .with_usage(None, None, Some(aggregator.clone()))
+            .with_trace_store(Some(store.clone()));
+        let key_ctx = KeyContext {
+            billing_policy: policy,
+            ..key()
+        };
+        let payload = json!({
+            "model":"gpt-5.6-sol","max_tokens":64,"stream":streaming,
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[{"name":"run","description":"test command","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}]
+        });
+        let payload = Json(serde_json::from_value(payload).unwrap());
+        let response = if endpoint == "cc" {
+            post_messages_cc(axum::extract::State(state), Extension(key_ctx), payload).await
+        } else {
+            post_messages(axum::extract::State(state), Extension(key_ctx), payload).await
+        };
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+
+        // 下游看到的 usage
+        let (final_usage, start_usage) = if streaming {
+            let events: Vec<serde_json::Value> = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str(data).ok())
+                .collect();
+            let find = |kind: &str| {
+                events
+                    .iter()
+                    .find(|event| event["type"] == kind)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            (
+                find("message_delta")["usage"].clone(),
+                Some(find("message_start")["message"]["usage"].clone()),
+            )
+        } else {
+            let message: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            (message["usage"].clone(), None)
+        };
+        let downstream_credit = final_usage["credit_usage"].as_f64().unwrap_or(-1.0);
+        if final_usage["input_tokens"] != 16
+            || final_usage["cache_creation_input_tokens"] != 2
+            || final_usage["cache_read_input_tokens"] != 18
+            || final_usage["output_tokens"] != 17
+            || (downstream_credit - expected_billed_credits).abs() > 1e-9
+        {
+            failures.push(format!("{endpoint} stream={streaming}: final usage {final_usage}"));
+        }
+        // message_start 也按同一策略换算（命中率 50%，必有缓存读取）
+        if let Some(start) = start_usage
+            && start["cache_read_input_tokens"].as_i64().unwrap_or(0) <= 0
+        {
+            failures.push(format!("{endpoint} stream={streaming}: message_start {start}"));
+        }
+
+        // 管理端统计：两套口径
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let raw = aggregator.query_timeseries(window, None, None, StatsView::Raw);
+        let billed = aggregator.query_timeseries(window, None, None, StatsView::Billed);
+        let raw_ok = raw.len() == 1
+            && (raw[0].input_tokens, raw[0].cache_creation_tokens, raw[0].cache_read_tokens)
+                == (13, 2, 3)
+            && (raw[0].credits - 0.42).abs() < 1e-9;
+        let billed_ok = billed.len() == 1
+            && (billed[0].input_tokens, billed[0].cache_creation_tokens, billed[0].cache_read_tokens)
+                == (16, 2, 18)
+            && (billed[0].credits - downstream_credit).abs() < 1e-9;
+        if !raw_ok || !billed_ok {
+            failures.push(format!(
+                "{endpoint} stream={streaming}: stats raw={raw:?} billed={billed:?}"
+            ));
+        }
+
+        // trace：顶层是计费后，raw_* 是原始
+        let (records, _) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        let trace_ok = records.len() == 1
+            && records[0].input_tokens == 16
+            && records[0].cache_read_tokens == 18
+            && (records[0].credits - downstream_credit).abs() < 1e-9
+            && records[0].raw_input_tokens == Some(13)
+            && records[0].raw_cache_read_tokens == Some(3)
+            && records[0].raw_credits.is_some_and(|c| (c - 0.42).abs() < 1e-9);
+        if !trace_ok {
+            failures.push(format!("{endpoint} stream={streaming}: trace {records:?}"));
+        }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

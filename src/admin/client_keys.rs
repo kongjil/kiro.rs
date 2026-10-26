@@ -17,6 +17,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
+use crate::anthropic::billing::{BillingMode, BillingPolicy, Composition, LegacyMultipliers};
+
 /// 单条客户端 Key
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,25 +59,31 @@ pub struct ClientKey {
     /// None 表示不绑定分组，可使用全部账号。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// 缓存计费系数（0.0~1.0）。None 等价于 1.0（满缓存）。
-    ///
-    /// 只影响本 Key 上报给下游的 usage 拆分：最终缓存量（本地 CacheMeter 模拟值或
-    /// 上游 tokenUsage 精确值）乘以此系数，被砍掉的部分转入 input 全价计；
-    /// 0 表示缓存 token 归零。不影响发往上游的真实请求与 credit 消耗。
+    /// 计费模式。None 表示旧配置，按下面的旧字段推导（见 [`ClientKey::billing_policy`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_mode: Option<BillingMode>,
+    /// 构成规则「缓存缩放系数」（0~1）。旧版 `cacheRatio` 沿用同一个字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ratio: Option<f64>,
-    /// 普通 input 的计费用量倍率；空值表示 raw 模式下的默认 1.0。
+    /// 旧版分类倍率，仅 `LegacyMultipliers` 模式使用；新配置不再写入。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_multiplier: Option<f64>,
-    /// cache creation/write 的计费用量倍率。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_multiplier: Option<f64>,
-    /// cache read 的计费用量倍率。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_multiplier: Option<f64>,
-    /// 目标有效缓存命中率（0~1）；设置后动态求解 read multiplier。
+    /// 构成规则「目标命中率」（0~1）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_effective_hit_rate: Option<f64>,
+    /// 非命中部分里缓存创建的占比（0~1）；None 沿用原始比例。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_share: Option<f64>,
+    /// 加量模式的输入总量倍率。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_scale: Option<f64>,
+    /// 加量模式的 output 倍率。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_scale: Option<f64>,
     /// 下游卖出倍率；只用于内部销售统计，不改变请求响应。
     #[serde(default, skip_serializing_if = "is_one_f64")]
     pub sell_multiplier: f64,
@@ -83,6 +91,83 @@ pub struct ClientKey {
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_system: bool,
+}
+
+/// 0~1 之间的有限值才算有效的比例配置。
+fn valid_fraction(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+}
+
+impl ClientKey {
+    /// 本 Key 的下游计费策略。
+    ///
+    /// 显式设置过 `billingMode` 的按新字段组装；旧配置按旧版优先级推导，保证升级后
+    /// 计费结果不变：目标命中率 > 分类倍率 > 缓存系数 > 原始。
+    pub fn billing_policy(&self) -> BillingPolicy {
+        let composition = if let Some(rate) = valid_fraction(self.target_effective_hit_rate) {
+            Composition::TargetHitRate(rate)
+        } else if let Some(ratio) = valid_fraction(self.cache_ratio) {
+            Composition::ScaleCache(ratio)
+        } else {
+            Composition::Keep
+        };
+        let legacy = LegacyMultipliers {
+            input: self.input_multiplier.unwrap_or(1.0),
+            creation: self.cache_creation_multiplier.unwrap_or(1.0),
+            read: self.cache_read_multiplier.unwrap_or(1.0),
+        };
+        let mode = self.billing_mode.unwrap_or_else(|| {
+            let has_multiplier = self.input_multiplier.is_some()
+                || self.cache_creation_multiplier.is_some()
+                || self.cache_read_multiplier.is_some();
+            match composition {
+                Composition::TargetHitRate(_) => BillingMode::Redistribute,
+                _ if has_multiplier => BillingMode::LegacyMultipliers,
+                Composition::ScaleCache(_) => BillingMode::Redistribute,
+                Composition::Keep => BillingMode::Raw,
+            }
+        });
+        // 旧配置里分类倍率与缓存系数同时存在时，旧版只认倍率。
+        let composition = if mode == BillingMode::LegacyMultipliers {
+            Composition::Keep
+        } else {
+            composition
+        };
+        BillingPolicy {
+            mode,
+            composition,
+            creation_share: valid_fraction(self.creation_share),
+            input_scale: self.input_scale.unwrap_or(1.0),
+            output_scale: self.output_scale.unwrap_or(1.0),
+            legacy,
+        }
+    }
+
+    /// 写入新的计费策略。旧版分类倍率一并清除（新配置不可再选该模式）。
+    fn store_billing_policy(&mut self, policy: &BillingPolicy) {
+        self.billing_mode = Some(policy.mode);
+        self.input_multiplier = None;
+        self.cache_creation_multiplier = None;
+        self.cache_read_multiplier = None;
+        self.target_effective_hit_rate = None;
+        self.cache_ratio = None;
+        self.creation_share = None;
+        self.input_scale = None;
+        self.output_scale = None;
+        if policy.mode == BillingMode::Raw {
+            return;
+        }
+        match policy.composition {
+            Composition::Keep => {}
+            Composition::TargetHitRate(rate) => self.target_effective_hit_rate = Some(rate),
+            Composition::ScaleCache(ratio) => self.cache_ratio = Some(ratio),
+        }
+        self.creation_share = policy.creation_share;
+        if policy.mode == BillingMode::Inflate {
+            self.input_scale = Some(policy.input_scale);
+            self.output_scale = Some(policy.output_scale);
+        }
+    }
 }
 
 /// 鉴权结果：区分「命中」「超额」「未命中」，供中间件返回不同 HTTP 状态。
@@ -218,11 +303,15 @@ impl ClientKeyManager {
             total_credits: 0.0,
             max_credits: None,
             group: group.filter(|g| !g.trim().is_empty()),
+            billing_mode: None,
             cache_ratio: None,
             input_multiplier: None,
             cache_creation_multiplier: None,
             cache_read_multiplier: None,
             target_effective_hit_rate: None,
+            creation_share: None,
+            input_scale: None,
+            output_scale: None,
             sell_multiplier: 1.0,
             is_system: false,
         };
@@ -268,11 +357,15 @@ impl ClientKeyManager {
                     total_credits: 0.0,
                     max_credits: None,
                     group: None,
+                    billing_mode: None,
                     cache_ratio: None,
                     input_multiplier: None,
                     cache_creation_multiplier: None,
                     cache_read_multiplier: None,
                     target_effective_hit_rate: None,
+                    creation_share: None,
+                    input_scale: None,
+                    output_scale: None,
                     sell_multiplier: 1.0,
                     is_system: true,
                 },
@@ -380,35 +473,14 @@ impl ClientKeyManager {
         Some(normalize_group_scope(None, legacy))
     }
 
-    /// 返回指定 Key 的有效缓存计费系数（未设置或 Key 不存在时为 1.0）
-    pub fn cache_ratio_of(&self, id: u64) -> f64 {
-        normalize_cache_ratio(self.inner.read().entries.get(&id).and_then(|e| e.cache_ratio))
-    }
-
-    /// 返回该 Key 的完整计费策略字段；缺省值保持 raw 行为。
-    pub fn billing_policy_of(
-        &self,
-        id: u64,
-    ) -> (
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        f64,
-    ) {
-        let inner = self.inner.read();
-        let Some(entry) = inner.entries.get(&id) else {
-            return (None, None, None, None, None, 1.0);
-        };
-        (
-            entry.cache_ratio,
-            entry.input_multiplier,
-            entry.cache_creation_multiplier,
-            entry.cache_read_multiplier,
-            entry.target_effective_hit_rate,
-            normalize_sell_multiplier(entry.sell_multiplier),
-        )
+    /// 返回该 Key 的下游计费策略；Key 不存在时为原始模式。
+    pub fn billing_policy_of(&self, id: u64) -> BillingPolicy {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(ClientKey::billing_policy)
+            .unwrap_or_default()
     }
 
     pub fn sell_multiplier_of(&self, id: u64) -> f64 {
@@ -604,20 +676,15 @@ impl ClientKeyManager {
         updated
     }
 
-    /// 设置或清除单个 Key 的缓存计费系数。`None` 或 `>= 1.0` 表示满缓存（清除字段）。
-    ///
-    /// 非有限值拒绝为无效，其余值归一到 0.0~1.0。返回 `false` 表示 Key 不存在或入参非法。
-    pub fn set_cache_ratio(&self, id: u64, cache_ratio: Option<f64>) -> bool {
-        if cache_ratio.is_some_and(|v| !v.is_finite()) {
+    /// 设置 Key 的计费策略。策略非法（见 [`BillingPolicy::validate`]）或 Key 不存在时返回 `false`。
+    pub fn set_billing_policy(&self, id: u64, policy: &BillingPolicy) -> bool {
+        if policy.validate().is_err() {
             return false;
         }
-        let cache_ratio = cache_ratio
-            .map(|v| v.clamp(0.0, 1.0))
-            .filter(|v| *v < 1.0);
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
-            Some(e) => {
-                e.cache_ratio = cache_ratio;
+            Some(entry) => {
+                entry.store_billing_policy(policy);
                 true
             }
             None => false,
@@ -628,41 +695,16 @@ impl ClientKeyManager {
         updated
     }
 
-    /// 设置 Key 的新计费策略字段。`None` 表示回到 raw 模式默认值。
-    pub fn set_billing_policy(
-        &self,
-        id: u64,
-        input_multiplier: Option<f64>,
-        cache_creation_multiplier: Option<f64>,
-        cache_read_multiplier: Option<f64>,
-        target_effective_hit_rate: Option<f64>,
-        sell_multiplier: Option<f64>,
-    ) -> bool {
-        let valid_multiplier = |v: Option<f64>| {
-            v.map(|x| x.is_finite() && x >= 0.0).unwrap_or(true)
-        };
-        let valid_target = |v: Option<f64>| {
-            v.map(|x| x.is_finite() && (0.0..=1.0).contains(&x))
-                .unwrap_or(true)
-        };
-        if !valid_multiplier(input_multiplier)
-            || !valid_multiplier(cache_creation_multiplier)
-            || !valid_multiplier(cache_read_multiplier)
-            || !valid_multiplier(sell_multiplier)
-            || !valid_target(target_effective_hit_rate)
-        {
+    /// 设置卖出倍率（只用于内部销售统计）；`None` 恢复为 1。
+    pub fn set_sell_multiplier(&self, id: u64, sell_multiplier: Option<f64>) -> bool {
+        let value = sell_multiplier.unwrap_or(1.0);
+        if !value.is_finite() || value < 0.0 {
             return false;
         }
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
             Some(entry) => {
-                entry.input_multiplier = input_multiplier;
-                entry.cache_creation_multiplier = cache_creation_multiplier;
-                entry.cache_read_multiplier = cache_read_multiplier;
-                entry.target_effective_hit_rate = target_effective_hit_rate;
-                if let Some(value) = sell_multiplier {
-                    entry.sell_multiplier = value;
-                }
+                entry.sell_multiplier = value;
                 true
             }
             None => false,
@@ -670,50 +712,6 @@ impl ClientKeyManager {
         if updated {
             self.save_locked(&inner);
         }
-        updated
-    }
-
-    /// 按字段增量更新计费策略；外层 None 表示保持，内层 None 表示清除该字段。
-    pub fn update_billing_policy(
-        &self,
-        id: u64,
-        input_multiplier: Option<Option<f64>>,
-        cache_creation_multiplier: Option<Option<f64>>,
-        cache_read_multiplier: Option<Option<f64>>,
-        target_effective_hit_rate: Option<Option<f64>>,
-        sell_multiplier: Option<Option<f64>>,
-    ) -> bool {
-        let valid_multiplier = |v: Option<Option<f64>>| {
-            v.flatten()
-                .map(|x| x.is_finite() && x >= 0.0)
-                .unwrap_or(true)
-        };
-        let valid_target = |v: Option<Option<f64>>| {
-            v.flatten()
-                .map(|x| x.is_finite() && (0.0..=1.0).contains(&x))
-                .unwrap_or(true)
-        };
-        if !valid_multiplier(input_multiplier)
-            || !valid_multiplier(cache_creation_multiplier)
-            || !valid_multiplier(cache_read_multiplier)
-            || !valid_multiplier(sell_multiplier)
-            || !valid_target(target_effective_hit_rate)
-        {
-            return false;
-        }
-        let mut inner = self.inner.write();
-        let updated = match inner.entries.get_mut(&id) {
-            Some(entry) => {
-                if let Some(value) = input_multiplier { entry.input_multiplier = value; }
-                if let Some(value) = cache_creation_multiplier { entry.cache_creation_multiplier = value; }
-                if let Some(value) = cache_read_multiplier { entry.cache_read_multiplier = value; }
-                if let Some(value) = target_effective_hit_rate { entry.target_effective_hit_rate = value; }
-                if let Some(value) = sell_multiplier { entry.sell_multiplier = value.unwrap_or(1.0); }
-                true
-            }
-            None => false,
-        };
-        if updated { self.save_locked(&inner); }
         updated
     }
 
@@ -795,14 +793,6 @@ fn is_one_f64(v: &f64) -> bool {
 
 pub fn normalize_sell_multiplier(v: f64) -> f64 {
     if v.is_finite() && v >= 0.0 { v } else { 1.0 }
-}
-
-/// 把存储的缓存计费系数归一为有效值：未设置 / 非有限值为 1.0，其余夹到 0.0~1.0。
-pub fn normalize_cache_ratio(ratio: Option<f64>) -> f64 {
-    match ratio {
-        Some(v) if v.is_finite() => v.clamp(0.0, 1.0),
-        _ => 1.0,
-    }
 }
 
 /// 生成 `sk-` 前缀 + 32 位 base62 随机字符串
@@ -915,56 +905,101 @@ mod tests {
     }
 
     #[test]
-    fn cache_ratio_defaults_to_full_and_round_trips() {
+    fn billing_policy_defaults_to_raw_and_round_trips() {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("test".to_string(), None, None);
-        assert_eq!(entry.cache_ratio, None);
-        assert_eq!(mgr.cache_ratio_of(entry.id), 1.0);
+        assert_eq!(mgr.billing_policy_of(entry.id), BillingPolicy::default());
+        assert_eq!(mgr.billing_policy_of(999), BillingPolicy::default());
 
-        assert!(mgr.set_cache_ratio(entry.id, Some(0.5)));
-        assert_eq!(mgr.cache_ratio_of(entry.id), 0.5);
-        assert!(mgr.set_cache_ratio(entry.id, Some(0.0)));
-        assert_eq!(mgr.cache_ratio_of(entry.id), 0.0);
+        let inflate = BillingPolicy {
+            mode: BillingMode::Inflate,
+            composition: Composition::TargetHitRate(0.8),
+            creation_share: Some(0.3),
+            input_scale: 1.2,
+            output_scale: 1.0,
+            ..Default::default()
+        };
+        assert!(mgr.set_billing_policy(entry.id, &inflate));
+        assert_eq!(mgr.billing_policy_of(entry.id), inflate);
 
-        // 越界值夹到 0~1；>= 1 视为满缓存并清除字段
-        assert!(mgr.set_cache_ratio(entry.id, Some(-3.0)));
-        assert_eq!(mgr.cache_ratio_of(entry.id), 0.0);
-        assert!(mgr.set_cache_ratio(entry.id, Some(7.0)));
-        assert_eq!(mgr.list()[0].cache_ratio, None);
-        assert_eq!(mgr.cache_ratio_of(entry.id), 1.0);
-
-        assert!(!mgr.set_cache_ratio(entry.id, Some(f64::NAN)));
-        assert!(!mgr.set_cache_ratio(999, Some(0.5)));
-        assert_eq!(mgr.cache_ratio_of(999), 1.0);
-    }
-
-    #[test]
-    fn cache_ratio_is_omitted_from_json_when_unset() {
-        let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None);
-        let json = serde_json::to_value(&entry).unwrap();
+        // 落盘格式与旧字段兼容
+        let json = serde_json::to_value(&mgr.list()[0]).unwrap();
+        assert_eq!(json["billingMode"], "inflate");
+        assert_eq!(json["targetEffectiveHitRate"], 0.8);
+        assert_eq!(json["inputScale"], 1.2);
         assert!(json.get("cacheRatio").is_none());
 
-        mgr.set_cache_ratio(entry.id, Some(0.25));
+        // 切回原始：构成字段全部清除
+        assert!(mgr.set_billing_policy(entry.id, &BillingPolicy::default()));
         let json = serde_json::to_value(&mgr.list()[0]).unwrap();
-        assert_eq!(json["cacheRatio"], serde_json::json!(0.25));
-
-        // 旧文件无此字段时反序列化为 None
-        let legacy: ClientKey = serde_json::from_value(serde_json::json!({
-            "id": 1, "key": "sk-x", "name": "old", "createdAt": "2026-01-01T00:00:00Z"
-        }))
-        .unwrap();
-        assert_eq!(legacy.cache_ratio, None);
+        assert_eq!(json["billingMode"], "raw");
+        assert!(json.get("targetEffectiveHitRate").is_none());
+        assert!(json.get("inputScale").is_none());
     }
 
     #[test]
-    fn normalize_cache_ratio_handles_invalid_values() {
-        assert_eq!(normalize_cache_ratio(None), 1.0);
-        assert_eq!(normalize_cache_ratio(Some(f64::INFINITY)), 1.0);
-        assert_eq!(normalize_cache_ratio(Some(f64::NAN)), 1.0);
-        assert_eq!(normalize_cache_ratio(Some(-0.2)), 0.0);
-        assert_eq!(normalize_cache_ratio(Some(0.3)), 0.3);
-        assert_eq!(normalize_cache_ratio(Some(1.5)), 1.0);
+    fn invalid_billing_policy_is_rejected() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None);
+        let bad = [
+            BillingPolicy {
+                mode: BillingMode::Redistribute,
+                composition: Composition::TargetHitRate(1.5),
+                ..Default::default()
+            },
+            BillingPolicy {
+                mode: BillingMode::Inflate,
+                input_scale: 0.5,
+                ..Default::default()
+            },
+            BillingPolicy {
+                mode: BillingMode::LegacyMultipliers,
+                ..Default::default()
+            },
+        ];
+        for policy in bad {
+            assert!(!mgr.set_billing_policy(entry.id, &policy), "{policy:?}");
+        }
+        assert_eq!(mgr.billing_policy_of(entry.id), BillingPolicy::default());
+    }
+
+    /// 升级前写入的旧配置按旧版优先级推导，计费结果不变。
+    #[test]
+    fn legacy_billing_fields_map_to_equivalent_policy() {
+        let key = |extra: serde_json::Value| -> ClientKey {
+            let mut base = serde_json::json!({
+                "id": 1, "key": "sk-x", "name": "old", "createdAt": "2026-01-01T00:00:00Z"
+            });
+            base.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(base).unwrap()
+        };
+
+        assert_eq!(key(serde_json::json!({})).billing_policy(), BillingPolicy::default());
+
+        let ratio = key(serde_json::json!({"cacheRatio": 0.5})).billing_policy();
+        assert_eq!(ratio.mode, BillingMode::Redistribute);
+        assert_eq!(ratio.composition, Composition::ScaleCache(0.5));
+
+        // 目标命中率优先于分类倍率
+        let target = key(serde_json::json!({
+            "targetEffectiveHitRate": 0.8, "inputMultiplier": 1.2
+        }))
+        .billing_policy();
+        assert_eq!(target.mode, BillingMode::Redistribute);
+        assert_eq!(target.composition, Composition::TargetHitRate(0.8));
+
+        // 分类倍率优先于缓存系数（旧版同样只认倍率）
+        let legacy = key(serde_json::json!({
+            "cacheRatio": 0.5, "inputMultiplier": 1.2, "cacheReadMultiplier": 2.0
+        }))
+        .billing_policy();
+        assert_eq!(legacy.mode, BillingMode::LegacyMultipliers);
+        assert_eq!(legacy.composition, Composition::Keep);
+        assert_eq!(legacy.legacy.input, 1.2);
+        assert_eq!(legacy.legacy.creation, 1.0);
+        assert_eq!(legacy.legacy.read, 2.0);
     }
 
     #[test]

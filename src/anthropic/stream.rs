@@ -1421,6 +1421,7 @@ impl SseStateManager {
     }
 }
 
+use super::billing::BillingOutcome;
 use super::converter::get_context_window_size;
 
 /// 流处理上下文
@@ -1477,14 +1478,13 @@ pub struct StreamContext {
     /// 覆盖的前缀重复计进 input_tokens。
     pub cache_usage: super::cache_metering::CacheUsage,
     /// 对下游公开的 usage 修改策略；原始 usage 仍由 provider/cache_usage 保留。
-    pub billing_policy: super::cache_metering::BillingPolicy,
+    pub billing_policy: super::billing::BillingPolicy,
     /// 按模型计算修改后 credit 的价格表；为空时保留上游原始 credit。
     pub billing_prices: std::sync::Arc<std::collections::HashMap<String, crate::model::config::BillingPrice>>,
     /// meteringEvent 上报的 credit 计费量（上游真实下发，多次事件累加得到本次总量）
     pub credits: f64,
-    /// 最近一次 meteringEvent 完整 payload（含 unit / unit_plural / usage）。
-    /// 透传到 message_delta.usage 的 `credit_usage` / `credit_unit` / `credit_unit_plural`
-    /// 字段，与 kiro-rs /v1/messages 行为对齐；上游只下发一次则取该次。
+    /// 最近一次 meteringEvent 完整 payload，只取它的单位字段；message_delta 的
+    /// `credit_usage` 用结算后的 credit（原始值为 `credits` 的累加）。
     pub metering: Option<MeteringEvent>,
     /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
     /// Opus 长上下文退化时会把同一个 stray token（call/count/card）一行一行无限复读，
@@ -1510,15 +1510,17 @@ pub struct StreamContext {
     pending_retry_separator: bool,
     /// 之前各次尝试累计的输出 tokens。
     carried_output_tokens: i32,
-    /// 首次尝试的输入用量；重试后锁定，避免把续写请求的输入重复计入。
-    frozen_input_usage: Option<(i32, i32, i32)>,
-    /// 之前各次尝试累计的 meteringEvent credit。
-    carried_metering_usage: f64,
+    /// 首次尝试的原始输入用量 `(input, creation, read)`；截断续写后锁定，
+    /// 避免把续写请求的输入重复计入。计费后口径由它经策略算出，不单独冻结。
+    frozen_raw_input: Option<(i32, i32, i32)>,
 }
 
 impl StreamContext {
-    /// 解析未应用 Key 计费策略的原始 usage，供管理端审计；该值不进入下游响应。
-    pub fn raw_resolved_usage(&self) -> (i32, i32, i32) {
+    /// 本次上游尝试的原始输入 `(input, creation, read)`。
+    ///
+    /// 精确 `metadataEvent.tokenUsage` 优先；只有上游未提供该事件时，才按
+    /// contextUsage/请求估算总量与本地 CacheMeter 比例回退。
+    fn attempt_raw_input(&self) -> (i32, i32, i32) {
         if let Some(usage) = self.provider_token_usage {
             let usage = usage.sanitized();
             return (
@@ -1527,6 +1529,8 @@ impl StreamContext {
                 usage.cache_read_input_tokens,
             );
         }
+        // contextUsage 覆盖的是生成结束后的整个上下文（含本轮输出），
+        // 先扣掉本轮输出再做 cache 分摊，避免输出被计两次。
         let total_real = crate::token::input_tokens_excluding_output(
             self.context_input_tokens,
             self.input_tokens,
@@ -1535,39 +1539,39 @@ impl StreamContext {
         self.cache_usage.split_against_total(total_real)
     }
 
-    /// 解析 Anthropic 口径的 `(uncached_input, cache_write, cache_read)`。
-    ///
-    /// 精确 `metadataEvent.tokenUsage` 优先；只有上游未提供该事件时，才按
-    /// contextUsage/请求估算总量与本地 CacheMeter 比例回退。
-    pub fn resolved_usage(&self) -> (i32, i32, i32) {
-        if let Some(frozen) = self.frozen_input_usage {
-            return frozen;
+    /// 原始口径的完整 usage（未应用 Key 计费策略）：截断续写后输入锁定为首轮，
+    /// 输出为各次尝试之和。
+    pub fn raw_usage(&self) -> TokenUsage {
+        let (input, creation, read) = self
+            .frozen_raw_input
+            .unwrap_or_else(|| self.attempt_raw_input());
+        TokenUsage {
+            uncached_input_tokens: input,
+            output_tokens: self.resolved_output_tokens(),
+            cache_write_input_tokens: creation,
+            cache_read_input_tokens: read,
         }
-        if let Some(usage) = self.provider_token_usage {
-            let usage = self.billing_policy.apply_to_provider_usage(usage);
-            return (
-                usage.uncached_input_tokens,
-                usage.cache_write_input_tokens,
-                usage.cache_read_input_tokens,
-            );
-        }
+    }
 
-        // contextUsage 覆盖的是生成结束后的整个上下文（含本轮输出），
-        // 先扣掉本轮输出再做 cache 分摊，避免输出被计两次。
-        let total_real = crate::token::input_tokens_excluding_output(
-            self.context_input_tokens,
-            self.input_tokens,
-            self.output_tokens,
-        );
-        let usage = self.billing_policy.apply_to_simulated_usage(
-            &self.cache_usage,
-            total_real,
-            self.output_tokens,
-        );
+    /// 按本 Key 的计费策略结算当前用量。响应、用量统计与 trace 都取这一份。
+    pub fn billing(&self) -> BillingOutcome {
+        super::billing::settle(
+            &self.billing_policy,
+            &self.billing_prices,
+            &self.model,
+            self.raw_usage(),
+            self.credits,
+        )
+    }
+
+    /// 计费后口径的 `(input, cache_creation, cache_read)`，即发给下游的值。
+    #[cfg(test)]
+    pub fn resolved_usage(&self) -> (i32, i32, i32) {
+        let billed = self.billing().billed;
         (
-            usage.uncached_input_tokens,
-            usage.cache_write_input_tokens,
-            usage.cache_read_input_tokens,
+            billed.uncached_input_tokens,
+            billed.cache_write_input_tokens,
+            billed.cache_read_input_tokens,
         )
     }
 
@@ -1576,41 +1580,12 @@ impl StreamContext {
         self.carried_output_tokens + self.attempt_output_tokens()
     }
 
-    fn modified_metering(&self) -> Option<MeteringEvent> {
+    /// 下游看到的 meteringEvent：单位沿用上游，用量换成计费后 credit。
+    /// 没收到过 meteringEvent 时为 None（不附加 credit_* 字段）。
+    fn billed_metering(&self, outcome: &BillingOutcome) -> Option<MeteringEvent> {
         let mut metering = self.metering.clone()?;
-        let (input, creation, read) = self.resolved_usage();
-        let raw = {
-            let (raw_input, raw_creation, raw_read) = self.raw_resolved_usage();
-            TokenUsage {
-                uncached_input_tokens: raw_input,
-                output_tokens: self.resolved_output_tokens(),
-                cache_write_input_tokens: raw_creation,
-                cache_read_input_tokens: raw_read,
-            }
-        };
-        let modified = TokenUsage {
-            uncached_input_tokens: input,
-            output_tokens: self.resolved_output_tokens(),
-            cache_write_input_tokens: creation,
-            cache_read_input_tokens: read,
-        };
-        let cost = super::cache_metering::configured_token_cost_for_model(
-            &self.model,
-            modified,
-            &self.billing_prices,
-        );
-        if let Some(cost) = cost {
-            metering.usage = cost;
-        } else {
-            metering.usage = self.billing_policy.modify_credits(metering.usage, raw, modified);
-        }
+        metering.usage = outcome.billed_credits;
         Some(metering)
-    }
-
-    pub(crate) fn resolved_credits(&self) -> f64 {
-        self.modified_metering()
-            .map(|metering| metering.usage)
-            .unwrap_or(self.credits)
     }
 
     fn attempt_output_tokens(&self) -> i32 {
@@ -1657,7 +1632,7 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
-            billing_policy: super::cache_metering::BillingPolicy::default(),
+            billing_policy: super::billing::BillingPolicy::default(),
             billing_prices: std::sync::Arc::new(std::collections::HashMap::new()),
             credits: 0.0,
             metering: None,
@@ -1671,13 +1646,23 @@ impl StreamContext {
             last_emitted_char: None,
             pending_retry_separator: false,
             carried_output_tokens: 0,
-            frozen_input_usage: None,
-            carried_metering_usage: 0.0,
+            frozen_raw_input: None,
         }
     }
 
     /// 生成 message_start 事件
+    ///
+    /// 此时只有请求估算与本地缓存模拟，用量按同一计费策略换算后发出；
+    /// 上游真值到达后由 message_delta 给出最终值。
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let estimate = self.billing_policy.apply(self.cache_usage.simulated_usage(
+            crate::token::input_tokens_excluding_output(
+                self.context_input_tokens,
+                self.input_tokens,
+                0,
+            ),
+            0,
+        ));
         json!({
             "type": "message_start",
             "message": {
@@ -1689,10 +1674,10 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": estimate.uncached_input_tokens,
                     "output_tokens": 1,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": estimate.cache_write_input_tokens,
+                    "cache_read_input_tokens": estimate.cache_read_input_tokens
                 }
             }
         })
@@ -1768,12 +1753,9 @@ impl StreamContext {
                     unit_plural = %metering.unit_plural,
                     "metering credits +{:.6}", metering.usage
                 );
-                // 保留最近一次完整 payload，用于在 message_delta 里透传 credit_*
-                // 字段；如果上游真的多次下发，则以最后一次为准（与 kiro-rs 一致）。
-                // 截断重试时叠加之前各次尝试的 credit。
-                let mut metering = metering.clone();
-                metering.usage += self.carried_metering_usage;
-                self.metering = Some(metering);
+                // 保留最近一次完整 payload 的单位字段，用于 message_delta 的 credit_*；
+                // 用量以 `credits` 的累加为准。
+                self.metering = Some(metering.clone());
                 Vec::new()
             }
             Event::Error {
@@ -2737,15 +2719,10 @@ impl StreamContext {
     /// 「首次输入 + 各次输出之和」累计。调用前须先 `flush_buffered_output`。
     pub fn prepare_for_retry(&mut self) {
         let attempt_output = self.attempt_output_tokens();
-        if self.frozen_input_usage.is_none() {
-            self.frozen_input_usage = Some(self.resolved_usage());
+        if self.frozen_raw_input.is_none() {
+            self.frozen_raw_input = Some(self.attempt_raw_input());
         }
         self.carried_output_tokens += attempt_output;
-        self.carried_metering_usage = self
-            .metering
-            .as_ref()
-            .map(|m| m.usage)
-            .unwrap_or(self.carried_metering_usage);
         self.provider_token_usage = None;
         self.output_tokens = 0;
 
@@ -2835,19 +2812,21 @@ impl StreamContext {
             events.extend(self.create_empty_text_block_events());
         }
 
-        // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
-        let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
-        let final_output_tokens = self.resolved_output_tokens();
+        // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退，再按计费策略换算。
+        let outcome = self.billing();
+        let billed = outcome.billed;
 
         // 生成最终事件（message_delta + message_stop）
-        let creation_ttl = self.cache_usage.split_creation_ttl(cache_creation);
-        let modified_metering = self.modified_metering();
+        let creation_ttl = self
+            .cache_usage
+            .split_creation_ttl(billed.cache_write_input_tokens);
+        let metering = self.billed_metering(&outcome);
         events.extend(self.state_manager.generate_final_events(
-            final_input_tokens,
-            final_output_tokens,
-            cache_creation,
-            cache_read,
-            modified_metering.as_ref(),
+            billed.uncached_input_tokens,
+            billed.output_tokens,
+            billed.cache_write_input_tokens,
+            billed.cache_read_input_tokens,
+            metering.as_ref(),
             creation_ttl,
         ));
 
@@ -3206,6 +3185,10 @@ mod tests {
         // 输入侧以首次请求为准，输出累加两次上游调用。
         assert_eq!(delta.data["usage"]["output_tokens"], json!(140));
         assert_eq!(ctx.resolved_usage(), (10, 0, 0));
+        // 原始口径同样锁定首轮输入（之前原始侧取的是最后一次续写的 30）
+        let raw = ctx.raw_usage();
+        assert_eq!(raw.uncached_input_tokens, 10);
+        assert_eq!(raw.output_tokens, 140);
     }
 
     #[test]
@@ -5747,8 +5730,10 @@ mod tests {
         );
     }
 
+    /// 上游通常只下发一次 meteringEvent；多次下发时 credit 累加（与用量统计同一口径），
+    /// 单位取最后一次。
     #[test]
-    fn test_stream_context_keeps_latest_metering_in_message_delta() {
+    fn test_stream_context_sums_metering_events_in_message_delta() {
         use crate::kiro::model::events::MeteringEvent;
 
         let mut ctx = StreamContext::new_with_thinking(
@@ -5766,7 +5751,7 @@ mod tests {
             unit_plural: "credits".into(),
             usage: 0.10,
         }));
-        // 第二次下发（应覆盖）
+        // 第二次下发（累加）
         ctx.process_kiro_event(&Event::Metering(MeteringEvent {
             unit: "credit".into(),
             unit_plural: "credits".into(),
@@ -5779,7 +5764,8 @@ mod tests {
             .find(|e| e.event == "message_delta")
             .expect("must have message_delta");
         let usage = &delta.data["usage"];
-        assert_eq!(usage["credit_usage"], json!(0.42));
+        let credit = usage["credit_usage"].as_f64().unwrap();
+        assert!((credit - 0.52).abs() < 1e-9, "{credit}");
         assert_eq!(usage["credit_unit"], json!("credit"));
         assert_eq!(usage["credit_unit_plural"], json!("credits"));
         // 累计 credit 仍然是两次之和

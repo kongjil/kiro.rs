@@ -1000,6 +1000,80 @@ pub struct UpdateAdminKeyRequest {
 
 // ============ 客户端 API Key 分发 ============
 
+/// 客户端 Key 的下游计费策略（管理接口形态）。
+///
+/// - `raw`：原样透传；
+/// - `redistribute`：输入总量不变，按 `targetHitRate` 或 `cacheScale`（二选一，都不填
+///   则保持原始比例）重新分配读取 / 创建 / input；
+/// - `inflate`：输入总量乘以 `inputScale`、output 乘以 `outputScale`，再按同样规则分配；
+/// - `legacy_multipliers`：旧版分类倍率，只读回显，不能新设。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingPolicyDto {
+    pub mode: crate::anthropic::billing::BillingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_hit_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_share: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_scale: Option<f64>,
+    /// 旧版分类倍率（input / creation / read），仅回显
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_multipliers: Option<[f64; 3]>,
+}
+
+impl BillingPolicyDto {
+    pub fn from_policy(policy: &crate::anthropic::billing::BillingPolicy) -> Self {
+        use crate::anthropic::billing::{BillingMode, Composition};
+        let (target_hit_rate, cache_scale) = match policy.composition {
+            Composition::Keep => (None, None),
+            Composition::TargetHitRate(rate) => (Some(rate), None),
+            Composition::ScaleCache(ratio) => (None, Some(ratio)),
+        };
+        let inflate = policy.mode == BillingMode::Inflate;
+        Self {
+            mode: policy.mode,
+            target_hit_rate,
+            cache_scale,
+            creation_share: policy.creation_share,
+            input_scale: inflate.then_some(policy.input_scale),
+            output_scale: inflate.then_some(policy.output_scale),
+            legacy_multipliers: (policy.mode == BillingMode::LegacyMultipliers).then_some([
+                policy.legacy.input,
+                policy.legacy.creation,
+                policy.legacy.read,
+            ]),
+        }
+    }
+
+    /// 转成内部策略并校验。
+    pub fn to_policy(&self) -> Result<crate::anthropic::billing::BillingPolicy, String> {
+        use crate::anthropic::billing::{BillingPolicy, Composition};
+        let composition = match (self.target_hit_rate, self.cache_scale) {
+            (Some(_), Some(_)) => {
+                return Err("目标命中率与缓存缩放系数只能二选一".to_string());
+            }
+            (Some(rate), None) => Composition::TargetHitRate(rate),
+            (None, Some(ratio)) => Composition::ScaleCache(ratio),
+            (None, None) => Composition::Keep,
+        };
+        let policy = BillingPolicy {
+            mode: self.mode,
+            composition,
+            creation_share: self.creation_share,
+            input_scale: self.input_scale.unwrap_or(1.0),
+            output_scale: self.output_scale.unwrap_or(1.0),
+            ..Default::default()
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+}
+
 /// 客户端 Key 列表项（脱敏展示）
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1027,16 +1101,8 @@ pub struct ClientKeyItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     pub groups: Vec<String>,
-    /// 有效缓存计费系数（0~1，1 = 满缓存）
-    pub cache_ratio: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input_multiplier: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_creation_multiplier: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_read_multiplier: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_effective_hit_rate: Option<f64>,
+    /// 下游计费策略
+    pub billing: BillingPolicyDto,
     pub sell_multiplier: f64,
     /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
     #[serde(default)]
@@ -1065,17 +1131,9 @@ pub struct CreateClientKeyRequest {
     /// 积分使用上限（可选；None / 省略表示不限制）
     #[serde(default)]
     pub max_credits: Option<f64>,
-    /// 缓存计费系数（可选，0~1；省略表示满缓存）
+    /// 下游计费策略（可选；省略表示原始模式）
     #[serde(default)]
-    pub cache_ratio: Option<f64>,
-    #[serde(default)]
-    pub input_multiplier: Option<f64>,
-    #[serde(default)]
-    pub cache_creation_multiplier: Option<f64>,
-    #[serde(default)]
-    pub cache_read_multiplier: Option<f64>,
-    #[serde(default)]
-    pub target_effective_hit_rate: Option<f64>,
+    pub billing: Option<BillingPolicyDto>,
     #[serde(default)]
     pub sell_multiplier: Option<f64>,
 }
@@ -1100,17 +1158,9 @@ pub struct UpdateClientKeyRequest {
     pub group: Option<String>,
     #[serde(default)]
     pub groups: Option<Vec<String>>,
-    /// 缓存计费系数（可选，0~1；省略表示不修改）
+    /// 下游计费策略（省略表示不修改；提供时整体替换）
     #[serde(default)]
-    pub cache_ratio: Option<f64>,
-    #[serde(default)]
-    pub input_multiplier: Option<Option<f64>>,
-    #[serde(default)]
-    pub cache_creation_multiplier: Option<Option<f64>>,
-    #[serde(default)]
-    pub cache_read_multiplier: Option<Option<f64>>,
-    #[serde(default)]
-    pub target_effective_hit_rate: Option<Option<f64>>,
+    pub billing: Option<BillingPolicyDto>,
     #[serde(default)]
     pub sell_multiplier: Option<Option<f64>>,
 }
@@ -1455,4 +1505,71 @@ pub struct CustomModelItem {
 #[serde(rename_all = "camelCase")]
 pub struct SetCustomModelsRequest {
     pub models: Vec<CustomModelItem>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anthropic::billing::{BillingMode, BillingPolicy, Composition};
+
+    fn dto(value: serde_json::Value) -> BillingPolicyDto {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn billing_dto_round_trips_inflate_policy() {
+        let policy = dto(serde_json::json!({
+            "mode": "inflate", "inputScale": 1.2, "targetHitRate": 0.8, "creationShare": 0.3
+        }))
+        .to_policy()
+        .unwrap();
+        assert_eq!(policy.mode, BillingMode::Inflate);
+        assert_eq!(policy.composition, Composition::TargetHitRate(0.8));
+        assert_eq!(policy.input_scale, 1.2);
+        assert_eq!(policy.output_scale, 1.0);
+
+        let back = serde_json::to_value(BillingPolicyDto::from_policy(&policy)).unwrap();
+        assert_eq!(back["mode"], "inflate");
+        assert_eq!(back["inputScale"], 1.2);
+        assert_eq!(back["targetHitRate"], 0.8);
+        assert!(back.get("cacheScale").is_none());
+    }
+
+    #[test]
+    fn billing_dto_rejects_conflicting_or_invalid_values() {
+        // 目标命中率与缓存缩放系数二选一
+        assert!(
+            dto(serde_json::json!({"mode": "redistribute", "targetHitRate": 0.8, "cacheScale": 0.5}))
+                .to_policy()
+                .is_err()
+        );
+        // 加量倍率不能小于 1
+        assert!(
+            dto(serde_json::json!({"mode": "inflate", "inputScale": 0.8}))
+                .to_policy()
+                .is_err()
+        );
+        // 旧版分类倍率不能新设
+        assert!(
+            dto(serde_json::json!({"mode": "legacy_multipliers"}))
+                .to_policy()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_policy_is_echoed_read_only() {
+        let legacy = BillingPolicy {
+            mode: BillingMode::LegacyMultipliers,
+            legacy: crate::anthropic::billing::LegacyMultipliers {
+                input: 1.2,
+                creation: 1.0,
+                read: 2.0,
+            },
+            ..Default::default()
+        };
+        let value = serde_json::to_value(BillingPolicyDto::from_policy(&legacy)).unwrap();
+        assert_eq!(value["mode"], "legacy_multipliers");
+        assert_eq!(value["legacyMultipliers"], serde_json::json!([1.2, 1.0, 2.0]));
+    }
 }

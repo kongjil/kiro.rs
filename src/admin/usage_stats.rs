@@ -35,16 +35,16 @@ pub struct UsageRecord {
     pub credential_id: u64,
     /// 模型名（请求里声明的，可能含 -thinking 后缀）
     pub model: String,
+    /// 计费后口径（下游看到的值）
     pub input_tokens: u64,
     pub output_tokens: u64,
     #[serde(default)]
     pub cache_creation_tokens: u64,
     #[serde(default)]
     pub cache_read_tokens: u64,
-    /// 上游 meteringEvent.usage 上报的 credit 计费量（浮点）
     #[serde(default)]
     pub credits: f64,
-    /// 原始 usage（仅管理端统计；下游响应只使用上面的修改后字段）。
+    /// 原始口径（未应用 Key 计费策略，仅管理端统计）
     #[serde(default)]
     pub raw_input_tokens: u64,
     #[serde(default)]
@@ -54,15 +54,11 @@ pub struct UsageRecord {
     #[serde(default)]
     pub raw_cache_read_tokens: u64,
     #[serde(default)]
-    pub raw_total_tokens: u64,
-    #[serde(default)]
     pub raw_credits: f64,
-    #[serde(default)]
-    pub modified_total_tokens: u64,
-    #[serde(default)]
-    pub modified_credits: f64,
+    /// 账号成本：原始 credit × 凭据成本倍率
     #[serde(default)]
     pub account_cost: f64,
+    /// 卖出消费：计费后 credit × Key 卖出倍率
     #[serde(default)]
     pub sell_consumption: f64,
     /// 端到端耗时（毫秒）
@@ -70,6 +66,83 @@ pub struct UsageRecord {
     pub duration_ms: u64,
     /// "success" 或 "error"
     pub status: String,
+}
+
+impl UsageRecord {
+    fn billed_totals(&self) -> UsageTotals {
+        UsageTotals {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            credits: self.credits,
+        }
+    }
+
+    /// 原始口径。加入原始字段之前写入的老记录没有这些值，回填为计费后口径——
+    /// 那时还没有计费策略，两者相同。
+    fn raw_totals(&self) -> UsageTotals {
+        let raw = UsageTotals {
+            input_tokens: self.raw_input_tokens,
+            output_tokens: self.raw_output_tokens,
+            cache_creation_tokens: self.raw_cache_creation_tokens,
+            cache_read_tokens: self.raw_cache_read_tokens,
+            credits: self.raw_credits,
+        };
+        if raw.is_empty() {
+            self.billed_totals()
+        } else {
+            raw
+        }
+    }
+}
+
+/// 统计口径
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StatsView {
+    /// 未应用 Key 计费策略的原始值
+    Raw,
+    /// 下游看到的计费后值
+    #[default]
+    Billed,
+}
+
+impl StatsView {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "raw" => Some(Self::Raw),
+            "billed" => Some(Self::Billed),
+            _ => None,
+        }
+    }
+}
+
+/// 一套口径的累计用量
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct UsageTotals {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub credits: f64,
+}
+
+impl UsageTotals {
+    fn add(&mut self, other: &UsageTotals) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.credits += other.credits;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_creation_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.credits == 0.0
+    }
 }
 
 /// 按天 rotate 的 JSONL writer
@@ -190,44 +263,21 @@ fn parse_usage_log_filename(name: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(body, "%Y-%m-%d").ok()
 }
 
-/// 单个时间桶的统计
-#[derive(Debug, Default, Clone, Copy, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// 单个时间桶的统计：原始与计费后两套口径并存，查询时按 [`StatsView`] 取一套。
+#[derive(Debug, Default, Clone, Copy)]
 pub struct BucketStats {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub cache_read_tokens: u64,
     pub calls: u64,
     pub errors: u64,
-    pub credits: f64,
-    pub raw_input_tokens: u64,
-    pub raw_output_tokens: u64,
-    pub raw_cache_creation_tokens: u64,
-    pub raw_cache_read_tokens: u64,
-    pub raw_total_tokens: u64,
-    pub raw_credits: f64,
-    pub modified_total_tokens: u64,
-    pub modified_credits: f64,
+    pub billed: UsageTotals,
+    pub raw: UsageTotals,
     pub account_cost: f64,
     pub sell_consumption: f64,
 }
 
 impl BucketStats {
     fn add(&mut self, rec: &UsageRecord) {
-        self.input_tokens += rec.input_tokens;
-        self.output_tokens += rec.output_tokens;
-        self.cache_creation_tokens += rec.cache_creation_tokens;
-        self.cache_read_tokens += rec.cache_read_tokens;
-        self.credits += rec.credits;
-        self.raw_input_tokens += rec.raw_input_tokens;
-        self.raw_output_tokens += rec.raw_output_tokens;
-        self.raw_cache_creation_tokens += rec.raw_cache_creation_tokens;
-        self.raw_cache_read_tokens += rec.raw_cache_read_tokens;
-        self.raw_total_tokens += rec.raw_total_tokens;
-        self.raw_credits += rec.raw_credits;
-        self.modified_total_tokens += rec.modified_total_tokens;
-        self.modified_credits += rec.modified_credits;
+        self.billed.add(&rec.billed_totals());
+        self.raw.add(&rec.raw_totals());
         self.account_cost += rec.account_cost;
         self.sell_consumption += rec.sell_consumption;
         self.calls += 1;
@@ -238,23 +288,19 @@ impl BucketStats {
 
     /// 把另一个 stats 累加到自己上（用于 group 过滤后重新汇总）
     fn add_stats(&mut self, other: &BucketStats) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.cache_creation_tokens += other.cache_creation_tokens;
-        self.cache_read_tokens += other.cache_read_tokens;
-        self.credits += other.credits;
-        self.raw_input_tokens += other.raw_input_tokens;
-        self.raw_output_tokens += other.raw_output_tokens;
-        self.raw_cache_creation_tokens += other.raw_cache_creation_tokens;
-        self.raw_cache_read_tokens += other.raw_cache_read_tokens;
-        self.raw_total_tokens += other.raw_total_tokens;
-        self.raw_credits += other.raw_credits;
-        self.modified_total_tokens += other.modified_total_tokens;
-        self.modified_credits += other.modified_credits;
+        self.billed.add(&other.billed);
+        self.raw.add(&other.raw);
         self.account_cost += other.account_cost;
         self.sell_consumption += other.sell_consumption;
         self.calls += other.calls;
         self.errors += other.errors;
+    }
+
+    pub fn totals(&self, view: StatsView) -> &UsageTotals {
+        match view {
+            StatsView::Raw => &self.raw,
+            StatsView::Billed => &self.billed,
+        }
     }
 }
 
@@ -341,7 +387,7 @@ impl StatsQueryWindow {
     }
 }
 
-/// 时序点（导出给前端）
+/// 时序点（导出给前端）。token / credit 为查询所选口径的值。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeSeriesPoint {
@@ -354,14 +400,6 @@ pub struct TimeSeriesPoint {
     pub calls: u64,
     pub errors: u64,
     pub credits: f64,
-    pub raw_input_tokens: u64,
-    pub raw_output_tokens: u64,
-    pub raw_cache_creation_tokens: u64,
-    pub raw_cache_read_tokens: u64,
-    pub raw_total_tokens: u64,
-    pub raw_credits: f64,
-    pub modified_total_tokens: u64,
-    pub modified_credits: f64,
     pub account_cost: f64,
     pub sell_consumption: f64,
 }
@@ -374,6 +412,9 @@ pub struct ModelDistribution {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub credits: f64,
 }
 
 /// 上游凭据分布
@@ -384,15 +425,10 @@ pub struct CredentialDistribution {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
     pub errors: u64,
-    pub raw_input_tokens: u64,
-    pub raw_output_tokens: u64,
-    pub raw_cache_creation_tokens: u64,
-    pub raw_cache_read_tokens: u64,
-    pub raw_total_tokens: u64,
-    pub raw_credits: f64,
-    pub modified_total_tokens: u64,
-    pub modified_credits: f64,
+    pub credits: f64,
     pub account_cost: f64,
     pub sell_consumption: f64,
 }
@@ -409,14 +445,6 @@ pub struct KeyDistribution {
     pub cache_read_tokens: u64,
     pub errors: u64,
     pub credits: f64,
-    pub raw_input_tokens: u64,
-    pub raw_output_tokens: u64,
-    pub raw_cache_creation_tokens: u64,
-    pub raw_cache_read_tokens: u64,
-    pub raw_total_tokens: u64,
-    pub raw_credits: f64,
-    pub modified_total_tokens: u64,
-    pub modified_credits: f64,
     pub account_cost: f64,
     pub sell_consumption: f64,
 }
@@ -531,6 +559,7 @@ impl UsageAggregator {
         window: StatsQueryWindow,
         key_id: Option<u64>,
         cred_filter: Option<&std::collections::HashSet<u64>>,
+        view: StatsView,
     ) -> Vec<TimeSeriesPoint> {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
@@ -555,23 +584,16 @@ impl UsageAggregator {
                         })
                         .unwrap_or_default(),
                 };
+                let totals = stats.totals(view);
                 TimeSeriesPoint {
                     ts: ts_to_rfc3339(b.ts),
-                    input_tokens: stats.input_tokens,
-                    output_tokens: stats.output_tokens,
-                    cache_creation_tokens: stats.cache_creation_tokens,
-                    cache_read_tokens: stats.cache_read_tokens,
+                    input_tokens: totals.input_tokens,
+                    output_tokens: totals.output_tokens,
+                    cache_creation_tokens: totals.cache_creation_tokens,
+                    cache_read_tokens: totals.cache_read_tokens,
                     calls: stats.calls,
                     errors: stats.errors,
-                    credits: stats.credits,
-                    raw_input_tokens: stats.raw_input_tokens,
-                    raw_output_tokens: stats.raw_output_tokens,
-                    raw_cache_creation_tokens: stats.raw_cache_creation_tokens,
-                    raw_cache_read_tokens: stats.raw_cache_read_tokens,
-                    raw_total_tokens: stats.raw_total_tokens,
-                    raw_credits: stats.raw_credits,
-                    modified_total_tokens: stats.modified_total_tokens,
-                    modified_credits: stats.modified_credits,
+                    credits: totals.credits,
                     account_cost: stats.account_cost,
                     sell_consumption: stats.sell_consumption,
                 }
@@ -586,6 +608,7 @@ impl UsageAggregator {
         &self,
         window: StatsQueryWindow,
         key_id: Option<u64>,
+        view: StatsView,
     ) -> Vec<ModelDistribution> {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
@@ -595,19 +618,22 @@ impl UsageAggregator {
                 continue;
             };
             for (model, stats) in group {
-                let entry = acc.entry(model.clone()).or_default();
-                entry.input_tokens += stats.input_tokens;
-                entry.output_tokens += stats.output_tokens;
-                entry.calls += stats.calls;
+                acc.entry(model.clone()).or_default().add_stats(stats);
             }
         }
         let mut out: Vec<ModelDistribution> = acc
             .into_iter()
-            .map(|(model, stats)| ModelDistribution {
-                model,
-                calls: stats.calls,
-                input_tokens: stats.input_tokens,
-                output_tokens: stats.output_tokens,
+            .map(|(model, stats)| {
+                let totals = stats.totals(view);
+                ModelDistribution {
+                    model,
+                    calls: stats.calls,
+                    input_tokens: totals.input_tokens,
+                    output_tokens: totals.output_tokens,
+                    cache_creation_tokens: totals.cache_creation_tokens,
+                    cache_read_tokens: totals.cache_read_tokens,
+                    credits: totals.credits,
+                }
             })
             .collect();
         out.sort_by(|a, b| b.calls.cmp(&a.calls));
@@ -620,6 +646,7 @@ impl UsageAggregator {
         window: StatsQueryWindow,
         key_id: Option<u64>,
         cred_filter: Option<&std::collections::HashSet<u64>>,
+        view: StatsView,
     ) -> Vec<CredentialDistribution> {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
@@ -640,22 +667,20 @@ impl UsageAggregator {
         }
         let mut out: Vec<CredentialDistribution> = acc
             .into_iter()
-            .map(|(id, stats)| CredentialDistribution {
-                credential_id: id,
-                calls: stats.calls,
-                input_tokens: stats.input_tokens,
-                output_tokens: stats.output_tokens,
-                errors: stats.errors,
-                raw_input_tokens: stats.raw_input_tokens,
-                raw_output_tokens: stats.raw_output_tokens,
-                raw_cache_creation_tokens: stats.raw_cache_creation_tokens,
-                raw_cache_read_tokens: stats.raw_cache_read_tokens,
-                raw_total_tokens: stats.raw_total_tokens,
-                raw_credits: stats.raw_credits,
-                modified_total_tokens: stats.modified_total_tokens,
-                modified_credits: stats.modified_credits,
-                account_cost: stats.account_cost,
-                sell_consumption: stats.sell_consumption,
+            .map(|(id, stats)| {
+                let totals = stats.totals(view);
+                CredentialDistribution {
+                    credential_id: id,
+                    calls: stats.calls,
+                    input_tokens: totals.input_tokens,
+                    output_tokens: totals.output_tokens,
+                    cache_creation_tokens: totals.cache_creation_tokens,
+                    cache_read_tokens: totals.cache_read_tokens,
+                    errors: stats.errors,
+                    credits: totals.credits,
+                    account_cost: stats.account_cost,
+                    sell_consumption: stats.sell_consumption,
+                }
             })
             .collect();
         out.sort_by(|a, b| b.calls.cmp(&a.calls));
@@ -670,6 +695,7 @@ impl UsageAggregator {
         &self,
         window: StatsQueryWindow,
         cred_filter: Option<&std::collections::HashSet<u64>>,
+        view: StatsView,
     ) -> Vec<KeyDistribution> {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
@@ -696,25 +722,20 @@ impl UsageAggregator {
         let mut out: Vec<KeyDistribution> = acc
             .into_iter()
             .filter(|(_, stats)| stats.calls > 0)
-            .map(|(key_id, stats)| KeyDistribution {
-                key_id,
-                calls: stats.calls,
-                input_tokens: stats.input_tokens,
-                output_tokens: stats.output_tokens,
-                cache_creation_tokens: stats.cache_creation_tokens,
-                cache_read_tokens: stats.cache_read_tokens,
-                errors: stats.errors,
-                credits: stats.credits,
-                raw_input_tokens: stats.raw_input_tokens,
-                raw_output_tokens: stats.raw_output_tokens,
-                raw_cache_creation_tokens: stats.raw_cache_creation_tokens,
-                raw_cache_read_tokens: stats.raw_cache_read_tokens,
-                raw_total_tokens: stats.raw_total_tokens,
-                raw_credits: stats.raw_credits,
-                modified_total_tokens: stats.modified_total_tokens,
-                modified_credits: stats.modified_credits,
-                account_cost: stats.account_cost,
-                sell_consumption: stats.sell_consumption,
+            .map(|(key_id, stats)| {
+                let totals = stats.totals(view);
+                KeyDistribution {
+                    key_id,
+                    calls: stats.calls,
+                    input_tokens: totals.input_tokens,
+                    output_tokens: totals.output_tokens,
+                    cache_creation_tokens: totals.cache_creation_tokens,
+                    cache_read_tokens: totals.cache_read_tokens,
+                    errors: stats.errors,
+                    credits: totals.credits,
+                    account_cost: stats.account_cost,
+                    sell_consumption: stats.sell_consumption,
+                }
             })
             .collect();
         out.sort_by(|a, b| b.calls.cmp(&a.calls));
@@ -722,7 +743,7 @@ impl UsageAggregator {
     }
 
     /// 概览（今日 + 最近 7 天）
-    pub fn overview(&self) -> OverviewStats {
+    pub fn overview(&self, view: StatsView) -> OverviewStats {
         let inner = self.inner.read();
         let today_start = Local
             .with_ymd_and_hms(
@@ -739,32 +760,27 @@ impl UsageAggregator {
 
         let mut today = BucketStats::default();
         for b in inner.hour_buckets.iter().filter(|b| b.ts >= today_start) {
-            today.input_tokens += b.overall.input_tokens;
-            today.output_tokens += b.overall.output_tokens;
-            today.calls += b.overall.calls;
-            today.errors += b.overall.errors;
-            today.credits += b.overall.credits;
+            today.add_stats(&b.overall);
         }
 
         let week_cutoff = Utc::now().timestamp() - 7 * 24 * 3600;
         let mut week = BucketStats::default();
         for b in inner.hour_buckets.iter().filter(|b| b.ts >= week_cutoff) {
-            week.input_tokens += b.overall.input_tokens;
-            week.output_tokens += b.overall.output_tokens;
-            week.calls += b.overall.calls;
-            week.credits += b.overall.credits;
+            week.add_stats(&b.overall);
         }
 
+        let today_totals = today.totals(view);
+        let week_totals = week.totals(view);
         OverviewStats {
             today_calls: today.calls,
-            today_input_tokens: today.input_tokens,
-            today_output_tokens: today.output_tokens,
+            today_input_tokens: today_totals.input_tokens,
+            today_output_tokens: today_totals.output_tokens,
             today_errors: today.errors,
-            today_credits: today.credits,
+            today_credits: today_totals.credits,
             week_calls: week.calls,
-            week_input_tokens: week.input_tokens,
-            week_output_tokens: week.output_tokens,
-            week_credits: week.credits,
+            week_input_tokens: week_totals.input_tokens,
+            week_output_tokens: week_totals.output_tokens,
+            week_credits: week_totals.credits,
         }
     }
 }
@@ -909,28 +925,109 @@ mod tests {
         agg.ingest(&rec);
         agg.ingest(&rec);
 
-        let ov = agg.overview();
+        let ov = agg.overview(StatsView::Billed);
         assert_eq!(ov.today_calls, 2);
         assert_eq!(ov.today_input_tokens, 2000);
 
         let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
-        let series = agg.query_timeseries(window, None, None);
+        let series = agg.query_timeseries(window, None, None, StatsView::Billed);
         assert!(!series.is_empty());
 
-        let by_model = agg.query_by_model(window, None);
+        let by_model = agg.query_by_model(window, None, StatsView::Billed);
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].model, "claude-opus-4-7");
         assert_eq!(by_model[0].calls, 2);
 
-        let by_cred = agg.query_by_credential(window, None, None);
+        let by_cred = agg.query_by_credential(window, None, None, StatsView::Billed);
         assert_eq!(by_cred.len(), 1);
         assert_eq!(by_cred[0].credential_id, 5);
 
-        let by_key = agg.query_by_key(window, None);
+        let by_key = agg.query_by_key(window, None, StatsView::Billed);
         assert_eq!(by_key.len(), 1);
         assert_eq!(by_key[0].key_id, 1);
         assert_eq!(by_key[0].calls, 2);
         assert_eq!(by_key[0].input_tokens, 2000);
+    }
+
+    /// 原始与计费后两套口径分开累计，按 view 取值；calls / errors / 成本与口径无关。
+    #[test]
+    fn views_select_raw_or_billed_totals() {
+        let agg = UsageAggregator::new();
+        let rec = UsageRecord {
+            ts: Utc::now().to_rfc3339(),
+            key_id: 1,
+            credential_id: 5,
+            model: "m".to_string(),
+            // 计费后：加量 1.2 倍并改成 80% 命中
+            input_tokens: 800,
+            output_tokens: 500,
+            cache_creation_tokens: 1600,
+            cache_read_tokens: 9600,
+            credits: 0.36,
+            raw_input_tokens: 1000,
+            raw_output_tokens: 500,
+            raw_cache_creation_tokens: 2000,
+            raw_cache_read_tokens: 7000,
+            raw_credits: 0.30,
+            account_cost: 0.30,
+            sell_consumption: 0.72,
+            status: "success".to_string(),
+            ..Default::default()
+        };
+        agg.ingest(&rec);
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+
+        let raw = &agg.query_timeseries(window, None, None, StatsView::Raw)[0];
+        assert_eq!(
+            (raw.input_tokens, raw.cache_creation_tokens, raw.cache_read_tokens),
+            (1000, 2000, 7000)
+        );
+        assert!((raw.credits - 0.30).abs() < 1e-12);
+
+        let billed = &agg.query_timeseries(window, None, None, StatsView::Billed)[0];
+        assert_eq!(
+            (billed.input_tokens, billed.cache_creation_tokens, billed.cache_read_tokens),
+            (800, 1600, 9600)
+        );
+        assert!((billed.credits - 0.36).abs() < 1e-12);
+
+        // 与口径无关的字段两边一致
+        assert_eq!(raw.calls, billed.calls);
+        assert!((raw.sell_consumption - 0.72).abs() < 1e-12);
+        assert!((billed.account_cost - 0.30).abs() < 1e-12);
+
+        let by_key = agg.query_by_key(window, None, StatsView::Raw);
+        assert_eq!(by_key[0].cache_read_tokens, 7000);
+        let by_model = agg.query_by_model(window, None, StatsView::Billed);
+        assert_eq!(by_model[0].cache_read_tokens, 9600);
+        let by_cred = agg.query_by_credential(window, None, None, StatsView::Raw);
+        assert_eq!(by_cred[0].input_tokens, 1000);
+        assert_eq!(agg.overview(StatsView::Raw).today_input_tokens, 1000);
+        assert_eq!(agg.overview(StatsView::Billed).today_input_tokens, 800);
+    }
+
+    /// 加入原始字段之前写入的 JSONL 记录没有 raw*，原始口径回填为计费后的值。
+    #[test]
+    fn records_without_raw_fields_backfill_raw_view() {
+        let line = format!(
+            r#"{{"ts":"{}","keyId":1,"credentialId":5,"model":"m","inputTokens":120,"outputTokens":30,"cacheReadTokens":50,"credits":0.1,"status":"success"}}"#,
+            Utc::now().to_rfc3339()
+        );
+        let rec: UsageRecord = serde_json::from_str(&line).unwrap();
+        let agg = UsageAggregator::new();
+        agg.ingest(&rec);
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let raw = &agg.query_timeseries(window, None, None, StatsView::Raw)[0];
+        assert_eq!((raw.input_tokens, raw.cache_read_tokens), (120, 50));
+        assert!((raw.credits - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn stats_view_parses_query_values() {
+        assert_eq!(StatsView::parse("raw"), Some(StatsView::Raw));
+        assert_eq!(StatsView::parse("billed"), Some(StatsView::Billed));
+        assert_eq!(StatsView::parse("modified"), None);
+        assert_eq!(StatsView::default(), StatsView::Billed);
     }
 
     #[test]
@@ -956,7 +1053,7 @@ mod tests {
         agg.ingest(&mk(2, 6, 300));
 
         let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
-        let by_key = agg.query_by_key(window, None);
+        let by_key = agg.query_by_key(window, None, StatsView::Billed);
         assert_eq!(by_key.len(), 2);
         // key 2 调用更多 → 排在前面
         assert_eq!(by_key[0].key_id, 2);
@@ -966,7 +1063,7 @@ mod tests {
 
         // 分组白名单只放行凭据 5 → 仅 key 1 命中
         let allow: std::collections::HashSet<u64> = [5u64].into_iter().collect();
-        let filtered = agg.query_by_key(window, Some(&allow));
+        let filtered = agg.query_by_key(window, Some(&allow), StatsView::Billed);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].key_id, 1);
         assert_eq!(filtered[0].input_tokens, 100);
@@ -1008,15 +1105,15 @@ mod tests {
         agg.ingest(&rec_b);
 
         let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
-        let series = agg.query_timeseries(window, Some(1), None);
+        let series = agg.query_timeseries(window, Some(1), None, StatsView::Billed);
         assert_eq!(series.iter().map(|p| p.calls).sum::<u64>(), 1);
         assert_eq!(series.iter().map(|p| p.input_tokens).sum::<u64>(), 100);
 
-        let by_model = agg.query_by_model(window, Some(1));
+        let by_model = agg.query_by_model(window, Some(1), StatsView::Billed);
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].model, "m-a");
 
-        let by_cred = agg.query_by_credential(window, Some(1), None);
+        let by_cred = agg.query_by_credential(window, Some(1), None, StatsView::Billed);
         assert_eq!(by_cred.len(), 1);
         assert_eq!(by_cred[0].credential_id, 5);
     }
@@ -1097,11 +1194,11 @@ mod tests {
             granularity: StatsGranularity::Day,
         };
 
-        let hourly = agg.query_timeseries(hour_window, None, None);
+        let hourly = agg.query_timeseries(hour_window, None, None, StatsView::Billed);
         assert_eq!(hourly.iter().map(|p| p.calls).sum::<u64>(), 1);
         assert_eq!(hourly.iter().map(|p| p.input_tokens).sum::<u64>(), 300);
 
-        let daily = agg.query_timeseries(day_window, None, None);
+        let daily = agg.query_timeseries(day_window, None, None, StatsView::Billed);
         assert_eq!(daily.iter().map(|p| p.calls).sum::<u64>(), 1);
         assert_eq!(daily.iter().map(|p| p.output_tokens).sum::<u64>(), 40);
     }
@@ -1124,7 +1221,7 @@ mod tests {
             ..Default::default()
         };
         agg.ingest(&rec);
-        let ov = agg.overview();
+        let ov = agg.overview(StatsView::Billed);
         assert_eq!(ov.today_errors, 1);
     }
 }

@@ -1,6 +1,6 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { getByCredential, getByKey, getByModel, getOverview, getTimeSeries } from '@/api/stats'
-import type { StatsFilter, StatsTimeFilter } from '@/types/api'
+import type { StatsFilter, StatsTimeFilter, StatsView } from '@/types/api'
 
 /**
  * 统计接口共用配置
@@ -16,12 +16,17 @@ const COMMON = {
   refetchOnWindowFocus: false,
 } as const
 
-export function useOverview() {
+export function useOverview(view?: StatsView) {
   return useQuery({
-    queryKey: ['stats', 'overview'],
-    queryFn: getOverview,
+    queryKey: ['stats', 'overview', view ?? 'billed'],
+    queryFn: () => getOverview(view),
     ...COMMON,
   })
+}
+
+/** 筛选条件参与 query key：口径切换后各面板各自重新拉取 */
+function filterKey(filter?: StatsFilter) {
+  return [filter?.keyId ?? 'all', filter?.group ?? 'all', filter?.view ?? 'billed'] as const
 }
 
 function timeKey(time: StatsTimeFilter) {
@@ -35,7 +40,7 @@ function timeKey(time: StatsTimeFilter) {
 
 export function useTimeSeries(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
-    queryKey: ['stats', 'timeseries', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all'],
+    queryKey: ['stats', 'timeseries', ...timeKey(time), ...filterKey(filter)],
     queryFn: () => getTimeSeries(time, filter),
     ...COMMON,
   })
@@ -43,7 +48,7 @@ export function useTimeSeries(time: StatsTimeFilter, filter?: StatsFilter) {
 
 export function useByModel(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
-    queryKey: ['stats', 'by-model', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all'],
+    queryKey: ['stats', 'by-model', ...timeKey(time), ...filterKey(filter)],
     queryFn: () => getByModel(time, filter),
     ...COMMON,
   })
@@ -51,16 +56,16 @@ export function useByModel(time: StatsTimeFilter, filter?: StatsFilter) {
 
 export function useByCredential(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
-    queryKey: ['stats', 'by-credential', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all'],
+    queryKey: ['stats', 'by-credential', ...timeKey(time), ...filterKey(filter)],
     queryFn: () => getByCredential(time, filter),
     ...COMMON,
   })
 }
 
 export function useByKey(time: StatsTimeFilter, filter?: StatsFilter) {
-  // by-key 横向对比所有 Key，仅受时间窗与分组影响（不随 keyId 变化）
+  // by-key 横向对比所有 Key，仅受时间窗、分组与口径影响（不随 keyId 变化）
   return useQuery({
-    queryKey: ['stats', 'by-key', ...timeKey(time), filter?.group ?? 'all'],
+    queryKey: ['stats', 'by-key', ...timeKey(time), filter?.group ?? 'all', filter?.view ?? 'billed'],
     queryFn: () => getByKey(time, filter),
     ...COMMON,
   })

@@ -27,6 +27,7 @@ import {
 import { useTraces } from '@/hooks/use-traces'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
+import { useStatsView } from '@/hooks/use-stats-view'
 import { useUrlState } from '@/hooks/use-url-state'
 import {
   ConsoleTable,
@@ -34,6 +35,7 @@ import {
 } from '@/components/console/data-table'
 import { BulkBar } from '@/components/console/bulk-bar'
 import { PageHeader } from '@/components/console/page-header'
+import { StatsViewToggle } from '@/components/console/stats-view-toggle'
 import {
   TimeRangePicker,
   rangeToStartMs,
@@ -45,7 +47,7 @@ import {
   railTextClass,
   type RailTone,
 } from '@/components/console/rail'
-import type { TraceAttempt, TraceQuery, TraceRecord, UsageSource } from '@/types/api'
+import type { StatsView, TraceAttempt, TraceQuery, TraceRecord, UsageSource } from '@/types/api'
 
 /** 失败分类 → 中文标签 + Badge 颜色 */
 function outcomeStyle(outcome: string): {
@@ -416,18 +418,47 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
   )
 }
 
+/** 一条 trace 在指定口径下的用量 */
+interface TraceUsageView {
+  input: number
+  output: number
+  cacheCreation: number
+  cacheRead: number
+  credits: number
+  /** 请求原始口径但该记录没有原始数据（加列前的老记录），已回退为计费后 */
+  fallback: boolean
+}
+
+function traceUsage(rec: TraceRecord, view: StatsView): TraceUsageView {
+  if (view === 'raw' && rec.rawInputTokens != null) {
+    return {
+      input: rec.rawInputTokens ?? 0,
+      output: rec.rawOutputTokens ?? 0,
+      cacheCreation: rec.rawCacheCreationTokens ?? 0,
+      cacheRead: rec.rawCacheReadTokens ?? 0,
+      credits: rec.rawCredits ?? 0,
+      fallback: false,
+    }
+  }
+  return {
+    input: rec.inputTokens ?? 0,
+    output: rec.outputTokens ?? 0,
+    cacheCreation: rec.cacheCreationTokens ?? 0,
+    cacheRead: rec.cacheReadTokens ?? 0,
+    credits: rec.credits ?? 0,
+    fallback: view === 'raw',
+  }
+}
+
 /**
  * Token 用量单元格，两行：
  *   `{未缓存输入} / {输出}`
  *   `缓存↓ {缓存读取} ↑ {缓存写入}`
  * 数字为千位分隔完整值，hover 显示带命中率的分项明细。
  */
-function TokenCell({ rec }: { rec: TraceRecord }) {
-  const input = rec.inputTokens ?? 0
-  const output = rec.outputTokens ?? 0
-  const cacheCreation = rec.cacheCreationTokens ?? 0
-  const cacheRead = rec.cacheReadTokens ?? 0
-  const total = rec.totalTokens ?? input + output + cacheCreation + cacheRead
+function TokenCell({ rec, view }: { rec: TraceRecord; view: StatsView }) {
+  const { input, output, cacheCreation, cacheRead, fallback } = traceUsage(rec, view)
+  const total = input + output + cacheCreation + cacheRead
   // 全 0（早期失败、未走到上游）时不显示明细，仅占位
   if (total === 0) {
     return <span className="text-muted-foreground">—</span>
@@ -449,6 +480,7 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
     `缓存读取: ${formatTokenFull(cacheRead)}${hitRatio != null ? `（命中率 ${hitRatio}%）` : ''}`,
     `输出: ${formatTokenFull(output)}`,
     `总计: ${formatTokenFull(total)}`,
+    ...(fallback ? ['（老记录无原始数据，显示的是计费后值）'] : []),
   ].join('\n')
 
   // 与详情面板同色：缓存读取 emerald、缓存写入 amber；为 0 的分段淡化，两者皆 0 时整行淡化
@@ -544,14 +576,15 @@ function AttemptChain({ rec }: { rec: TraceRecord }) {
  * Token 与缓存构成面板：
  * 完整展示输入/输出/缓存命中/写入/上游计费等各项指标，保证无论是否产生 credits 都清晰可见。
  */
-function TokenAndCachePanel({ rec }: { rec: TraceRecord }) {
-  const freshInput = rec.inputTokens ?? 0
-  const cacheCreation = rec.cacheCreationTokens ?? 0
-  const cacheRead = rec.cacheReadTokens ?? 0
+function TokenAndCachePanel({ rec, view }: { rec: TraceRecord; view: StatsView }) {
+  const usage = traceUsage(rec, view)
+  const freshInput = usage.input
+  const cacheCreation = usage.cacheCreation
+  const cacheRead = usage.cacheRead
   const promptTotal = freshInput + cacheCreation + cacheRead
-  const output = rec.outputTokens ?? 0
-  const total = rec.totalTokens ?? promptTotal + output
-  const credit = rec.credits ?? 0
+  const output = usage.output
+  const total = promptTotal + output
+  const credit = usage.credits
 
   const hitRatio =
     promptTotal > 0 && cacheRead > 0
@@ -570,6 +603,9 @@ function TokenAndCachePanel({ rec }: { rec: TraceRecord }) {
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/40 pb-2">
         <div className="flex items-center gap-2">
           <span className="text-[13px] font-semibold tracking-tight">Token 与缓存构成</span>
+          <Badge variant="outline" className="text-[11px] h-5 text-muted-foreground">
+            {view === 'raw' ? (usage.fallback ? '原始（老记录无数据，显示计费后）' : '原始') : '计费后'}
+          </Badge>
           {cacheRead > 0 ? (
             <Badge variant="success" className="text-[11px] h-5 gap-1">
               <span>命中率 {hitRatio}%</span>
@@ -674,7 +710,9 @@ function TokenAndCachePanel({ rec }: { rec: TraceRecord }) {
         </div>
 
         <div className="rounded-md bg-secondary/40 p-2">
-          <div className="text-[11px] text-muted-foreground">真实计费 (Credit)</div>
+          <div className="text-[11px] text-muted-foreground">
+            {view === 'raw' ? '上游原始 (Credit)' : '计费后 (Credit)'}
+          </div>
           <div className="font-mono text-[14px] font-semibold tabular-nums text-sky-600 dark:text-sky-400">
             {credit > 0 ? credit.toFixed(4) : '—'}
           </div>
@@ -690,10 +728,12 @@ function TokenAndCachePanel({ rec }: { rec: TraceRecord }) {
 /** 展开折叠后的完整链路详情 */
 function TraceExpandedDetail({
   rec,
+  view,
   onFilterSession,
   onFilterIp,
 }: {
   rec: TraceRecord
+  view: StatsView
   onFilterSession?: (sessionId: string) => void
   onFilterIp?: (ip: string) => void
 }) {
@@ -790,7 +830,7 @@ function TraceExpandedDetail({
       </div>
 
       {/* 核心：Token 与缓存构成面板 */}
-      <TokenAndCachePanel rec={rec} />
+      <TokenAndCachePanel rec={rec} view={view} />
 
       {/* 报错信息（若存在） */}
       {rec.errorMessage && (
@@ -902,7 +942,7 @@ function useSlashFocus(ref: React.RefObject<HTMLInputElement | null>) {
 }
 
 /** 表格列定义。默认 8 列，其余进列控制菜单 —— 12 列全摆开必然横向滚动。 */
-function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
+function useTraceColumns(view: StatsView): ConsoleColumn<TraceRecord>[] {
   return useMemo(
     () => [
       {
@@ -957,18 +997,17 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
         id: 'tokens',
         header: 'Token',
         hint: '未缓存输入 / 输出；缓存↓读取 ↑写入',
-        cell: (r) => <TokenCell rec={r} />,
+        cell: (r) => <TokenCell rec={r} view={view} />,
       },
       {
         id: 'credits',
         header: '费用',
         align: 'right',
-        hint: 'credit —— 上游 metering 的真实计费',
-        cell: (r) => (
-          <span className="console-num">
-            {r.credits != null && r.credits > 0 ? r.credits.toFixed(4) : '—'}
-          </span>
-        ),
+        hint: '计费后 = 下游看到的 credit；原始 = 上游 metering 的真实计费',
+        cell: (r) => {
+          const credits = traceUsage(r, view).credits
+          return <span className="console-num">{credits > 0 ? credits.toFixed(4) : '—'}</span>
+        },
       },
       {
         id: 'duration',
@@ -1038,7 +1077,7 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
         ),
       },
     ],
-    [],
+    [view],
   )
 }
 
@@ -1104,7 +1143,8 @@ export function TraceLogPage() {
   const records = data?.records ?? []
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
-  const columns = useTraceColumns()
+  const [view, setView] = useStatsView()
+  const columns = useTraceColumns(view)
   const filterSession = (sessionId: string) => patchUrl({ session: sessionId, page: '0' })
   const filterIp = (ip: string) => patchUrl({ ip, page: '0' })
 
@@ -1217,6 +1257,7 @@ export function TraceLogPage() {
           <ArrowLeftRight className="h-3.5 w-3.5" />
           仅换号
         </Button>
+        <StatsViewToggle value={view} onChange={setView} />
         {url.session && (
           <span className="inline-flex h-8 items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 pl-2.5 pr-1.5 text-xs">
             <span className="text-muted-foreground">会话</span>
@@ -1269,6 +1310,7 @@ export function TraceLogPage() {
         renderExpandedRow={(rec) => (
           <TraceExpandedDetail
             rec={rec}
+            view={view}
             onFilterSession={filterSession}
             onFilterIp={filterIp}
           />

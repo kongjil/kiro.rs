@@ -7,6 +7,7 @@ import type {
   OverviewStats,
   StatsFilter,
   StatsTimeFilter,
+  StatsView,
   TimeSeriesPoint,
 } from '@/types/api'
 
@@ -22,8 +23,10 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-export async function getOverview(): Promise<OverviewStats> {
-  const { data } = await api.get<OverviewStats>('/stats/overview')
+export async function getOverview(view?: StatsView): Promise<OverviewStats> {
+  const { data } = await api.get<OverviewStats>('/stats/overview', {
+    params: view ? { view } : {},
+  })
   return data
 }
 
@@ -32,6 +35,7 @@ function statsParams(time: StatsTimeFilter, filter?: StatsFilter) {
     ...time,
     ...(filter?.keyId !== undefined ? { keyId: filter.keyId } : {}),
     ...(filter?.group ? { group: filter.group } : {}),
+    ...(filter?.view ? { view: filter.view } : {}),
   }
 }
 
@@ -57,9 +61,13 @@ export async function getByCredential(time: StatsTimeFilter, filter?: StatsFilte
 }
 
 export async function getByKey(time: StatsTimeFilter, filter?: StatsFilter): Promise<KeyDistribution[]> {
-  // by-key 是横向对比所有 Key，忽略 keyId 过滤；仅透传时间窗与分组
+  // by-key 是横向对比所有 Key，忽略 keyId 过滤；仅透传时间窗、分组与口径
   const { data } = await api.get<KeyDistribution[]>('/stats/by-key', {
-    params: { ...time, ...(filter?.group ? { group: filter.group } : {}) },
+    params: {
+      ...time,
+      ...(filter?.group ? { group: filter.group } : {}),
+      ...(filter?.view ? { view: filter.view } : {}),
+    },
   })
   return data
 }

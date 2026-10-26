@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::admin::trace_db::TraceSink;
+use crate::kiro::model::events::TokenUsage;
 
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
@@ -241,10 +242,9 @@ pub fn create_websearch_sse_stream(
     query: String,
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
-    input_tokens: i32,
+    usage: TokenUsage,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(&model, &query, &tool_use_id, search_results, usage);
 
     stream::iter(
         events
@@ -253,13 +253,13 @@ pub fn create_websearch_sse_stream(
     )
 }
 
-/// 生成 WebSearch SSE 事件序列
+/// 生成 WebSearch SSE 事件序列。`usage` 为计费后口径（已应用 Key 计费策略）。
 fn generate_websearch_events(
     model: &str,
     query: &str,
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
-    input_tokens: i32,
+    usage: TokenUsage,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = super::ids::message_id();
@@ -277,10 +277,10 @@ fn generate_websearch_events(
                 "content": [],
                 "stop_reason": null,
                 "usage": {
-                    "input_tokens": input_tokens,
+                    "input_tokens": usage.uncached_input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": usage.cache_write_input_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens
                 }
             }
         }),
@@ -416,7 +416,6 @@ fn generate_websearch_events(
 
     // 10. message_delta
     // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
-    let output_tokens = (summary.len() as i32 + 3) / 4; // 简单估算
     events.push(SseEvent::new(
         "message_delta",
         json!({
@@ -425,7 +424,7 @@ fn generate_websearch_events(
                 "stop_reason": "end_turn"
             },
             "usage": {
-                "output_tokens": output_tokens,
+                "output_tokens": usage.output_tokens,
                 "server_tool_use": {
                     "web_search_requests": 1
                 }
@@ -537,17 +536,22 @@ fn finish_mcp_call(
     }
 }
 
+/// 搜索摘要的输出 token 估算（摘要就是这条回复的正文）。
+fn summary_output_tokens(query: &str, search_results: &Option<WebSearchResults>) -> i32 {
+    (generate_search_summary(query, search_results).len() as i32 + 3) / 4
+}
+
+/// `usage` 为计费后口径（已应用 Key 计费策略）。
 fn render_websearch_response(
     stream_response: bool,
     model: String,
     query: String,
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
-    input_tokens: i32,
+    usage: TokenUsage,
 ) -> Response {
     if stream_response {
-        let stream =
-            create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+        let stream = create_websearch_sse_stream(model, query, tool_use_id, search_results, usage);
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
@@ -558,19 +562,12 @@ fn render_websearch_response(
             .unwrap()
     } else {
         let content = build_websearch_content(&query, &tool_use_id, &search_results);
-        let summary = generate_search_summary(&query, &search_results);
-        let output_tokens = (summary.len() as i32 + 3) / 4;
         // 本地 WebSearch 不走上游，不会收到 meteringEvent，因此也不带 credit_* 字段。
         super::websearch_loop::render_json(
             &model,
             content,
             "end_turn",
-            crate::kiro::model::events::TokenUsage {
-                uncached_input_tokens: input_tokens,
-                output_tokens,
-                cache_read_input_tokens: 0,
-                cache_write_input_tokens: 0,
-            },
+            usage,
             "",
             None,
             Default::default(),
@@ -578,18 +575,22 @@ fn render_websearch_response(
     }
 }
 
-/// 处理 WebSearch 请求
+/// 处理 WebSearch 请求。
+///
+/// 成功时同时返回结算结果（原始 + 计费后），由调用方记账；失败时为 None。
 pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
     group: Option<&str>,
-) -> Response {
+    billing_policy: &super::billing::BillingPolicy,
+    billing_prices: &std::collections::HashMap<String, crate::model::config::BillingPrice>,
+) -> (Response, Option<super::billing::BillingOutcome>) {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
         Some(q) => q,
         None => {
-            return (
+            let response = (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(
                     "invalid_request_error",
@@ -597,6 +598,7 @@ pub async fn handle_websearch_request(
                 )),
             )
                 .into_response();
+            return (response, None);
         }
     };
 
@@ -609,18 +611,27 @@ pub async fn handle_websearch_request(
     let search_results =
         match finish_mcp_call(call_mcp_api(&provider, &mcp_request, None, group).await) {
             Ok(results) => results,
-            Err(response) => return response,
+            Err(response) => return (response, None),
         };
 
-    // 4. 按请求模式生成响应
-    render_websearch_response(
+    // 4. 结算后按请求模式生成响应
+    let raw = TokenUsage {
+        uncached_input_tokens: input_tokens,
+        output_tokens: summary_output_tokens(&query, &search_results),
+        cache_read_input_tokens: 0,
+        cache_write_input_tokens: 0,
+    };
+    let outcome =
+        super::billing::settle(billing_policy, billing_prices, &payload.model, raw, 0.0);
+    let response = render_websearch_response(
         payload.stream,
         payload.model.clone(),
         query,
         tool_use_id,
         search_results,
-        input_tokens,
-    )
+        outcome.billed,
+    );
+    (response, Some(outcome))
 }
 
 /// 调用 Kiro MCP API
@@ -742,7 +753,10 @@ mod tests {
             "rust".to_string(),
             "srvtoolu_test".to_string(),
             None,
-            12,
+            TokenUsage {
+                uncached_input_tokens: 12,
+                ..TokenUsage::default()
+            },
         );
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1026,7 +1040,16 @@ mod tests {
 
     #[test]
     fn web_search_tool_result_references_server_tool_use_id() {
-        let events = generate_websearch_events("claude-sonnet-4.5", "q", "srvtoolu_abc", None, 1);
+        let events = generate_websearch_events(
+            "claude-sonnet-4.5",
+            "q",
+            "srvtoolu_abc",
+            None,
+            TokenUsage {
+                uncached_input_tokens: 1,
+                ..TokenUsage::default()
+            },
+        );
         let result_block = events
             .iter()
             .find(|e| e.data["content_block"]["type"] == "web_search_tool_result")

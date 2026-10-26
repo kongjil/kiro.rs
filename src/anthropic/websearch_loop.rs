@@ -37,7 +37,8 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::cache_metering::{BillingPolicy, CacheCreationTtl, CacheUsage, SharedCacheMeter};
+use super::billing::{BillingOutcome, BillingPolicy};
+use super::cache_metering::{CacheCreationTtl, CacheUsage, SharedCacheMeter};
 use super::converter::{convert_request_with_mode, get_context_window_size};
 use super::handlers::{
     RequestTracer, TraceUsage, UsageRecordHook, UsageSource, last_attempt_outcome,
@@ -137,45 +138,21 @@ impl RoundOutcome {
         )
     }
 
-    /// 解析本次 provider 调用的 token 用量；精确 metadata 缺失时，使用本轮
-    /// CacheMeter 结果把总 prompt 拆成互斥的 input / cache-write / cache-read。
+    fn usage_source(&self, cache_usage: &CacheUsage) -> UsageSource {
+        UsageSource::resolve(self.provider_token_usage.is_some(), cache_usage)
+    }
+
+    /// 本次 provider 调用按计费策略换算后的用量，以及原始用量的来源。
+    #[cfg(test)]
     fn resolved_token_usage(
         &self,
         fallback_input_tokens: i32,
         cache_usage: CacheUsage,
         billing_policy: BillingPolicy,
     ) -> (TokenUsage, UsageSource) {
-        if let Some(usage) = self.provider_token_usage {
-            return (
-                billing_policy.apply_to_provider_usage(usage),
-                UsageSource::Provider,
-            );
-        }
-
-        let mut output = Vec::new();
-        if !self.thinking.is_empty() {
-            output.push(json!({"type": "thinking", "thinking": self.thinking}));
-        }
-        if !self.text.is_empty() {
-            output.push(json!({"type": "text", "text": self.text}));
-        }
-        output.extend(
-            self.tool_uses
-                .iter()
-                .map(CompletedToolUse::to_anthropic_block),
-        );
-
-        // contextUsage 覆盖生成结束后的整个上下文（含本轮输出）。这里逐轮
-        // saturating_add 累加，不扣的话 N 轮会把输出重复放大 N 次。
-        let output_tokens = token::estimate_output_tokens(&output);
-        let total_input_tokens = token::input_tokens_excluding_output(
-            self.context_input_tokens,
-            fallback_input_tokens,
-            output_tokens,
-        );
         (
-            split_simulated_usage(total_input_tokens, output_tokens, cache_usage, billing_policy),
-            UsageSource::resolve(false, &cache_usage),
+            billing_policy.apply(self.raw_token_usage(fallback_input_tokens, cache_usage)),
+            self.usage_source(&cache_usage),
         )
     }
 }
@@ -186,7 +163,7 @@ fn split_simulated_usage(
     cache_usage: CacheUsage,
     billing_policy: BillingPolicy,
 ) -> TokenUsage {
-    billing_policy.apply_to_simulated_usage(&cache_usage, total_input_tokens, output_tokens)
+    billing_policy.apply(cache_usage.simulated_usage(total_input_tokens, output_tokens))
 }
 
 /// Normalize model-produced Web Search input into one non-empty query.
@@ -510,7 +487,6 @@ async fn run_round(
     payload: &MessagesRequest,
     fallback_input_tokens: i32,
     cache_usage: CacheUsage,
-    billing_policy: BillingPolicy,
     tracer: &RequestTracer,
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
@@ -566,12 +542,7 @@ async fn run_round(
         Err(e) => {
             let error_type = last_attempt_outcome(tracer).unwrap_or(outcome::UNKNOWN);
             let error_message = e.to_string();
-            let token_usage = split_simulated_usage(
-                fallback_input_tokens,
-                0,
-                cache_usage,
-                billing_policy,
-            );
+            let token_usage = cache_usage.simulated_usage(fallback_input_tokens, 0);
             return Err(RoundFailure {
                 response: map_provider_error(e),
                 error_type,
@@ -602,8 +573,8 @@ async fn run_round(
     if let Some(error_message) = outcome.stream_error.take() {
         // The stream is partial and cannot re-enter the search loop, but any final metadata
         // snapshot/credits observed before the cut still belong to this real provider call.
-        let (token_usage, usage_source) =
-            outcome.resolved_token_usage(fallback_input_tokens, cache_usage, billing_policy);
+        let token_usage = outcome.raw_token_usage(fallback_input_tokens, cache_usage);
+        let usage_source = outcome.usage_source(&cache_usage);
         return Err(RoundFailure {
             response: (
                 StatusCode::BAD_GATEWAY,
@@ -991,25 +962,6 @@ fn build_flush_content(
     content
 }
 
-fn record_aggregated_usage_with_raw(
-    hook: &UsageRecordHook,
-    credential_id: u64,
-    raw: TokenUsage,
-    modified: TokenUsage,
-    raw_credits: f64,
-    modified_credits: f64,
-    status: &str,
-) {
-    hook.record_with_raw(
-        credential_id,
-        raw,
-        modified,
-        raw_credits,
-        modified_credits,
-        status,
-    );
-}
-
 /// Cancellation-safe, exactly-once accounting for the multi-round search loop.
 /// The snapshot is updated after every completed provider round, so cancelling
 /// a later MCP/provider await still records all usage and trace attempts already
@@ -1018,9 +970,10 @@ struct WebSearchUsageSettlement {
     hook: UsageRecordHook,
     tracer: Option<Arc<RequestTracer>>,
     credential_id: u64,
+    /// 多轮累计的计费后用量（每轮按策略换算后相加）
     usage: TokenUsage,
+    /// 多轮累计的原始用量
     raw_usage: TokenUsage,
-    credits: f64,
     raw_credits: f64,
     /// 多轮累计的缓存写入 TTL 拆分，下游按 5m / 1h 分别计价。
     creation_ttl: CacheCreationTtl,
@@ -1042,7 +995,6 @@ impl WebSearchUsageSettlement {
             credential_id: 0,
             usage: TokenUsage::default(),
             raw_usage: TokenUsage::default(),
-            credits: 0.0,
             raw_credits: 0.0,
             creation_ttl: CacheCreationTtl::default(),
             settled: false,
@@ -1061,7 +1013,6 @@ impl WebSearchUsageSettlement {
             credential_id: 0,
             usage: TokenUsage::default(),
             raw_usage: TokenUsage::default(),
-            credits: 0.0,
             raw_credits: 0.0,
             creation_ttl: CacheCreationTtl::default(),
             settled: false,
@@ -1072,29 +1023,20 @@ impl WebSearchUsageSettlement {
         }
     }
 
-    fn add(&mut self, credential_id: u64, usage: TokenUsage, credits: f64) {
-        self.add_with_raw(credential_id, usage, usage, credits, credits);
-    }
-
-    fn add_with_raw(
-        &mut self,
-        credential_id: u64,
-        raw_usage: TokenUsage,
-        usage: TokenUsage,
-        raw_credits: f64,
-        credits: f64,
-    ) {
+    /// 累计一轮真实 provider 调用的原始用量，按本 Key 策略换算后同时累计计费后用量。
+    /// 返回本轮计费后用量。
+    fn add(&mut self, credential_id: u64, raw: TokenUsage, raw_credits: f64) -> TokenUsage {
+        let raw = raw.sanitized();
+        let billed = self.billing_policy.apply(raw);
         if credential_id != 0 {
             self.credential_id = credential_id;
         }
-        self.usage = self.usage.saturating_add(usage);
-        self.raw_usage = self.raw_usage.saturating_add(raw_usage);
-        if credits.is_finite() && credits > 0.0 {
-            self.credits += credits;
-        }
+        self.raw_usage = self.raw_usage.saturating_add(raw);
+        self.usage = self.usage.saturating_add(billed);
         if raw_credits.is_finite() && raw_credits > 0.0 {
             self.raw_credits += raw_credits;
         }
+        billed
     }
 
     fn add_creation_ttl(&mut self, ttl: CacheCreationTtl) {
@@ -1117,23 +1059,24 @@ impl WebSearchUsageSettlement {
         self.usage.sanitized()
     }
 
-    /// 构造最终响应的计费信息：费用取整条 agentic loop 中所有模型调用的
-    /// meteringEvent 累计值，单位沿用最近一次上游事件。
+    /// 整条 agentic loop 的结算结果：原始与计费后用量都是各轮之和，
+    /// 计费后 credit 按累计值统一计算。
+    fn outcome(&self) -> BillingOutcome {
+        super::billing::outcome(
+            &self.billing_prices,
+            &self.model,
+            self.raw_usage,
+            self.raw_credits,
+            self.usage,
+        )
+    }
+
+    /// 构造最终响应的计费信息：单位沿用最近一次上游事件，用量换成计费后 credit。
     fn response_metering(&self, latest: Option<&MeteringEvent>) -> Option<MeteringEvent> {
-        latest.map(|metering| {
-            let cost = super::cache_metering::configured_token_cost_for_model(
-                &self.model,
-                self.usage,
-                &self.billing_prices,
-            );
-            MeteringEvent {
-            usage: if let Some(cost) = cost {
-                cost
-            } else {
-                self.billing_policy.modify_credits(self.raw_credits, self.raw_usage, self.usage)
-            },
+        latest.map(|metering| MeteringEvent {
+            usage: self.outcome().billed_credits,
             ..metering.clone()
-        }})
+        })
     }
 
     fn finish(
@@ -1146,25 +1089,16 @@ impl WebSearchUsageSettlement {
         if self.settled {
             return;
         }
-        let modified_credit = self.response_metering(None).map(|m| m.usage).unwrap_or(self.credits);
-        record_aggregated_usage_with_raw(
-            &self.hook,
-            self.credential_id,
-            self.raw_usage,
-            self.usage,
-            self.raw_credits,
-            modified_credit,
-            usage_status,
-        );
+        let outcome = self.outcome();
+        self.hook
+            .record_outcome(self.credential_id, &outcome, usage_status);
         if let Some(tracer) = &self.tracer {
-            finalize_aggregated_trace(
-                tracer,
+            tracer.finalize(
                 trace_status,
                 error_type,
                 error_message,
-                self.usage,
-                self.credits,
-                self.source,
+                None,
+                TraceUsage::from_outcome(&outcome, self.source),
             );
         }
         self.settled = true;
@@ -1475,7 +1409,9 @@ where
     result
 }
 
-fn initial_stream_event(model: &str, input_tokens: i32) -> SseEvent {
+/// 首个 message_start。此时还没跑第一轮（缓存模拟会写入条目，不能提前做），
+/// 只能对输入估算应用计费策略；最终值以 message_delta 为准。
+fn initial_stream_event(model: &str, usage: TokenUsage) -> SseEvent {
     let message_id = super::ids::message_id();
     SseEvent::new(
         "message_start",
@@ -1490,10 +1426,10 @@ fn initial_stream_event(model: &str, input_tokens: i32) -> SseEvent {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": input_tokens.max(0),
+                    "input_tokens": usage.uncached_input_tokens.max(0),
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": usage.cache_write_input_tokens.max(0),
+                    "cache_read_input_tokens": usage.cache_read_input_tokens.max(0)
                 }
             }
         }),
@@ -1639,40 +1575,6 @@ async fn execute_web_search(
     result
 }
 
-fn aggregated_trace_usage(usage: TokenUsage, credits: f64, source: UsageSource) -> TraceUsage {
-    let usage = usage.sanitized();
-    TraceUsage {
-        input_tokens: usage.uncached_input_tokens as u64,
-        output_tokens: usage.output_tokens as u64,
-        cache_creation_tokens: usage.cache_write_input_tokens as u64,
-        cache_read_tokens: usage.cache_read_input_tokens as u64,
-        credits: if credits.is_finite() && credits > 0.0 {
-            credits
-        } else {
-            0.0
-        },
-        source,
-    }
-}
-
-fn finalize_aggregated_trace(
-    tracer: &RequestTracer,
-    status: &str,
-    error_type: Option<&str>,
-    error_message: Option<&str>,
-    usage: TokenUsage,
-    credits: f64,
-    source: UsageSource,
-) {
-    tracer.finalize(
-        status,
-        error_type,
-        error_message,
-        None,
-        aggregated_trace_usage(usage, credits, source),
-    );
-}
-
 /// web_search loop entry point
 ///
 /// `stream_client`: whether the client wants SSE (true) or a single JSON response (false).
@@ -1710,7 +1612,13 @@ pub(super) async fn run_web_search_loop(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let initial_event = initial_stream_event(&payload.model, initial_input_tokens);
+    let initial_event = initial_stream_event(
+        &payload.model,
+        billing_policy.apply(TokenUsage {
+            uncached_input_tokens: initial_input_tokens,
+            ..TokenUsage::default()
+        }),
+    );
     let (sender, receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
     tokio::spawn(async move {
         let receiver_guard = sender.clone();
@@ -1806,7 +1714,6 @@ async fn run_web_search_loop_inner(
                 &payload,
                 round_fallback_input_tokens,
                 round_cache_usage,
-                billing_policy,
                 tracer.as_ref(),
                 group.as_deref(),
                 tool_compatibility_mode,
@@ -1834,24 +1741,15 @@ async fn run_web_search_loop_inner(
                     return failure.response;
                 }
             };
-            let (round_usage, usage_source) =
-                round.resolved_token_usage(
-                    round_fallback_input_tokens,
-                    round_cache_usage,
-                    billing_policy,
-                );
-            let raw_round_usage = round.raw_token_usage(round_fallback_input_tokens, round_cache_usage);
-            settlement.add_creation_ttl(
-                round_cache_usage.split_creation_ttl(round_usage.cache_write_input_tokens),
-            );
-            settlement.add_with_raw(
+            let round_billed = settlement.add(
                 credential_id,
-                raw_round_usage,
-                round_usage,
-                round.credits,
+                round.raw_token_usage(round_fallback_input_tokens, round_cache_usage),
                 round.credits,
             );
-            settlement.note_source(usage_source);
+            settlement.add_creation_ttl(
+                round_cache_usage.split_creation_ttl(round_billed.cache_write_input_tokens),
+            );
+            settlement.note_source(round.usage_source(&round_cache_usage));
             // 跨 round 保留最近一次 meteringEvent 的单位字段；最终响应中的 usage
             // 会替换为 settlement 累计的所有模型调用费用。
             // (clone 以避免与 empty_tool_result_disposition 后续对 round 的借用冲突)。
@@ -2322,7 +2220,13 @@ mod tests {
     #[tokio::test]
     async fn channel_response_exposes_message_start_before_background_progress() {
         let (sender, receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
-        let response = render_channel_sse(initial_stream_event("gpt-5.6-sol", 17), receiver);
+        let response = render_channel_sse(initial_stream_event(
+            "gpt-5.6-sol",
+            TokenUsage {
+                uncached_input_tokens: 17,
+                ..TokenUsage::default()
+            },
+        ), receiver);
         let mut body = response.into_body().into_data_stream();
 
         let first = tokio::time::timeout(Duration::from_millis(100), body.next())
@@ -2547,7 +2451,7 @@ mod tests {
         drop(receiver);
         assert!(while_receiver_open(&sender, in_flight).await.is_none());
 
-        let overview = aggregator.overview();
+        let overview = aggregator.overview(crate::admin::usage_stats::StatsView::Billed);
         assert_eq!(overview.today_calls, 1);
         assert_eq!(overview.today_errors, 1);
         assert_eq!(overview.today_input_tokens, 3);
@@ -3892,38 +3796,49 @@ mod tests {
 
     #[test]
     fn aggregated_trace_usage_matches_websearch_usage_and_sanitizes_values() {
-        let trace = aggregated_trace_usage(
-            TokenUsage {
-                uncached_input_tokens: 3,
-                output_tokens: 5,
-                cache_read_input_tokens: 7,
-                cache_write_input_tokens: 4,
-            },
+        let usage = TokenUsage {
+            uncached_input_tokens: 3,
+            output_tokens: 5,
+            cache_read_input_tokens: 7,
+            cache_write_input_tokens: 4,
+        };
+        let outcome = crate::anthropic::billing::outcome(
+            &std::collections::HashMap::new(),
+            "m",
+            usage,
             0.125,
-            UsageSource::Provider,
+            usage,
         );
+        let trace = TraceUsage::from_outcome(&outcome, UsageSource::Provider);
         assert_eq!(trace.input_tokens, 3);
         assert_eq!(trace.output_tokens, 5);
         assert_eq!(trace.cache_creation_tokens, 4);
         assert_eq!(trace.cache_read_tokens, 7);
         assert_eq!(trace.credits, 0.125);
+        assert_eq!(trace.raw.input_tokens, 3);
+        assert_eq!(trace.raw.credits, 0.125);
         assert_eq!(trace.source, UsageSource::Provider);
 
-        let sanitized = aggregated_trace_usage(
-            TokenUsage {
-                uncached_input_tokens: -1,
-                output_tokens: -2,
-                cache_read_input_tokens: -3,
-                cache_write_input_tokens: -4,
-            },
+        let negative = TokenUsage {
+            uncached_input_tokens: -1,
+            output_tokens: -2,
+            cache_read_input_tokens: -3,
+            cache_write_input_tokens: -4,
+        };
+        let outcome = crate::anthropic::billing::outcome(
+            &std::collections::HashMap::new(),
+            "m",
+            negative,
             f64::NAN,
-            UsageSource::None,
+            negative,
         );
+        let sanitized = TraceUsage::from_outcome(&outcome, UsageSource::None);
         assert_eq!(sanitized.input_tokens, 0);
         assert_eq!(sanitized.output_tokens, 0);
         assert_eq!(sanitized.cache_creation_tokens, 0);
         assert_eq!(sanitized.cache_read_tokens, 0);
         assert_eq!(sanitized.credits, 0.0);
+        assert_eq!(sanitized.raw.credits, 0.0);
     }
 
     #[test]
@@ -4054,6 +3969,54 @@ mod tests {
             .expect("streaming response must contain message_delta");
         assert_eq!(delta.data["usage"]["credit_usage"], json!(0.75));
         settlement.settled = true;
+    }
+
+    /// 回归：结算时计费后 credit 曾因 `response_metering(None)` 恒为 None 而退回原始值。
+    /// 现在记账、trace、响应都取同一份结算结果。
+    #[test]
+    fn settlement_records_billed_usage_and_credits_with_policy() {
+        use crate::admin::usage_stats::{
+            Range, StatsGranularity, StatsQueryWindow, StatsView, UsageAggregator,
+        };
+        use crate::anthropic::billing::{BillingMode, BillingPolicy, Composition};
+
+        let aggregator = Arc::new(UsageAggregator::new());
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: Some(aggregator.clone()),
+            client_keys: None,
+            key_id: 0,
+            model: "gpt-5.6-sol".to_string(),
+            started_at: std::time::Instant::now(),
+            billing_prices: Arc::new(std::collections::HashMap::new()),
+            token_manager: None,
+        };
+        let mut settlement = WebSearchUsageSettlement::without_trace(hook);
+        settlement.billing_policy = BillingPolicy {
+            mode: BillingMode::Inflate,
+            composition: Composition::Keep,
+            input_scale: 1.5,
+            ..Default::default()
+        };
+        // 两轮：输入 10 + 20，输出 2 + 3，原始 credit 0.25 + 0.50
+        let first = settlement.add(1, token_usage(10, 2), 0.25);
+        assert_eq!(first.uncached_input_tokens, 15);
+        settlement.add(1, token_usage(20, 3), 0.50);
+        assert_eq!(settlement.usage().uncached_input_tokens, 45);
+
+        let expected = 0.75 * (45.0 + 5.0) / (30.0 + 5.0);
+        let latest = metering_event(0.50);
+        let metering = settlement.response_metering(Some(&latest)).unwrap();
+        assert!((metering.usage - expected).abs() < 1e-12);
+
+        settlement.finish("success", "success", None, None);
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let billed = &aggregator.query_timeseries(window, None, None, StatsView::Billed)[0];
+        let raw = &aggregator.query_timeseries(window, None, None, StatsView::Raw)[0];
+        assert_eq!(billed.input_tokens, 45);
+        assert!((billed.credits - expected).abs() < 1e-12);
+        assert_eq!(raw.input_tokens, 30);
+        assert!((raw.credits - 0.75).abs() < 1e-12);
     }
 
     #[test]

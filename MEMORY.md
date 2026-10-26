@@ -37,3 +37,18 @@
   硬编码制造 75%～90% 命中率。
 - 已知边界：尚未按模型执行 512～4096 token 的最小缓存阈值；并发请求中条目在
   上游响应开始前即可见；JSON 解析会规范化对象键序，无法复现原始线序变化导致的失效。
+
+## 按 Key 的下游计费策略
+
+- 计费策略（`src/anthropic/billing.rs`）是缓存模拟之后独立的一层：模拟本身仍不得
+  制造命中率；策略由运营方按客户端 Key 显式配置，只改写发给下游的 usage。
+- 原始 usage（上游 tokenUsage 真值或模拟拆分）始终保留：用量统计 JSONL 的 `raw*`
+  字段与 traces 表的 `raw_*` 列，管理端可在「原始 / 计费后」两种口径间切换查看。
+- 模式：`raw` 原样透传；`redistribute` 输入总量不变，按目标命中率或缓存缩放系数
+  重新分配读取 / 创建 / input；`inflate` 输入总量乘以倍率（output 可单独放大）后
+  再分配。旧版分类倍率只为兼容已有配置，不能新设。
+- 每个请求只结算一次（`billing::settle`），响应里的 usage / credit_usage、用量统计
+  与 trace 都取同一份结果；流式 message_start 也按同一策略换算，最终值以
+  message_delta 为准。
+- 计费后 credit：配置了模型价格表时按计费后 token 计价，否则按「计费后总 token /
+  原始总 token」缩放原始 credit。多次下发 meteringEvent 时原始 credit 取累加值。

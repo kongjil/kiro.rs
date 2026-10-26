@@ -25,6 +25,10 @@ import { useConfirm } from '@/components/ui/confirm-dialog'
 import { ConsoleTable, type ConsoleColumn } from '@/components/console/data-table'
 import { BulkBar } from '@/components/console/bulk-bar'
 import { PageHeader } from '@/components/console/page-header'
+import {
+  BillingPolicyFields, billingSummary, draftFromPolicy, emptyBillingDraft, policyFromDraft,
+  type BillingDraft,
+} from '@/components/billing-policy-fields'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
@@ -46,31 +50,10 @@ function parseMaxCreditsInput(raw: string): number | null | 'invalid' {
   return n
 }
 
-/** 缓存计费系数展示：1 → 满，0 → 无，其余显示百分比 */
-function formatCacheRatio(ratio?: number): string {
-  const v = ratio ?? 1
-  if (v >= 1) return '满'
-  if (v <= 0) return '无'
-  return `${Math.round(v * 100)}%`
-}
-
-/** 解析缓存系数输入框：非法 / 空值回落为 1（满缓存），其余夹到 0~1 */
-function parseCacheRatio(raw: string): number {
-  const n = parseFloat(raw)
-  if (!Number.isFinite(n)) return 1
-  return Math.min(1, Math.max(0, n))
-}
-
-function parseOptionalMultiplier(raw: string): number | undefined {
+function parseSellMultiplier(raw: string): number | undefined {
   if (!raw.trim()) return undefined
   const n = Number(raw)
   return Number.isFinite(n) && n >= 0 ? n : undefined
-}
-
-function parseOptionalMultiplierForUpdate(raw: string): number | null {
-  if (!raw.trim()) return null
-  const n = Number(raw)
-  return Number.isFinite(n) && n >= 0 ? n : null
 }
 
 /** 渲染「已用积分 / 上限」列。无上限时仅显示已用量。 */
@@ -120,11 +103,7 @@ export function ClientKeysPage() {
   const [createDesc, setCreateDesc] = useState('')
   const [createGroups, setCreateGroups] = useState<string[]>(['default'])
   const [createMaxCredits, setCreateMaxCredits] = useState('')
-  const [createCacheRatio, setCreateCacheRatio] = useState('1')
-  const [createInputMultiplier, setCreateInputMultiplier] = useState('')
-  const [createCreationMultiplier, setCreateCreationMultiplier] = useState('')
-  const [createReadMultiplier, setCreateReadMultiplier] = useState('')
-  const [createTargetRate, setCreateTargetRate] = useState('')
+  const [createBilling, setCreateBilling] = useState<BillingDraft>(emptyBillingDraft)
   const [createSellMultiplier, setCreateSellMultiplier] = useState('1')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
@@ -135,11 +114,7 @@ export function ClientKeysPage() {
   const [editDesc, setEditDesc] = useState('')
   const [editGroups, setEditGroups] = useState<string[]>(['default'])
   const [editMaxCredits, setEditMaxCredits] = useState('')
-  const [editCacheRatio, setEditCacheRatio] = useState('1')
-  const [editInputMultiplier, setEditInputMultiplier] = useState('')
-  const [editCreationMultiplier, setEditCreationMultiplier] = useState('')
-  const [editReadMultiplier, setEditReadMultiplier] = useState('')
-  const [editTargetRate, setEditTargetRate] = useState('')
+  const [editBilling, setEditBilling] = useState<BillingDraft>(emptyBillingDraft)
   const [editSellMultiplier, setEditSellMultiplier] = useState('1')
 
   const handleCreate = async (e: React.FormEvent) => {
@@ -154,18 +129,21 @@ export function ClientKeysPage() {
       toast.error('积分上限必须是非负数')
       return
     }
+    let billing
+    try {
+      billing = policyFromDraft(createBilling)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err))
+      return
+    }
     try {
       const res = await createKey.mutateAsync({
         name,
         description: createDesc.trim() || undefined,
         groups: createGroups,
         maxCredits: maxCredits ?? undefined,
-        cacheRatio: parseCacheRatio(createCacheRatio),
-        inputMultiplier: parseOptionalMultiplier(createInputMultiplier),
-        cacheCreationMultiplier: parseOptionalMultiplier(createCreationMultiplier),
-        cacheReadMultiplier: parseOptionalMultiplier(createReadMultiplier),
-        targetEffectiveHitRate: parseOptionalMultiplier(createTargetRate),
-        sellMultiplier: parseOptionalMultiplier(createSellMultiplier) ?? 1,
+        billing,
+        sellMultiplier: parseSellMultiplier(createSellMultiplier) ?? 1,
       })
       setCreatedKey(res)
       setCreateOpen(false)
@@ -173,11 +151,7 @@ export function ClientKeysPage() {
       setCreateDesc('')
       setCreateGroups(['default'])
       setCreateMaxCredits('')
-      setCreateCacheRatio('1')
-      setCreateInputMultiplier('')
-      setCreateCreationMultiplier('')
-      setCreateReadMultiplier('')
-      setCreateTargetRate('')
+      setCreateBilling(emptyBillingDraft())
       setCreateSellMultiplier('1')
       setShowCreatedPlain(true)
     } catch (err) {
@@ -261,11 +235,7 @@ export function ClientKeysPage() {
     setEditDesc(item.description ?? '')
     setEditGroups(item.groups?.length ? item.groups : ['default'])
     setEditMaxCredits(item.maxCredits != null ? String(item.maxCredits) : '')
-    setEditCacheRatio(String(item.cacheRatio ?? 1))
-    setEditInputMultiplier(item.inputMultiplier != null ? String(item.inputMultiplier) : '')
-    setEditCreationMultiplier(item.cacheCreationMultiplier != null ? String(item.cacheCreationMultiplier) : '')
-    setEditReadMultiplier(item.cacheReadMultiplier != null ? String(item.cacheReadMultiplier) : '')
-    setEditTargetRate(item.targetEffectiveHitRate != null ? String(item.targetEffectiveHitRate) : '')
+    setEditBilling(draftFromPolicy(item.billing))
     setEditSellMultiplier(String(item.sellMultiplier ?? 1))
     setEditOpen(true)
   }
@@ -278,6 +248,16 @@ export function ClientKeysPage() {
       toast.error('积分上限必须是非负数')
       return
     }
+    // 仍是旧版分类倍率（未改选新模式）时不提交，保持原配置
+    let billing
+    if (editBilling.mode !== 'legacy_multipliers') {
+      try {
+        billing = policyFromDraft(editBilling)
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : String(err))
+        return
+      }
+    }
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
@@ -285,12 +265,8 @@ export function ClientKeysPage() {
           name: editName.trim(),
           description: editDesc.trim(),
           groups: editGroups,
-          cacheRatio: parseCacheRatio(editCacheRatio),
-          inputMultiplier: parseOptionalMultiplierForUpdate(editInputMultiplier),
-          cacheCreationMultiplier: parseOptionalMultiplierForUpdate(editCreationMultiplier),
-          cacheReadMultiplier: parseOptionalMultiplierForUpdate(editReadMultiplier),
-          targetEffectiveHitRate: parseOptionalMultiplierForUpdate(editTargetRate),
-          sellMultiplier: parseOptionalMultiplierForUpdate(editSellMultiplier),
+          billing,
+          sellMultiplier: parseSellMultiplier(editSellMultiplier) ?? null,
         },
       })
       // 仅在上限发生变化时才调用额度接口，避免无谓写入
@@ -459,19 +435,16 @@ export function ClientKeysPage() {
           ),
       },
       {
-        id: 'cacheRatio',
-        header: '缓存',
-        cell: (k) => {
-          const v = k.cacheRatio ?? 1
-          return (
-            <Badge
-              variant={v >= 1 ? 'success' : v <= 0 ? 'destructive' : 'outline'}
-              title={`缓存计费系数 ${v}`}
-            >
-              {formatCacheRatio(v)}
-            </Badge>
-          )
-        },
+        id: 'billing',
+        header: '计费',
+        cell: (k) => (
+          <Badge
+            variant={k.billing.mode === 'raw' ? 'success' : k.billing.mode === 'legacy_multipliers' ? 'destructive' : 'outline'}
+            title="下游计费策略（发给下游的 usage 按此换算，原始用量不受影响）"
+          >
+            {billingSummary(k.billing)}
+          </Badge>
+        ),
       },
       {
         id: 'status',
@@ -724,29 +697,15 @@ export function ClientKeysPage() {
                   累计使用的 credit 达到上限后，该 Key 的请求会被拒绝（HTTP 429）。重置统计后重新计费。
                 </p>
               </div>
+              <BillingPolicyFields
+                draft={createBilling}
+                onChange={setCreateBilling}
+                disabled={createKey.isPending}
+              />
               <div>
-                <label className="text-[12px] text-muted-foreground">缓存系数（0~1）</label>
-                <Input
-                  type="number"
-                  min="0"
-                  max="1"
-                  step="0.05"
-                  inputMode="decimal"
-                  placeholder="1 = 满缓存，0 = 无缓存，0.5 = 缓存红利打五折"
-                  value={createCacheRatio}
-                  onChange={(e) => setCreateCacheRatio(e.target.value)}
-                  disabled={createKey.isPending}
-                />
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  控制本 Key 请求上报给下游的缓存红利比例：1=满缓存（享 cache_read 折扣），0=无缓存（全按 input 计），0.5=缓存覆盖砍半。不影响发往上游的真实请求。
-                </p>
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div><label className="text-[12px] text-muted-foreground">Input 倍率（无目标时）</label><Input type="number" min="0" step="0.05" placeholder="留空=原始" value={createInputMultiplier} onChange={(e) => setCreateInputMultiplier(e.target.value)} /></div>
-                <div><label className="text-[12px] text-muted-foreground">Cache 创建倍率（无目标时）</label><Input type="number" min="0" step="0.05" placeholder="留空=原始" value={createCreationMultiplier} onChange={(e) => setCreateCreationMultiplier(e.target.value)} /></div>
-                <div><label className="text-[12px] text-muted-foreground">Cache 读取倍率（无目标时）</label><Input type="number" min="0" step="0.05" placeholder="留空=原始" value={createReadMultiplier} onChange={(e) => setCreateReadMultiplier(e.target.value)} /></div>
-                <div><label className="text-[12px] text-muted-foreground">目标命中率</label><Input type="number" min="0" max="1" step="0.05" placeholder="留空=倍率模式" value={createTargetRate} onChange={(e) => setCreateTargetRate(e.target.value)} /></div>
-                <div><label className="text-[12px] text-muted-foreground">卖出倍率</label><Input type="number" min="0" step="0.05" value={createSellMultiplier} onChange={(e) => setCreateSellMultiplier(e.target.value)} /></div>
+                <label className="text-[12px] text-muted-foreground">卖出倍率</label>
+                <Input type="number" min="0" step="0.05" value={createSellMultiplier} onChange={(e) => setCreateSellMultiplier(e.target.value)} />
+                <p className="mt-1 text-[11px] text-muted-foreground">只用于内部「卖出消费」统计，不影响发给下游的用量。</p>
               </div>
               <DialogFooter>
                 <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
@@ -861,29 +820,15 @@ export function ClientKeysPage() {
                   累计 credit 达到上限后该 Key 请求会被拒绝（HTTP 429）。清空则取消限制；重置统计可清零已用量。
                 </p>
               </div>
+              <BillingPolicyFields
+                draft={editBilling}
+                onChange={setEditBilling}
+                disabled={updateKey.isPending}
+              />
               <div>
-                <label className="text-[12px] text-muted-foreground">缓存系数（0~1）</label>
-                <Input
-                  type="number"
-                  min="0"
-                  max="1"
-                  step="0.05"
-                  inputMode="decimal"
-                  placeholder="1 = 满缓存，0 = 无缓存，0.5 = 缓存红利打五折"
-                  value={editCacheRatio}
-                  onChange={(e) => setEditCacheRatio(e.target.value)}
-                  disabled={updateKey.isPending}
-                />
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  1=满缓存，0=无缓存（缓存 token 归零，全按 input 计），0.5=缓存红利打五折。
-                </p>
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div><label className="text-[12px] text-muted-foreground">Input 倍率（无目标时）</label><Input type="number" min="0" step="0.05" placeholder="留空=原始" value={editInputMultiplier} onChange={(e) => setEditInputMultiplier(e.target.value)} /></div>
-                <div><label className="text-[12px] text-muted-foreground">Cache 创建倍率（无目标时）</label><Input type="number" min="0" step="0.05" placeholder="留空=原始" value={editCreationMultiplier} onChange={(e) => setEditCreationMultiplier(e.target.value)} /></div>
-                <div><label className="text-[12px] text-muted-foreground">Cache 读取倍率（无目标时）</label><Input type="number" min="0" step="0.05" placeholder="留空=原始" value={editReadMultiplier} onChange={(e) => setEditReadMultiplier(e.target.value)} /></div>
-                <div><label className="text-[12px] text-muted-foreground">目标命中率</label><Input type="number" min="0" max="1" step="0.05" placeholder="留空=倍率模式" value={editTargetRate} onChange={(e) => setEditTargetRate(e.target.value)} /></div>
-                <div><label className="text-[12px] text-muted-foreground">卖出倍率</label><Input type="number" min="0" step="0.05" value={editSellMultiplier} onChange={(e) => setEditSellMultiplier(e.target.value)} /></div>
+                <label className="text-[12px] text-muted-foreground">卖出倍率</label>
+                <Input type="number" min="0" step="0.05" value={editSellMultiplier} onChange={(e) => setEditSellMultiplier(e.target.value)} />
+                <p className="mt-1 text-[11px] text-muted-foreground">只用于内部「卖出消费」统计，不影响发给下游的用量。</p>
               </div>
               <DialogFooter>
                 <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>

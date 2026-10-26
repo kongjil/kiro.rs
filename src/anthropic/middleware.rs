@@ -18,7 +18,8 @@ use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::BillingPrice;
 
-use super::cache_metering::{BillingPolicy, SharedCacheMeter};
+use super::billing::BillingPolicy;
+use super::cache_metering::SharedCacheMeter;
 use super::types::ErrorResponse;
 
 /// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
@@ -32,9 +33,8 @@ pub struct KeyContext {
     pub key_source: TraceKeySource,
     /// 客户端 IP（转发头优先，回落到 TCP 对端），仅用于请求日志
     pub client_ip: Option<String>,
-    /// 该 Key 的缓存计费系数（0~1，1 = 满缓存），只影响上报给下游的 usage 拆分
-    pub cache_ratio: f64,
-    /// 新版 token 计费策略；字段全部为空时保持 raw 行为。
+    /// 该 Key 的下游计费策略：只影响发给下游的 usage 与「计费后」统计，
+    /// 发往上游的真实请求和「原始」统计不受影响。
     pub billing_policy: BillingPolicy,
 }
 
@@ -140,29 +140,14 @@ pub async fn auth_middleware(
         match mgr.verify_and_touch_ex(&presented) {
             KeyAuth::Ok(id) => {
                 let group = mgr.group_of(id);
-                let cache_ratio = mgr.cache_ratio_of(id);
-                let (
-                    legacy_cache_ratio,
-                    input_multiplier,
-                    cache_creation_multiplier,
-                    cache_read_multiplier,
-                    target_effective_hit_rate,
-                    _sell_multiplier,
-                ) = mgr.billing_policy_of(id);
+                let billing_policy = mgr.billing_policy_of(id);
                 let client_ip = auth::extract_client_ip(&request);
                 request.extensions_mut().insert(KeyContext {
                     key_id: id,
                     group,
                     key_source: TraceKeySource::ClientKey,
                     client_ip,
-                    cache_ratio,
-                    billing_policy: BillingPolicy {
-                        cache_ratio: legacy_cache_ratio,
-                        input_multiplier,
-                        cache_creation_multiplier,
-                        cache_read_multiplier,
-                        target_effective_hit_rate,
-                    },
+                    billing_policy,
                 });
                 return next.run(request).await;
             }
