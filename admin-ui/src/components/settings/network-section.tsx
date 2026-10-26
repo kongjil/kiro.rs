@@ -8,8 +8,10 @@ import {
   useFieldSaver,
 } from '@/components/console/setting-row'
 import { useGlobalProxy, useSetGlobalProxy } from '@/hooks/use-credentials'
-import { maskProxyUrl } from '@/lib/utils'
+import { batchAddProxies, getProxyPool, setGlobalProxy } from '@/api/credentials'
+import { maskProxyUrl, extractErrorMessage } from '@/lib/utils'
 import { reportSaveError } from '@/components/settings/report-error'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 /**
  * 网络分区：全局出站代理。
@@ -32,6 +34,11 @@ export function NetworkSection() {
   const saver = useFieldSaver(mutate, reportSaveError)
   const isPending = saver.isSaving('proxy')
   const saved = saver.isSaved('proxy')
+  const queryClient = useQueryClient()
+  const { data: proxyPool } = useQuery({
+    queryKey: ['proxy-pool'],
+    queryFn: getProxyPool,
+  })
 
   const currentUrl = data?.proxyUrl ?? null
   const currentUsername = data?.proxyUsername ?? null
@@ -40,6 +47,25 @@ export function NetworkSection() {
   const [draftUrl, setDraftUrl] = useState('')
   const [draftUsername, setDraftUsername] = useState('')
   const [draftPassword, setDraftPassword] = useState('')
+  const [batchText, setBatchText] = useState('')
+
+  const batchMutation = useMutation({
+    mutationFn: () => batchAddProxies({
+      urls: batchText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
+    }),
+    onSuccess: (result) => {
+      setBatchText('')
+      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
+      toast.success(`代理池导入完成：成功 ${result.added} 条，跳过 ${result.errors} 条`)
+    },
+    onError: (error) => toast.error(`代理池导入失败：${extractErrorMessage(error)}`),
+  })
+
+  const usePoolProxyMutation = useMutation({
+    mutationFn: (url: string) => setGlobalProxy({ proxyUrl: url }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['global-proxy'] }),
+    onError: (error) => toast.error(`设置全局代理失败：${extractErrorMessage(error)}`),
+  })
 
   useEffect(() => {
     setDraftUrl(currentUrl ?? '')
@@ -190,6 +216,53 @@ export function NetworkSection() {
           </SettingRow>
         </>
       )}
+
+      <SettingRow
+        label="同步代理池"
+        hint="与凭据管理中的代理池共用数据；每行一个完整 URL，可包含用户名和密码"
+        pending={batchMutation.isPending || usePoolProxyMutation.isPending}
+      >
+        <div className="w-full space-y-2">
+          <textarea
+            value={batchText}
+            onChange={(event) => setBatchText(event.target.value)}
+            placeholder={'socks5://用户名:密码@主机:端口\nsocks5://用户名:密码@主机:端口'}
+            className="min-h-[76px] w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-[12px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+            spellCheck={false}
+          />
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => batchMutation.mutate()}
+              disabled={batchMutation.isPending || !batchText.trim()}
+            >
+              批量导入到代理池
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              已有 {proxyPool?.total ?? 0} 条
+            </span>
+          </div>
+          {proxyPool && proxyPool.proxies.length > 0 && (
+            <div className="max-h-36 space-y-1 overflow-y-auto rounded-md border p-1.5">
+              {proxyPool.proxies.filter((proxy) => proxy.enabled).map((proxy) => (
+                <div key={proxy.id} className="flex items-center justify-between gap-2 px-1 text-xs">
+                  <span className="min-w-0 truncate font-mono" title={proxy.url}>{maskProxyUrl(proxy.url)}</span>
+                  <Button
+                    size="sm"
+                    variant={proxy.url === currentUrl ? 'secondary' : 'ghost'}
+                    className="h-7 shrink-0 px-2 text-xs"
+                    onClick={() => usePoolProxyMutation.mutate(proxy.url)}
+                    disabled={usePoolProxyMutation.isPending || proxy.url === currentUrl}
+                  >
+                    {proxy.url === currentUrl ? '当前全局' : '设为全局'}
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </SettingRow>
     </SettingGroup>
   )
 }
