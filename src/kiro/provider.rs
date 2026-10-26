@@ -110,6 +110,9 @@ impl ClientCache {
 pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    /// 本次请求占用的账号并发位。调用方必须一直持有到响应体读完（流式请求即整条流
+    /// 结束），读完后尽早释放，否则该账号的并发计数会偏高或偏低。
+    pub permit: Option<crate::kiro::concurrency::SharedPermit>,
 }
 
 /// A successful MCP HTTP response whose trace attempt is finalized after body validation.
@@ -924,6 +927,7 @@ impl KiroProvider {
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
+                    permit: ctx.permit.take(),
                 });
             }
 

@@ -5,6 +5,8 @@ import {
   useSetModelApiRetryConfig,
   useAccountRpmLimitConfig,
   useSetAccountRpmLimitConfig,
+  useAccountConcurrencyConfig,
+  useSetAccountConcurrencyConfig,
   useQuotaResetRecoveryConfig,
   useSetQuotaResetRecoveryConfig,
   useLoadBalancingMode,
@@ -28,6 +30,10 @@ const SECS_PER_MIN = 60
 // 与后端 SetAccountRpmLimitConfigRequest 的校验区间保持一致
 const MIN_RPM_LIMIT = 1
 const MAX_RPM_LIMIT = 100000
+// 与后端 set_account_concurrency_config 的校验区间保持一致
+const MIN_CONCURRENCY_LIMIT = 1
+const MAX_CONCURRENCY_LIMIT = 1000
+const MAX_CONCURRENCY_WAIT_SECS = 600
 
 /**
  * 调度分区：凭据怎么选、失败怎么转、禁用怎么恢复。
@@ -42,6 +48,7 @@ export function DispatchSection() {
       <LoadBalancingGroup />
       <ApiDomainGroup />
       <RateLimitHandlingGroup />
+      <ConcurrencyLimitGroup />
       <RpmLimitGroup />
       <QuotaResetRecoveryGroup />
       <SelfHealGroup />
@@ -172,6 +179,81 @@ function RateLimitHandlingGroup() {
 }
 
 /**
+ * 单账号并发控制。
+ *
+ * 一个请求从选中账号起占用一个并发位，直到响应读完（流式即整条流结束）才归还。
+ * 满载的账号暂时不参与调度；粘性会话先等自己绑定的账号，等不到再换号，
+ * 保住上游 prompt cache。
+ */
+function ConcurrencyLimitGroup() {
+  const { data, isLoading } = useAccountConcurrencyConfig()
+  const { mutate } = useSetAccountConcurrencyConfig()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const enabled = data?.enabled ?? true
+  const disabled = isLoading || !enabled
+
+  return (
+    <SettingGroup
+      title="单账号并发"
+      description="限制每个账号同时处理的请求数，单号并发过高最容易触发上游风控"
+    >
+      <SettingSwitch
+        label="启用并发控制"
+        hint={
+          enabled
+            ? '满载的凭据暂不参与调度，请求转给其它空闲凭据或排队等待'
+            : '关闭时不限制同一账号的同时请求数'
+        }
+        checked={enabled}
+        onChange={(next) => saver.save('enabled', { enabled: next })}
+        pending={saver.isSaving('enabled')}
+        saved={saver.isSaved('enabled')}
+        disabled={isLoading}
+      />
+      <SettingNumber
+        label="默认并发上限"
+        hint="每个凭据同时处理的请求数上限；可在凭据编辑里按账号单独覆盖"
+        value={data?.limit ?? 3}
+        onCommit={(n) => saver.save('limit', { limit: n })}
+        min={MIN_CONCURRENCY_LIMIT}
+        max={MAX_CONCURRENCY_LIMIT}
+        unit="个"
+        presets={[1, 2, 3, 5, 10]}
+        pending={saver.isSaving('limit')}
+        saved={saver.isSaved('limit')}
+        disabled={disabled}
+      />
+      <SettingNumber
+        label="粘性会话等待"
+        hint="会话绑定的凭据满载时，最多等它空出多久；超时换到其它凭据（会丢失该会话的上游缓存）。0 = 立即换号"
+        value={data?.stickyWaitSecs ?? 15}
+        onCommit={(n) => saver.save('sticky', { stickyWaitSecs: n })}
+        min={0}
+        max={MAX_CONCURRENCY_WAIT_SECS}
+        unit="秒"
+        presets={[0, 5, 15, 30]}
+        pending={saver.isSaving('sticky')}
+        saved={saver.isSaved('sticky')}
+        disabled={disabled}
+      />
+      <SettingNumber
+        label="满载排队上限"
+        hint="所有可用凭据都满载时，请求最多排队多久；超时返回 429（Retry-After 5 秒）。0 = 不排队"
+        value={data?.queueWaitSecs ?? 60}
+        onCommit={(n) => saver.save('queue', { queueWaitSecs: n })}
+        min={0}
+        max={MAX_CONCURRENCY_WAIT_SECS}
+        unit="秒"
+        presets={[0, 30, 60, 120]}
+        pending={saver.isSaving('queue')}
+        saved={saver.isSaved('queue')}
+        disabled={disabled}
+      />
+    </SettingGroup>
+  )
+}
+
+/**
  * 单账号 RPM 主动限流。
  *
  * 紧跟「上游 429 处理」是有意的：两者都是账号级限速，区别只在谁先动手 ——
@@ -204,7 +286,7 @@ function RpmLimitGroup() {
       />
       <SettingNumber
         label="每分钟上限"
-        hint="单个凭据 60 秒内最多放行多少请求。所有凭据都超限时请求返回 429"
+        hint="单个凭据 60 秒内最多放行多少请求，可在凭据编辑里按账号单独覆盖。所有凭据都超限时请求返回 429"
         value={limit}
         onCommit={(n) => saver.save('limit', { limit: n })}
         min={MIN_RPM_LIMIT}

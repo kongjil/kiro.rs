@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as TokioMutex, Semaphore};
+use tokio::sync::{Mutex as TokioMutex, Notify, Semaphore};
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::concurrency::{ConcurrencyPermit, SharedPermit};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
@@ -990,6 +991,8 @@ struct CredentialEntry {
     /// 队列长度达到 `account_rpm_limit` 时该凭据本窗口内被排除出候选。
     /// 不持久化，进程重启后清空；限流关闭时始终为空。
     rpm_window: VecDeque<Instant>,
+    /// 正在处理的模型请求数。由 [`ConcurrencyPermit`] 加减：选中时加一，响应读完释放。
+    in_flight: Arc<AtomicU32>,
     /// 当前凭据连续执行自愈的轮数。同一凭据成功后清零。
     self_heal_consecutive_rounds: u32,
     /// 当前凭据累计被自愈恢复的次数。
@@ -1179,6 +1182,22 @@ pub struct CredentialEntrySnapshot {
     /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    /// 正在处理的模型请求数
+    pub in_flight: u32,
+    /// 本账号的并发上限覆盖（None = 跟随全局）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
+    /// 当前生效的并发上限（None = 不限：全局关闭或本账号设为 0）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_max_concurrency: Option<u32>,
+    /// 本账号的 RPM 上限覆盖（None = 跟随全局）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_limit: Option<u32>,
+    /// 当前生效的 RPM 上限（None = 不限）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_rpm_limit: Option<u32>,
+    /// 最近 60 秒内已发起的请求数（RPM 限流关闭时为 0）
+    pub rpm_used: u32,
 }
 
 /// 凭据管理器状态快照
@@ -1260,6 +1279,16 @@ pub struct MultiTokenManager {
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
     account_rpm_limit: AtomicU32,
+    /// 单账号并发上限开关（运行时可修改）
+    account_concurrency_limit_enabled: AtomicBool,
+    /// 单账号默认并发上限（运行时可修改；账号可单独覆盖）
+    account_concurrency_limit: AtomicU32,
+    /// 粘性会话等绑定账号空出并发位的最长秒数（运行时可修改）
+    account_concurrency_sticky_wait_secs: AtomicU64,
+    /// 所有账号并发都满时排队等待的最长秒数（运行时可修改）
+    account_concurrency_queue_wait_secs: AtomicU64,
+    /// 有并发位释放（或配置放宽）时唤醒排队中的请求
+    concurrency_released: Arc<Notify>,
     /// 是否识别 403 封禁文案并立即禁用（运行时可修改）
     suspended_detection_enabled: AtomicBool,
     /// 全账号自愈总开关（运行时可修改）
@@ -1301,6 +1330,14 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 
 /// 单账号 RPM 限流的滑动窗口长度（秒）。固定 60 秒 = 每分钟。
 const RPM_WINDOW_SECS: u64 = 60;
+/// 所有账号并发都满、排队超时后返回给客户端的 Retry-After（秒）。
+const CONCURRENCY_RETRY_AFTER_SECS: u64 = 5;
+/// 单账号并发上限的取值上限。
+pub const MAX_ACCOUNT_CONCURRENCY: u32 = 1_000;
+/// 单账号 RPM 上限的取值上限。
+pub const MAX_ACCOUNT_RPM: u32 = 100_000;
+/// 并发等待时间的取值上限（秒）。
+const MAX_CONCURRENCY_WAIT_SECS: u64 = 600;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -1316,6 +1353,9 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 本次模型请求占用的账号并发位；随调用结果传递，直到响应体读完才释放。
+    /// MCP / 管理端只读查询不占位，为 None。
+    pub permit: Option<SharedPermit>,
 }
 
 pub struct IdcReloginCredentials {
@@ -1453,6 +1493,7 @@ impl MultiTokenManager {
                     last_used_at: None,
                     throttled_until: None,
                     rpm_window: VecDeque::new(),
+                    in_flight: Arc::new(AtomicU32::new(0)),
                     self_heal_consecutive_rounds: cred.self_heal_consecutive_rounds,
                     self_heal_total_count: cred.self_heal_total_count,
                     last_self_heal_at,
@@ -1512,6 +1553,10 @@ impl MultiTokenManager {
         let model_api_429_retry_enabled = config.model_api_429_retry_enabled;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
+        let concurrency_enabled = config.account_concurrency_limit_enabled;
+        let concurrency_limit = config.account_concurrency_limit;
+        let concurrency_sticky_wait = config.account_concurrency_sticky_wait_secs;
+        let concurrency_queue_wait = config.account_concurrency_queue_wait_secs;
         let suspended_detection_enabled = config.suspended_detection_enabled;
         let self_heal_enabled = config.self_heal_enabled;
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
@@ -1537,6 +1582,11 @@ impl MultiTokenManager {
             model_api_429_retry_enabled: AtomicBool::new(model_api_429_retry_enabled),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
+            account_concurrency_limit_enabled: AtomicBool::new(concurrency_enabled),
+            account_concurrency_limit: AtomicU32::new(concurrency_limit),
+            account_concurrency_sticky_wait_secs: AtomicU64::new(concurrency_sticky_wait),
+            account_concurrency_queue_wait_secs: AtomicU64::new(concurrency_queue_wait),
+            concurrency_released: Arc::new(Notify::new()),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
             self_heal_enabled: AtomicBool::new(self_heal_enabled),
             self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
@@ -1930,25 +1980,81 @@ impl MultiTokenManager {
             && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
     }
 
+    /// 该账号当前生效的 RPM 上限；None 表示不限（全局关闭，或本账号覆盖为 0）。
+    fn rpm_limit_for(&self, entry: &CredentialEntry) -> Option<usize> {
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let limit = entry
+            .credentials
+            .rpm_limit
+            .unwrap_or_else(|| self.account_rpm_limit.load(Ordering::Relaxed));
+        (limit > 0).then_some(limit as usize)
+    }
+
+    /// 该账号当前生效的并发上限；None 表示不限（全局关闭，或本账号覆盖为 0）。
+    fn concurrency_limit_for(&self, entry: &CredentialEntry) -> Option<u32> {
+        if !self.account_concurrency_limit_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let limit = entry
+            .credentials
+            .max_concurrency
+            .unwrap_or_else(|| self.account_concurrency_limit.load(Ordering::Relaxed));
+        (limit > 0).then_some(limit)
+    }
+
+    /// 该账号的并发位是否已占满。
+    fn concurrency_full(&self, entry: &CredentialEntry) -> bool {
+        self.concurrency_limit_for(entry)
+            .is_some_and(|limit| entry.in_flight.load(Ordering::Acquire) >= limit)
+    }
+
+    /// 可用且还有并发位：为模型请求选号时用。
+    ///
+    /// 「并发满」只影响选号，不算不可用——故障转移判断「是否还有其它可用账号」时
+    /// 仍按 [`Self::entry_available_for_request`]，忙碌账号不会让请求误判为凭据耗尽。
+    fn entry_selectable(
+        &self,
+        entry: &CredentialEntry,
+        model: Option<&str>,
+        group: Option<&str>,
+        now: Instant,
+    ) -> bool {
+        self.entry_available_for_request(entry, model, group, now) && !self.concurrency_full(entry)
+    }
+
+    /// 选号用的可用性判断：`need_slot` 为 false（MCP、Admin 只读查询）时不看并发位。
+    fn entry_pickable(
+        &self,
+        entry: &CredentialEntry,
+        model: Option<&str>,
+        group: Option<&str>,
+        now: Instant,
+        need_slot: bool,
+    ) -> bool {
+        if need_slot {
+            self.entry_selectable(entry, model, group, now)
+        } else {
+            self.entry_available_for_request(entry, model, group, now)
+        }
+    }
+
     /// 判断凭据在当前 60 秒滑动窗口内是否已达到 RPM 上限。
     ///
     /// 限流未开启时恒为 `false`（不参与调度判断）。只读判断，不修改窗口；
     /// 过期时间戳的实际清理发生在 [`Self::record_request`]。
     fn rpm_exceeded(&self, entry: &CredentialEntry, now: Instant) -> bool {
-        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+        let Some(limit) = self.rpm_limit_for(entry) else {
             return false;
-        }
-        let limit = self.account_rpm_limit.load(Ordering::Relaxed);
-        if limit == 0 {
-            return false;
-        }
+        };
         let window = StdDuration::from_secs(RPM_WINDOW_SECS);
         let fresh = entry
             .rpm_window
             .iter()
             .filter(|&&ts| now.duration_since(ts) < window)
             .count();
-        fresh as u32 >= limit
+        fresh >= limit
     }
 
     /// 当所有其它条件均满足的候选都耗尽 RPM 额度时，返回最早可重试秒数。
@@ -1960,10 +2066,6 @@ impl MultiTokenManager {
         now: Instant,
     ) -> Option<u64> {
         if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
-            return None;
-        }
-        let limit = self.account_rpm_limit.load(Ordering::Relaxed) as usize;
-        if limit == 0 {
             return None;
         }
 
@@ -1979,6 +2081,10 @@ impl MultiTokenManager {
                 && credential_matches_request(&entry.credentials, model, group)
                 && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         }) {
+            // 本账号不限 RPM：还有额度，不是 RPM 打满
+            let Some(limit) = self.rpm_limit_for(entry) else {
+                return None;
+            };
             let fresh_count = entry
                 .rpm_window
                 .iter()
@@ -2014,41 +2120,90 @@ impl MultiTokenManager {
         earliest_retry_after
     }
 
-    /// 尝试为一次真实业务请求预留 RPM 额度。
-    ///
-    /// 在同一把 `entries` 锁内完成过期清理、上限检查和记账，避免多个并发请求
-    /// 在选择阶段同时通过检查后全部写入窗口。返回 `false` 表示额度已被其它请求
-    /// 抢先占用，调用方应重新选择凭据。
+    /// 尝试为一次真实业务请求预留 RPM 额度（不占并发位）。
+    #[cfg(test)]
     fn record_request(&self, id: u64) -> bool {
+        self.reserve_request(id, false).is_some()
+    }
+
+    /// 为一次真实业务请求预留额度：RPM 记一次；`take_slot` 时再占一个并发位。
+    ///
+    /// 在同一把 `entries` 锁内完成检查和记账，避免多个并发请求在选择阶段同时通过
+    /// 检查后全部写入。返回 `None` 表示额度或并发位已被其它请求抢先占用，调用方应
+    /// 重新选择凭据；`Some(permit)` 中的 permit 在 `take_slot` 为 false 时为 None。
+    fn reserve_request(&self, id: u64, take_slot: bool) -> Option<Option<SharedPermit>> {
         let now = Instant::now();
         let window = StdDuration::from_secs(RPM_WINDOW_SECS);
         let mut entries = self.entries.lock();
-        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
-            return false;
-        };
-        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
-            if !entry.rpm_window.is_empty() {
-                entry.rpm_window.clear();
+        let entry = entries.iter_mut().find(|e| e.id == id)?;
+
+        // 并发位：先检查，RPM 也通过后才真正占用
+        if take_slot && self.concurrency_full(entry) {
+            return None;
+        }
+
+        match self.rpm_limit_for(entry) {
+            None => entry.rpm_window.clear(),
+            Some(limit) => {
+                while let Some(&front) = entry.rpm_window.front() {
+                    if now.duration_since(front) >= window {
+                        entry.rpm_window.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                if entry.rpm_window.len() >= limit {
+                    return None;
+                }
+                entry.rpm_window.push_back(now);
             }
-            return true;
         }
-        let limit = self.account_rpm_limit.load(Ordering::Relaxed);
-        if limit == 0 {
-            entry.rpm_window.clear();
-            return true;
+
+        if !take_slot {
+            return Some(None);
         }
-        while let Some(&front) = entry.rpm_window.front() {
-            if now.duration_since(front) >= window {
-                entry.rpm_window.pop_front();
-            } else {
-                break;
+        entry.in_flight.fetch_add(1, Ordering::AcqRel);
+        Some(Some(Arc::new(ConcurrencyPermit::new(
+            entry.in_flight.clone(),
+            self.concurrency_released.clone(),
+        ))))
+    }
+
+    /// 等到 `ready` 成立或超时。并发位释放时被唤醒；另每秒复查一次，覆盖调高上限、
+    /// 关闭限制、账号恢复这类不会触发唤醒的变化。
+    async fn wait_for_slot(
+        &self,
+        timeout: StdDuration,
+        ready: impl Fn(&[CredentialEntry], Instant) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let notified = self.concurrency_released.notified();
+            tokio::pin!(notified);
+            // 先登记再检查，避免检查与等待之间的释放被错过
+            notified.as_mut().enable();
+            if ready(&self.entries.lock(), Instant::now()) {
+                return true;
             }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let tick = deadline
+                .saturating_duration_since(now)
+                .min(StdDuration::from_secs(1));
+            let _ = tokio::time::timeout(tick, notified).await;
         }
-        if entry.rpm_window.len() >= limit as usize {
-            return false;
-        }
-        entry.rpm_window.push_back(now);
-        true
+    }
+
+    /// 是否有账号仅因并发满而选不上（其它条件都满足）。
+    fn has_busy_candidate(&self, model: Option<&str>, group: Option<&str>) -> bool {
+        let entries = self.entries.lock();
+        let now = Instant::now();
+        entries.iter().any(|entry| {
+            self.entry_available_for_request(entry, model, group, now)
+                && self.concurrency_full(entry)
+        })
     }
 
     fn has_available_for_request(
@@ -2073,18 +2228,29 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    #[cfg(test)]
     fn select_next_credential(
         &self,
         model: Option<&str>,
         group: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
+        self.select_credential(model, group, false)
+    }
+
+    /// 见 [`Self::select_next_credential`]；`need_slot` 为 true 时跳过并发已满的凭据。
+    fn select_credential(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        need_slot: bool,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
 
-        // 过滤可用凭据（已排除模型缓存明确不支持的凭据）
+        // 过滤可用的凭据（已排除模型缓存明确不支持的凭据；需要并发位时再排除满载的）
         let available: Vec<&CredentialEntry> = entries
             .iter()
-            .filter(|e| self.entry_available_for_request(e, model, group, now))
+            .filter(|e| self.entry_pickable(e, model, group, now, need_slot))
             .collect();
 
         if available.is_empty() {
@@ -2131,7 +2297,8 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context_impl(model, group, None, true)
+        // MCP 等短请求：计 RPM，不占并发位
+        self.acquire_context_impl(model, group, None, true, false)
             .await
             .map(|(context, _, _)| context)
     }
@@ -2147,7 +2314,8 @@ impl MultiTokenManager {
         group: Option<&str>,
         session: Option<&str>,
     ) -> anyhow::Result<(CallContext, RouteDecision)> {
-        self.acquire_context_impl(model, group, session, true)
+        // 模型对话请求：计 RPM 并占一个并发位
+        self.acquire_context_impl(model, group, session, true, true)
             .await
             .map(|(context, _, route)| (context, route))
     }
@@ -2166,19 +2334,22 @@ impl MultiTokenManager {
         &self.session_affinity
     }
 
-    /// 粘性候选：会话有绑定、绑定凭据存在且当前可用 → 直接返回该凭据。
-    /// 同时给出判定结果与「选号前的绑定」供 trace 使用。
+    /// 粘性候选：会话有绑定、绑定凭据存在、当前可用（`need_slot` 时还要有并发位）
+    /// → 直接返回该凭据。同时给出判定结果与「选号前的绑定」供 trace 使用。
+    ///
+    /// 第三个返回值：绑定账号可用但并发已满时为其 id，调用方据此先等它空出。
     fn sticky_candidate(
         &self,
         session: Option<&str>,
         model: Option<&str>,
         group: Option<&str>,
-    ) -> (Option<(u64, KiroCredentials)>, RouteDecision) {
+        need_slot: bool,
+    ) -> (Option<(u64, KiroCredentials)>, RouteDecision, Option<u64>) {
         let Some(session) = session else {
-            return (None, RouteDecision::none());
+            return (None, RouteDecision::none(), None);
         };
         if !self.session_affinity.is_enabled() {
-            return (None, RouteDecision::none());
+            return (None, RouteDecision::none(), None);
         }
         let Some(bound_id) = self.session_affinity.lookup(session) else {
             return (
@@ -2187,15 +2358,19 @@ impl MultiTokenManager {
                     sticky_outcome: StickyOutcome::MissFirst,
                     previous_credential_id: None,
                 },
+                None,
             );
         };
         let entries = self.entries.lock();
         let now = Instant::now();
-        let pick = entries
+        let available = entries
             .iter()
             .find(|e| e.id == bound_id)
-            .filter(|e| self.entry_available_for_request(e, model, group, now))
+            .filter(|e| self.entry_available_for_request(e, model, group, now));
+        let pick = available
+            .filter(|e| !need_slot || !self.concurrency_full(e))
             .map(|e| (e.id, e.credentials.clone()));
+        let busy = (available.is_some() && pick.is_none()).then_some(bound_id);
         let outcome = if pick.is_some() {
             StickyOutcome::Hit
         } else {
@@ -2207,6 +2382,7 @@ impl MultiTokenManager {
                 sticky_outcome: outcome,
                 previous_credential_id: Some(bound_id),
             },
+            busy,
         )
     }
 
@@ -2214,16 +2390,25 @@ impl MultiTokenManager {
     ///
     /// `update_current` 仅应在真实业务请求中开启。Admin 模型发现需要复用同一套
     /// 凭据选择和 Token 刷新规则，但不应因只读查询改变调度状态。
+    ///
+    /// `take_slot`：是否为本次请求占用账号并发位（仅模型对话请求）。账号并发满时：
+    /// 粘性会话先等绑定账号空出（`account_concurrency_sticky_wait_secs`），超时换号；
+    /// 所有账号都满时排队（`account_concurrency_queue_wait_secs`），超时返回 429。
     async fn acquire_context_impl(
         &self,
         model: Option<&str>,
         group: Option<&str>,
         session: Option<&str>,
         update_current: bool,
+        take_slot: bool,
     ) -> anyhow::Result<(CallContext, bool, RouteDecision)> {
+        let take_slot = take_slot && update_current;
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
+        // 每次请求最多等一次绑定账号、排一次队
+        let mut sticky_waited = false;
+        let mut queue_waited = false;
 
         loop {
             if attempt_count >= max_attempts {
@@ -2240,13 +2425,75 @@ impl MultiTokenManager {
                 // 会话粘性优先：绑定凭据仍可用就沿用，保住上游按账号隔离的 prompt cache。
                 // 粘性未命中时两种模式都按当前请求重新选择。priority 模式不能复用 current_id，
                 // 否则高优先级凭据从 RPM/冷却恢复后无法在下一次请求立即回切。
-                let (sticky_pick, route) = self.sticky_candidate(session, model, group);
-                let mut best = sticky_pick.or_else(|| self.select_next_credential(model, group));
+                let (sticky_pick, route, busy_bound) =
+                    self.sticky_candidate(session, model, group, take_slot);
+
+                // 绑定账号只是并发满：先等它空出，尽量不换号（换号后上游 prompt cache 作废）。
+                if sticky_pick.is_none() && take_slot && !sticky_waited {
+                    if let Some(bound_id) = busy_bound {
+                        sticky_waited = true;
+                        let wait = StdDuration::from_secs(
+                            self.account_concurrency_sticky_wait_secs.load(Ordering::Relaxed),
+                        );
+                        if !wait.is_zero() {
+                            let freed = self
+                                .wait_for_slot(wait, |entries, now| {
+                                    entries.iter().any(|e| {
+                                        e.id == bound_id
+                                            && self.entry_selectable(e, model, group, now)
+                                    })
+                                })
+                                .await;
+                            if freed {
+                                continue;
+                            }
+                            tracing::info!(
+                                credential_id = bound_id,
+                                wait_secs = wait.as_secs(),
+                                "粘性会话的绑定账号并发已满且等待超时，换号"
+                            );
+                        }
+                    }
+                }
+
+                let mut best =
+                    sticky_pick.or_else(|| self.select_credential(model, group, take_slot));
+
+                // 有账号可用、只是并发都满：排队等空位，不当作全灭去自愈。
+                let all_busy = best.is_none() && take_slot && self.has_busy_candidate(model, group);
 
                 // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
                 // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
-                if best.is_none() && self.try_self_heal(model, group) {
-                    best = self.select_next_credential(model, group);
+                if best.is_none() && !all_busy && self.try_self_heal(model, group) {
+                    best = self.select_credential(model, group, take_slot);
+                }
+
+                // 并发都满：排队等空位，超时回 429。
+                if all_busy {
+                    let wait = StdDuration::from_secs(
+                        self.account_concurrency_queue_wait_secs.load(Ordering::Relaxed),
+                    );
+                    if !queue_waited && !wait.is_zero() {
+                        queue_waited = true;
+                        let freed = self
+                            .wait_for_slot(wait, |entries, now| {
+                                entries
+                                    .iter()
+                                    .any(|e| self.entry_selectable(e, model, group, now))
+                            })
+                            .await;
+                        if freed {
+                            continue;
+                        }
+                    }
+                    tracing::warn!(
+                        wait_secs = wait.as_secs(),
+                        "所有可用账号并发已满，排队超时，返回 429"
+                    );
+                    return Err(UpstreamRateLimitError::new(Some(
+                        CONCURRENCY_RETRY_AFTER_SECS.to_string(),
+                    ))
+                    .into());
                 }
 
                 let (id, credentials) = if let Some((new_id, new_creds)) = best {
@@ -2278,11 +2525,14 @@ impl MultiTokenManager {
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
-                Ok(ctx) => {
-                    // 仅真实业务请求计入 RPM 窗口；Admin 只读模型发现不消耗额度。
-                    if update_current && !self.record_request(id) {
-                        // Token 获取期间额度可能被其它并发请求抢先占用；重新选号。
-                        continue;
+                Ok(mut ctx) => {
+                    // 仅真实业务请求计入 RPM 窗口 / 占并发位；Admin 只读模型发现不消耗额度。
+                    if update_current {
+                        match self.reserve_request(id, take_slot) {
+                            Some(permit) => ctx.permit = permit,
+                            // Token 获取期间额度或并发位可能被其它并发请求抢先占用；重新选号。
+                            None => continue,
+                        }
                     }
                     return Ok((ctx, is_balanced, route));
                 }
@@ -2372,6 +2622,7 @@ impl MultiTokenManager {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
             return Ok(CallContext {
+                permit: None,
                 id,
                 credentials: credentials.clone(),
                 token,
@@ -2442,6 +2693,7 @@ impl MultiTokenManager {
         }
 
         Ok(CallContext {
+            permit: None,
             id,
             credentials: creds,
             token,
@@ -3342,6 +3594,16 @@ impl MultiTokenManager {
                     source_channel: e.credentials.source_channel.clone(),
                     metadata: e.credentials.metadata.clone(),
                     created_at: e.credentials.created_at.clone(),
+                    in_flight: e.in_flight.load(Ordering::Acquire),
+                    max_concurrency: e.credentials.max_concurrency,
+                    effective_max_concurrency: self.concurrency_limit_for(e),
+                    rpm_limit: e.credentials.rpm_limit,
+                    effective_rpm_limit: self.rpm_limit_for(e).map(|v| v as u32),
+                    rpm_used: e
+                        .rpm_window
+                        .iter()
+                        .filter(|&&ts| now.duration_since(ts) < StdDuration::from_secs(RPM_WINDOW_SECS))
+                        .count() as u32,
                 })
                 .collect(),
             current_id,
@@ -3880,7 +4142,7 @@ impl MultiTokenManager {
     pub async fn get_available_models_for_current(
         &self,
     ) -> anyhow::Result<(u64, ListAvailableModelsResponse, bool)> {
-        let (context, is_balanced, _) = self.acquire_context_impl(None, None, None, false).await?;
+        let (context, is_balanced, _) = self.acquire_context_impl(None, None, None, false, false).await?;
         let id = context.id;
         let response = self.refresh_model_cache_for(id, true).await?;
         Ok((id, response, is_balanced))
@@ -4163,6 +4425,7 @@ impl MultiTokenManager {
                 last_used_at: None,
                 throttled_until: None,
                 rpm_window: VecDeque::new(),
+                in_flight: Arc::new(AtomicU32::new(0)),
                 self_heal_consecutive_rounds: 0,
                 self_heal_total_count: 0,
                 last_self_heal_at: None,
@@ -4768,8 +5031,8 @@ impl MultiTokenManager {
     ) -> anyhow::Result<()> {
         if let Some(value) = limit {
             // 限定合理范围：1..=100000。0 会被视为"不限"，故不接受，避免与关闭开关语义混淆。
-            if !(1..=100_000).contains(&value) {
-                anyhow::bail!("RPM 上限必须在 1..=100000 内: {}", value);
+            if !(1..=MAX_ACCOUNT_RPM).contains(&value) {
+                anyhow::bail!("RPM 上限必须在 1..={} 内: {}", MAX_ACCOUNT_RPM, value);
             }
         }
 
@@ -4815,6 +5078,119 @@ impl MultiTokenManager {
             config.account_rpm_limit_enabled = enabled;
             config.account_rpm_limit = limit;
         })
+    }
+
+    /// 获取单账号并发控制配置（Admin API）。
+    /// 返回：(是否启用, 默认上限, 粘性会话等待秒, 排队等待秒)。
+    pub fn get_account_concurrency_config(&self) -> (bool, u32, u64, u64) {
+        (
+            self.account_concurrency_limit_enabled.load(Ordering::Relaxed),
+            self.account_concurrency_limit.load(Ordering::Relaxed),
+            self.account_concurrency_sticky_wait_secs.load(Ordering::Relaxed),
+            self.account_concurrency_queue_wait_secs.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 设置单账号并发控制配置（Admin API）。任一参数传 `None` 表示不修改。
+    pub fn set_account_concurrency_config(
+        &self,
+        enabled: Option<bool>,
+        limit: Option<u32>,
+        sticky_wait_secs: Option<u64>,
+        queue_wait_secs: Option<u64>,
+    ) -> anyhow::Result<()> {
+        if let Some(value) = limit {
+            if !(1..=MAX_ACCOUNT_CONCURRENCY).contains(&value) {
+                anyhow::bail!("并发上限必须在 1..={} 内: {}", MAX_ACCOUNT_CONCURRENCY, value);
+            }
+        }
+        for value in [sticky_wait_secs, queue_wait_secs].into_iter().flatten() {
+            if value > MAX_CONCURRENCY_WAIT_SECS {
+                anyhow::bail!("等待时间必须在 0..={} 秒内: {}", MAX_CONCURRENCY_WAIT_SECS, value);
+            }
+        }
+
+        let _update_guard = self.runtime_config_update_lock.lock();
+        let prev = self.get_account_concurrency_config();
+        let next = (
+            enabled.unwrap_or(prev.0),
+            limit.unwrap_or(prev.1),
+            sticky_wait_secs.unwrap_or(prev.2),
+            queue_wait_secs.unwrap_or(prev.3),
+        );
+        if next == prev {
+            return Ok(());
+        }
+
+        let store = |(enabled, limit, sticky, queue): (bool, u32, u64, u64)| {
+            self.account_concurrency_limit_enabled
+                .store(enabled, Ordering::Relaxed);
+            self.account_concurrency_limit.store(limit, Ordering::Relaxed);
+            self.account_concurrency_sticky_wait_secs
+                .store(sticky, Ordering::Relaxed);
+            self.account_concurrency_queue_wait_secs
+                .store(queue, Ordering::Relaxed);
+        };
+        store(next);
+        if let Err(err) = self.update_config_file(move |config| {
+            config.account_concurrency_limit_enabled = next.0;
+            config.account_concurrency_limit = next.1;
+            config.account_concurrency_sticky_wait_secs = next.2;
+            config.account_concurrency_queue_wait_secs = next.3;
+        }) {
+            store(prev);
+            return Err(err);
+        }
+        // 放宽限制后让排队中的请求立即重试
+        self.concurrency_released.notify_waiters();
+        tracing::info!(
+            "单账号并发控制配置已更新: enabled={}, limit={}, sticky_wait={}s, queue_wait={}s",
+            next.0,
+            next.1,
+            next.2,
+            next.3
+        );
+        Ok(())
+    }
+
+    /// 设置单个账号的并发 / RPM 上限覆盖。
+    ///
+    /// 外层 `None` 表示不修改；内层 `None` 表示清除覆盖、跟随全局；`Some(0)` 表示本账号不限。
+    pub fn set_credential_limits(
+        &self,
+        id: u64,
+        max_concurrency: Option<Option<u32>>,
+        rpm_limit: Option<Option<u32>>,
+    ) -> anyhow::Result<()> {
+        if let Some(Some(value)) = max_concurrency {
+            if value > MAX_ACCOUNT_CONCURRENCY {
+                anyhow::bail!("并发上限必须在 0..={} 内: {}", MAX_ACCOUNT_CONCURRENCY, value);
+            }
+        }
+        if let Some(Some(value)) = rpm_limit {
+            if value > MAX_ACCOUNT_RPM {
+                anyhow::bail!("RPM 上限必须在 0..={} 内: {}", MAX_ACCOUNT_RPM, value);
+            }
+        }
+        if max_concurrency.is_none() && rpm_limit.is_none() {
+            return Ok(());
+        }
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if let Some(value) = max_concurrency {
+                entry.credentials.max_concurrency = value;
+            }
+            if let Some(value) = rpm_limit {
+                entry.credentials.rpm_limit = value;
+            }
+        }
+        self.persist_credentials()?;
+        self.concurrency_released.notify_waiters();
+        Ok(())
     }
 
     /// 获取自愈治理配置（Admin API）。
@@ -6406,7 +6782,7 @@ mod tests {
         let mut picked_other = false;
         for _ in 0..64 {
             let (context, is_balanced, _) = manager
-                .acquire_context_impl(None, None, None, false)
+                .acquire_context_impl(None, None, None, false, false)
                 .await
                 .unwrap();
             assert!(is_balanced);
@@ -7782,9 +8158,10 @@ mod tests {
         first.priority = 0;
         let mut second = grouped_cred("second", &[]);
         second.priority = 10;
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
-                .unwrap();
+        // 只验证粘性语义；各轮上下文都留在作用域里，关掉并发上限免得互相占位。
+        let mut config = Config::default();
+        config.account_concurrency_limit_enabled = false;
+        let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
 
         // 首轮：无绑定 → miss_first，priority 模式选 #1
         let (ctx, route) = manager
@@ -7882,6 +8259,294 @@ mod tests {
         assert_eq!(ctx.id, 2);
         assert_eq!(route.sticky_outcome, StickyOutcome::MissUnavailable);
         assert_eq!(route.previous_credential_id, Some(1));
+    }
+
+    /// 两个 priority 账号（#1 优先），并发上限与等待时间可配。
+    fn concurrency_manager(
+        limit: u32,
+        sticky_wait_secs: u64,
+        queue_wait_secs: u64,
+        creds: Vec<KiroCredentials>,
+    ) -> MultiTokenManager {
+        let mut config = Config::default();
+        config.account_concurrency_limit_enabled = true;
+        config.account_concurrency_limit = limit;
+        config.account_concurrency_sticky_wait_secs = sticky_wait_secs;
+        config.account_concurrency_queue_wait_secs = queue_wait_secs;
+        MultiTokenManager::new(config, creds, None, None, false).unwrap()
+    }
+
+    fn two_priority_creds() -> Vec<KiroCredentials> {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        vec![first, second]
+    }
+
+    fn entry_snapshot(manager: &MultiTokenManager, id: u64) -> CredentialEntrySnapshot {
+        manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|e| e.id == id)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_full_account_falls_through_and_recovers_on_release() {
+        let manager = concurrency_manager(1, 0, 0, two_priority_creds());
+
+        let (first, _) = manager.acquire_context_routed(None, None, None).await.unwrap();
+        assert_eq!(first.id, 1);
+        assert_eq!(entry_snapshot(&manager, 1).in_flight, 1);
+
+        let (second, _) = manager.acquire_context_routed(None, None, None).await.unwrap();
+        assert_eq!(second.id, 2, "#1 满载，落到 #2");
+
+        drop(first);
+        assert_eq!(entry_snapshot(&manager, 1).in_flight, 0);
+        let (again, _) = manager.acquire_context_routed(None, None, None).await.unwrap();
+        assert_eq!(again.id, 1, "#1 释放后立即回切");
+
+        drop((second, again));
+        assert_eq!(entry_snapshot(&manager, 1).in_flight, 0);
+        assert_eq!(entry_snapshot(&manager, 2).in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_all_busy_returns_rate_limit_error() {
+        let manager = concurrency_manager(1, 0, 0, vec![grouped_cred("only", &[])]);
+        let (_held, _) = manager.acquire_context_routed(None, None, None).await.unwrap();
+
+        let error = match manager.acquire_context_routed(None, None, None).await {
+            Ok(_) => panic!("满载且不排队时不应返回调用上下文"),
+            Err(error) => error,
+        };
+        let rate_limit = error
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("满载应返回类型化限流错误，HTTP 层映射为 429");
+        assert_eq!(rate_limit.retry_after(), Some("5"));
+    }
+
+    /// 满载只影响选号，不算凭据不可用：不能触发自愈把被禁用的账号放回来。
+    #[tokio::test]
+    async fn test_concurrency_all_busy_does_not_trigger_self_heal() {
+        let manager = concurrency_manager(1, 0, 0, two_priority_creds());
+        let (_held, _) = manager.acquire_context_routed(None, None, None).await.unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            let second = entries.iter_mut().find(|e| e.id == 2).unwrap();
+            second.disabled = true;
+            second.disabled_reason = Some(DisabledReason::TooManyFailures);
+        }
+
+        assert!(manager.acquire_context_routed(None, None, None).await.is_err());
+        assert!(entry_snapshot(&manager, 2).disabled, "满载不应自愈 #2");
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_queue_wakes_when_slot_released() {
+        let manager = concurrency_manager(1, 0, 30, vec![grouped_cred("only", &[])]);
+        let (held, _) = manager.acquire_context_routed(None, None, None).await.unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(200)).await;
+            drop(held);
+        });
+
+        let started = Instant::now();
+        let (ctx, _) = tokio::time::timeout(
+            StdDuration::from_secs(5),
+            manager.acquire_context_routed(None, None, None),
+        )
+        .await
+        .expect("并发位释放后应立即被唤醒，而不是等到排队超时")
+        .unwrap();
+        assert_eq!(ctx.id, 1);
+        assert!(started.elapsed() >= StdDuration::from_millis(150));
+        release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_disabling_limit_wakes_queued_requests() {
+        let manager = Arc::new(concurrency_manager(1, 0, 30, vec![grouped_cred("only", &[])]));
+        let (_held, _) = manager.acquire_context_routed(None, None, None).await.unwrap();
+        let waiter = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .acquire_context_routed(None, None, None)
+                    .await
+                    .map(|(ctx, _)| ctx.id)
+            })
+        };
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        manager
+            .set_account_concurrency_config(Some(false), None, None, None)
+            .unwrap();
+        let id = tokio::time::timeout(StdDuration::from_secs(5), waiter)
+            .await
+            .expect("关闭并发控制后排队请求应立即放行")
+            .unwrap()
+            .unwrap();
+        assert_eq!(id, 1);
+    }
+
+    /// 粘性会话：绑定账号满载时先等它空出，即便 #2 空闲也不换号。
+    #[tokio::test]
+    async fn test_sticky_session_waits_for_bound_account_slot() {
+        let manager = concurrency_manager(1, 10, 0, two_priority_creds());
+        manager.bind_session("s", 1);
+        let (held, _) = manager.acquire_context_routed(None, None, None).await.unwrap();
+        assert_eq!(held.id, 1);
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(200)).await;
+            drop(held);
+        });
+
+        let (ctx, route) = tokio::time::timeout(
+            StdDuration::from_secs(5),
+            manager.acquire_context_routed(None, None, Some("s")),
+        )
+        .await
+        .expect("绑定账号空出后应立即拿到")
+        .unwrap();
+        assert_eq!(ctx.id, 1);
+        assert_eq!(route.sticky_outcome, StickyOutcome::Hit);
+        release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sticky_session_switches_account_after_wait_timeout() {
+        let manager = concurrency_manager(1, 1, 0, two_priority_creds());
+        manager.bind_session("s", 1);
+        let (_held, _) = manager.acquire_context_routed(None, None, None).await.unwrap();
+
+        let started = Instant::now();
+        let (ctx, route) = manager
+            .acquire_context_routed(None, None, Some("s"))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= StdDuration::from_millis(900), "应先等满粘性等待时间");
+        assert_eq!(ctx.id, 2);
+        assert_eq!(route.sticky_outcome, StickyOutcome::MissUnavailable);
+        assert_eq!(route.previous_credential_id, Some(1));
+    }
+
+    /// MCP 等短请求不占并发位，也不被满载账号挡住。
+    #[tokio::test]
+    async fn test_slotless_acquire_ignores_concurrency_limit() {
+        let manager = concurrency_manager(1, 0, 0, vec![grouped_cred("only", &[])]);
+        let (_held, _) = manager.acquire_context_routed(None, None, None).await.unwrap();
+
+        let ctx = manager
+            .acquire_context(None, None)
+            .await
+            .expect("不占位的请求不受并发上限影响");
+        assert_eq!(ctx.id, 1);
+        assert!(ctx.permit.is_none());
+        assert_eq!(entry_snapshot(&manager, 1).in_flight, 1);
+    }
+
+    /// 并发抢位：同一时刻再多请求，也只有上限个拿到位。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrency_reservation_never_exceeds_limit_under_race() {
+        let manager = Arc::new(concurrency_manager(3, 0, 0, vec![grouped_cred("only", &[])]));
+        let tasks: Vec<_> = (0..16)
+            .map(|_| {
+                let manager = manager.clone();
+                tokio::spawn(async move { manager.acquire_context_routed(None, None, None).await })
+            })
+            .collect();
+        let mut held = Vec::new();
+        for task in tasks {
+            if let Ok((ctx, _)) = task.await.unwrap() {
+                held.push(ctx);
+            }
+        }
+        assert_eq!(held.len(), 3);
+        assert_eq!(entry_snapshot(&manager, 1).in_flight, 3);
+        drop(held);
+        assert_eq!(entry_snapshot(&manager, 1).in_flight, 0);
+    }
+
+    /// 单账号覆盖：0 = 本账号不限；具体值优先于全局；清除后跟随全局。
+    #[tokio::test]
+    async fn test_per_account_concurrency_override() {
+        let mut creds = two_priority_creds();
+        creds[0].max_concurrency = Some(0);
+        let manager = concurrency_manager(1, 0, 0, creds);
+
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            let (ctx, _) = manager.acquire_context_routed(None, None, None).await.unwrap();
+            assert_eq!(ctx.id, 1, "#1 覆盖为不限");
+            held.push(ctx);
+        }
+        let first = entry_snapshot(&manager, 1);
+        assert_eq!(first.max_concurrency, Some(0));
+        assert_eq!(first.effective_max_concurrency, None);
+        assert_eq!(first.in_flight, 5);
+
+        manager.set_credential_limits(1, Some(Some(2)), None).unwrap();
+        let (ctx, _) = manager.acquire_context_routed(None, None, None).await.unwrap();
+        assert_eq!(ctx.id, 2, "#1 覆盖改为 2 后已满载");
+        held.push(ctx);
+
+        manager.set_credential_limits(1, Some(None), None).unwrap();
+        let first = entry_snapshot(&manager, 1);
+        assert_eq!(first.max_concurrency, None);
+        assert_eq!(first.effective_max_concurrency, Some(1), "清除覆盖后跟随全局");
+
+        manager
+            .set_account_concurrency_config(Some(false), None, None, None)
+            .unwrap();
+        assert_eq!(entry_snapshot(&manager, 1).effective_max_concurrency, None);
+    }
+
+    /// 单账号 RPM 覆盖只在全局 RPM 开关打开时生效。
+    #[tokio::test]
+    async fn test_per_account_rpm_override() {
+        let mut config = Config::default();
+        config.account_rpm_limit_enabled = true;
+        config.account_rpm_limit = 100;
+        let mut creds = two_priority_creds();
+        creds[0].rpm_limit = Some(1);
+        let manager = MultiTokenManager::new(config, creds, None, None, false).unwrap();
+
+        assert_eq!(manager.acquire_context(None, None).await.unwrap().id, 1);
+        assert_eq!(
+            manager.acquire_context(None, None).await.unwrap().id,
+            2,
+            "#1 覆盖为每分钟 1 次"
+        );
+        let first = entry_snapshot(&manager, 1);
+        assert_eq!(first.effective_rpm_limit, Some(1));
+        assert_eq!(first.rpm_used, 1);
+        assert_eq!(entry_snapshot(&manager, 2).effective_rpm_limit, Some(100));
+
+        manager.set_account_rpm_limit_config(Some(false), None).unwrap();
+        assert_eq!(entry_snapshot(&manager, 1).effective_rpm_limit, None);
+        assert_eq!(manager.acquire_context(None, None).await.unwrap().id, 1);
+    }
+
+    #[test]
+    fn test_credential_limits_validate_range() {
+        let manager = concurrency_manager(1, 0, 0, two_priority_creds());
+        assert!(manager
+            .set_credential_limits(1, Some(Some(MAX_ACCOUNT_CONCURRENCY + 1)), None)
+            .is_err());
+        assert!(manager
+            .set_credential_limits(1, None, Some(Some(MAX_ACCOUNT_RPM + 1)))
+            .is_err());
+        assert!(manager.set_credential_limits(99, Some(Some(1)), None).is_err());
+        assert!(manager
+            .set_account_concurrency_config(None, Some(0), None, None)
+            .is_err());
+        assert!(manager
+            .set_account_concurrency_config(None, None, Some(601), None)
+            .is_err());
     }
 
     #[tokio::test]

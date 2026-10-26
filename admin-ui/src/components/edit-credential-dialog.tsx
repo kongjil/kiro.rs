@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
 import { useQuery } from '@tanstack/react-query'
-import { Tags, Settings2 } from 'lucide-react'
+import { Tags, Settings2, Gauge } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -21,7 +21,11 @@ import {
   SelectItem,
 } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
-import { useUpdateCredential } from '@/hooks/use-credentials'
+import {
+  useUpdateCredential,
+  useAccountConcurrencyConfig,
+  useAccountRpmLimitConfig,
+} from '@/hooks/use-credentials'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { getProxyPool } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl, cn } from '@/lib/utils'
@@ -29,12 +33,30 @@ import { GroupMultiSelect } from '@/components/group-select'
 import { CredentialMetadataEditor, metadataDefaults } from '@/components/credential-metadata-field'
 import type { CredentialMetadata, CredentialMetadataSchema, CredentialStatusItem } from '@/types/api'
 
-type TabKey = 'general' | 'metadata'
+type TabKey = 'general' | 'limits' | 'metadata'
 
 const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
   { key: 'general', label: '基本', icon: <Settings2 className="h-3.5 w-3.5" /> },
+  { key: 'limits', label: '限流', icon: <Gauge className="h-3.5 w-3.5" /> },
   { key: 'metadata', label: 'Metadata', icon: <Tags className="h-3.5 w-3.5" /> },
 ]
+
+// 与后端 MAX_ACCOUNT_CONCURRENCY / MAX_ACCOUNT_RPM 保持一致
+const MAX_CONCURRENCY = 1000
+const MAX_RPM = 100000
+
+/** 限流输入框 → 请求值：留空 = 跟随全局（null），否则须为 0..=max 的整数（0 = 不限） */
+function parseLimitInput(text: string, max: number): number | null | undefined {
+  const trimmed = text.trim()
+  if (trimmed === '') return null
+  const n = Number(trimmed)
+  return Number.isInteger(n) && n >= 0 && n <= max ? n : undefined
+}
+
+/** 「已用/上限」读数；上限缺省表示不限 */
+function usageText(used: number | undefined, limit: number | undefined): string {
+  return `${used ?? 0} / ${limit ?? '不限'}`
+}
 
 interface EditCredentialDialogProps {
   open: boolean
@@ -67,8 +89,12 @@ export function EditCredentialDialog({
     { ...metadataDefaults(metadataSchema), ...metadataValues(credential.metadata) },
   )
   const [manualMode, setManualMode] = useState(false)
+  const [maxConcurrency, setMaxConcurrency] = useState(credential.maxConcurrency?.toString() ?? '')
+  const [rpmLimit, setRpmLimit] = useState(credential.rpmLimit?.toString() ?? '')
 
   const groupOptions = useGroupOptions()
+  const { data: concurrencyConfig } = useAccountConcurrencyConfig()
+  const { data: rpmConfig } = useAccountRpmLimitConfig()
 
   const { data: proxyPool } = useQuery({
     queryKey: ['proxy-pool'],
@@ -91,6 +117,8 @@ export function EditCredentialDialog({
         ...metadataValues(credential.metadata),
       })
       setManualMode(false)
+      setMaxConcurrency(credential.maxConcurrency?.toString() ?? '')
+      setRpmLimit(credential.rpmLimit?.toString() ?? '')
     }
   }, [open, credential, metadataSchema])
 
@@ -98,6 +126,18 @@ export function EditCredentialDialog({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
+
+    const nextConcurrency = parseLimitInput(maxConcurrency, MAX_CONCURRENCY)
+    const nextRpm = parseLimitInput(rpmLimit, MAX_RPM)
+    if (nextConcurrency === undefined || nextRpm === undefined) {
+      setActiveTab('limits')
+      toast.error(
+        nextConcurrency === undefined
+          ? `并发上限需为 0~${MAX_CONCURRENCY} 的整数，留空跟随全局`
+          : `RPM 上限需为 0~${MAX_RPM} 的整数，留空跟随全局`,
+      )
+      return
+    }
 
     mutate(
       {
@@ -110,6 +150,8 @@ export function EditCredentialDialog({
           groups: groups,
           sourceChannel: sourceChannel,
           metadata,
+          maxConcurrency: nextConcurrency,
+          rpmLimit: nextRpm,
         },
       },
       {
@@ -143,7 +185,7 @@ export function EditCredentialDialog({
             编辑凭据 #{credential.id}
           </DialogTitle>
           <DialogDescription>
-            修改凭据标识、分组、Metadata 与代理配置。
+            修改凭据标识、分组、代理、限流与 Metadata。
           </DialogDescription>
         </DialogHeader>
 
@@ -290,6 +332,73 @@ export function EditCredentialDialog({
                   <p className="text-xs text-muted-foreground">
                     用户名/密码留空表示不修改；代理 URL 已包含凭据时无需填写
                   </p>
+                </div>
+              </>
+            )}
+
+            {activeTab === 'limits' && (
+              <>
+                <div className="space-y-2">
+                  <label htmlFor="maxConcurrency" className="text-sm font-medium">
+                    并发上限
+                  </label>
+                  <Input
+                    id="maxConcurrency"
+                    type="number"
+                    min={0}
+                    max={MAX_CONCURRENCY}
+                    step={1}
+                    placeholder={
+                      concurrencyConfig ? `跟随全局（${concurrencyConfig.limit}）` : '跟随全局'
+                    }
+                    value={maxConcurrency}
+                    onChange={(e) => setMaxConcurrency(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    本账号同时处理的请求数上限。留空跟随全局默认，0 表示本账号不限。
+                    {concurrencyConfig && !concurrencyConfig.enabled && (
+                      <span className="text-amber-600 dark:text-amber-400">
+                        {' '}全局并发控制已关闭，此设置暂不生效。
+                      </span>
+                    )}
+                  </p>
+                </div>
+
+                <div className="space-y-2">
+                  <label htmlFor="rpmLimit" className="text-sm font-medium">
+                    RPM 上限（次/分钟）
+                  </label>
+                  <Input
+                    id="rpmLimit"
+                    type="number"
+                    min={0}
+                    max={MAX_RPM}
+                    step={1}
+                    placeholder={rpmConfig ? `跟随全局（${rpmConfig.limit}）` : '跟随全局'}
+                    value={rpmLimit}
+                    onChange={(e) => setRpmLimit(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    本账号 60 秒内最多发起的请求数。留空跟随全局默认，0 表示本账号不限。
+                    {rpmConfig && !rpmConfig.enabled && (
+                      <span className="text-amber-600 dark:text-amber-400">
+                        {' '}全局 RPM 限流已关闭，此设置暂不生效。
+                      </span>
+                    )}
+                  </p>
+                </div>
+
+                <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                  当前负载：并发{' '}
+                  <span className="font-mono text-foreground">
+                    {usageText(credential.inFlight, credential.effectiveMaxConcurrency)}
+                  </span>
+                  {' · '}RPM{' '}
+                  <span className="font-mono text-foreground">
+                    {usageText(credential.rpmUsed, credential.effectiveRpmLimit)}
+                  </span>
                 </div>
               </>
             )}

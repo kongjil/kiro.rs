@@ -108,6 +108,18 @@ export interface CredentialStatusItem {
   createdAt?: string
   accountCostCny?: number
   costMultiplier?: number
+  /** 正在处理的模型请求数（占用的并发位） */
+  inFlight?: number
+  /** 本账号并发上限覆盖；undefined = 跟随全局，0 = 不限 */
+  maxConcurrency?: number
+  /** 当前生效的并发上限；undefined = 不限 */
+  effectiveMaxConcurrency?: number
+  /** 本账号 RPM 上限覆盖；undefined = 跟随全局，0 = 不限 */
+  rpmLimit?: number
+  /** 当前生效的 RPM 上限；undefined = 不限 */
+  effectiveRpmLimit?: number
+  /** 最近 60 秒内已发起的请求数 */
+  rpmUsed?: number
 }
 
 // 余额响应
@@ -232,6 +244,10 @@ export interface UpdateCredentialRequest {
   metadata?: CredentialMetadata
   accountCostCny?: number
   costMultiplier?: number
+  /** 本账号并发上限：undefined = 不修改，null = 跟随全局，0 = 不限 */
+  maxConcurrency?: number | null
+  /** 本账号 RPM 上限：undefined = 不修改，null = 跟随全局，0 = 不限 */
+  rpmLimit?: number | null
 }
 
 // 更新 refreshToken 请求

@@ -100,6 +100,22 @@ pub struct CredentialStatusItem {
     pub account_cost_cny: Option<f64>,
     /// 原始消费的账号成本倍率。
     pub cost_multiplier: f64,
+    /// 正在处理的模型请求数（占用的并发位）
+    pub in_flight: u32,
+    /// 本账号的并发上限覆盖（None = 跟随全局，0 = 不限）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
+    /// 当前生效的并发上限（None = 不限）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_max_concurrency: Option<u32>,
+    /// 本账号的 RPM 上限覆盖（None = 跟随全局，0 = 不限）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_limit: Option<u32>,
+    /// 当前生效的 RPM 上限（None = 不限）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_rpm_limit: Option<u32>,
+    /// 最近 60 秒内已发起的请求数
+    pub rpm_used: u32,
 }
 
 /// 单个凭据 metadata 字段的可展示信息。
@@ -285,6 +301,22 @@ pub struct UpdateCredentialRequest {
     pub account_cost_cny: Option<f64>,
     #[serde(default)]
     pub cost_multiplier: Option<f64>,
+    /// 本账号并发上限：省略 = 不修改，null = 跟随全局，0 = 不限
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub max_concurrency: Option<Option<u32>>,
+    /// 本账号 RPM 上限：省略 = 不修改，null = 跟随全局，0 = 不限
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub rpm_limit: Option<Option<u32>>,
+}
+
+/// 区分「字段省略」与「显式 null」：配合 `#[serde(default)]`，省略得到外层 `None`，
+/// null 得到 `Some(None)`。
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// 添加凭据成功响应
@@ -576,6 +608,37 @@ pub struct SetAccountRpmLimitConfigRequest {
     /// 每分钟上限；缺省表示不修改，1..=100000
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// 单账号并发控制配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountConcurrencyConfigResponse {
+    /// 是否启用单账号并发控制
+    pub enabled: bool,
+    /// 每账号默认同时处理的请求数上限（可被单账号覆盖）
+    pub limit: u32,
+    /// 粘性会话绑定的账号满载时，最多等它空出的秒数；超时后换号
+    pub sticky_wait_secs: u64,
+    /// 所有账号都满载时最多排队的秒数；超时返回 429
+    pub queue_wait_secs: u64,
+}
+
+/// 更新单账号并发控制配置（字段缺省表示不修改）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountConcurrencyConfigRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 1..=1000
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// 0..=600
+    #[serde(default)]
+    pub sticky_wait_secs: Option<u64>,
+    /// 0..=600
+    #[serde(default)]
+    pub queue_wait_secs: Option<u64>,
 }
 
 /// 月度额度重置后自动恢复配置响应。

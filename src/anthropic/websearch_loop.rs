@@ -565,6 +565,8 @@ async fn run_round(
         tracer,
     )
     .await;
+    // 本轮响应已读完：归还账号并发位（接下来的 MCP 搜索与下一轮各自另算）
+    drop(call_result.permit);
     // Carry the declared tool names (original + shortened) so the flush step can run the
     // shared `<invoke>` text-leak fault tolerance with a correct tool-table guard.
     outcome.known_tool_names = conversion.known_tool_names;

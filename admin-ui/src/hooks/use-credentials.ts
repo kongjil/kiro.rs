@@ -24,6 +24,8 @@ import {
   setModelApiRetryConfig,
   getAccountRpmLimitConfig,
   setAccountRpmLimitConfig,
+  getAccountConcurrencyConfig,
+  setAccountConcurrencyConfig,
   getQuotaResetRecoveryConfig,
   setQuotaResetRecoveryConfig,
   getSelfHealConfig,
@@ -340,6 +342,28 @@ export function useSetAccountRpmLimitConfig() {
     mutationFn: setAccountRpmLimitConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountRpmLimitConfig'] })
+      // 凭据卡片上的「生效 RPM 上限」随之变化
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 获取单账号并发控制配置
+export function useAccountConcurrencyConfig() {
+  return useQuery({
+    queryKey: ['accountConcurrencyConfig'],
+    queryFn: getAccountConcurrencyConfig,
+  })
+}
+
+// 更新单账号并发控制配置
+export function useSetAccountConcurrencyConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setAccountConcurrencyConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['accountConcurrencyConfig'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

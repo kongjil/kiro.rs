@@ -152,6 +152,11 @@ function formatResetDate(ts: number | null): string {
   });
 }
 
+/** 负载读数「已用/上限」；上限缺省（全局关闭或本账号设为不限）时只显示已用 */
+function loadText(used: number | undefined, limit: number | undefined): string {
+  return limit === undefined ? `${used ?? 0}` : `${used ?? 0}/${limit}`;
+}
+
 /** 把秒数格式化为 `mm:ss` 或 `hh:mm:ss` */
 function formatThrottleCountdown(secs: number): string {
   const total = Math.max(0, Math.floor(secs));
@@ -556,6 +561,20 @@ function CredentialCardImpl({
       onError: (err) => toast.error("删除失败: " + (err as Error).message),
     });
   };
+
+  const inFlight = credential.inFlight ?? 0;
+  const concurrencyFull =
+    credential.effectiveMaxConcurrency !== undefined &&
+    inFlight >= credential.effectiveMaxConcurrency;
+  const loadTitle =
+    `并发 ${inFlight} / ${credential.effectiveMaxConcurrency ?? "不限"}` +
+    ` · RPM ${credential.rpmUsed ?? 0} / ${credential.effectiveRpmLimit ?? "不限"}` +
+    (credential.maxConcurrency !== undefined || credential.rpmLimit !== undefined
+      ? "（含本账号覆盖）"
+      : "");
+  const loadClass = concurrencyFull
+    ? "text-amber-600 dark:text-amber-400"
+    : "text-muted-foreground";
 
   const authLabel = (() => {
     if (credential.authMethod === "api_key") return "API Key";
@@ -1003,6 +1022,15 @@ function CredentialCardImpl({
             <RotateCcw className="h-3 w-3 opacity-50" />
           </button>
         </div>
+
+        <div className="w-14 text-center" title={loadTitle}>
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/80">
+            并发
+          </div>
+          <div className={`mt-0.5 px-1.5 py-0.5 font-mono text-xs font-semibold tabular-nums ${loadClass}`}>
+            {loadText(inFlight, credential.effectiveMaxConcurrency)}
+          </div>
+        </div>
       </div>
 
       <div className="hidden w-44 shrink-0 xl:block">
@@ -1284,6 +1312,13 @@ function CredentialCardImpl({
               <LedgerRow label="最近调用">
                 <span className="font-mono text-muted-foreground">
                   {formatLastUsed(credential.lastUsedAt)}
+                </span>
+              </LedgerRow>
+              <LedgerRow label="并发 · RPM" title={loadTitle}>
+                <span className={`font-mono ${loadClass}`}>
+                  {loadText(inFlight, credential.effectiveMaxConcurrency)}
+                  <span className="text-muted-foreground/40"> · </span>
+                  {loadText(credential.rpmUsed, credential.effectiveRpmLimit)}
                 </span>
               </LedgerRow>
               <LedgerRow label="添加时间">

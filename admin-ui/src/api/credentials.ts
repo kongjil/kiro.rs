@@ -536,6 +536,33 @@ export async function setAccountRpmLimitConfig(
   return data
 }
 
+export interface AccountConcurrencyConfig {
+  enabled: boolean
+  /** 每账号默认并发上限，可被单账号覆盖 */
+  limit: number
+  /** 粘性会话绑定的账号满载时，最多等它空出的秒数 */
+  stickyWaitSecs: number
+  /** 所有账号满载时最多排队的秒数，超时返回 429 */
+  queueWaitSecs: number
+}
+
+// 获取单账号并发控制配置
+export async function getAccountConcurrencyConfig(): Promise<AccountConcurrencyConfig> {
+  const { data } = await api.get<AccountConcurrencyConfig>('/config/account-concurrency-limit')
+  return data
+}
+
+// 更新单账号并发控制配置
+export async function setAccountConcurrencyConfig(
+  patch: Partial<AccountConcurrencyConfig>,
+): Promise<AccountConcurrencyConfig> {
+  const { data } = await api.put<AccountConcurrencyConfig>(
+    '/config/account-concurrency-limit',
+    patch,
+  )
+  return data
+}
+
 export interface QuotaResetRecoveryConfig {
   enabled: boolean
 }

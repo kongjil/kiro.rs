@@ -1173,6 +1173,8 @@ async fn handle_stream_request(
     tracer.mark_upstream_headers_received();
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    // 并发位随流一起走，整条流结束（或客户端断开）才释放
+    let permit = call_result.permit;
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(
@@ -1192,6 +1194,7 @@ async fn handle_stream_request(
     // 创建 SSE 流
     let stream = create_sse_stream(
         response,
+        permit,
         ctx,
         initial_events,
         hook,
@@ -1225,6 +1228,7 @@ fn create_ping_sse() -> Bytes {
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
+    permit: Option<crate::kiro::concurrency::SharedPermit>,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
     hook: UsageRecordHook,
@@ -1247,6 +1251,7 @@ fn create_sse_stream(
         sent_bytes: 0,
         attempt_bytes: 0,
         retry,
+        permit,
     };
 
     let processing_stream = stream::unfold(live, |mut live| async move {
@@ -1301,11 +1306,14 @@ struct LiveStream {
     /// 当前这次上游响应收到的字节数
     attempt_bytes: u64,
     retry: Option<TruncationRetry>,
+    /// 当前上游响应占用的账号并发位；续写时换成新响应的，流结束随 LiveStream 一起释放。
+    permit: Option<crate::kiro::concurrency::SharedPermit>,
 }
 
 impl LiveStream {
     fn interrupt(&mut self, events: Vec<SseEvent>, error: &str) -> Vec<Result<Bytes, Infallible>> {
         self.finished = true;
+        self.permit = None;
         self.settlement
             .interrupt(&mut self.ctx, events, error, self.sent_bytes)
     }
@@ -1371,6 +1379,8 @@ impl LiveStream {
         if let Some(truncated) = self.ctx.truncated_tool_call() {
             if let Some(retry) = self.retry.as_mut() {
                 let partial_text = self.ctx.attempt_text().to_string();
+                // 上一次上游响应已读完：先归还并发位，否则续写请求可能等不到自己占着的位
+                self.permit = None;
                 if let Some(call) = retry
                     .resume(
                         &truncated,
@@ -1384,6 +1394,7 @@ impl LiveStream {
                     self.ctx.prepare_for_retry();
                     self.settlement.update(&self.ctx, self.sent_bytes);
                     self.body_stream = call.response.bytes_stream().boxed();
+                    self.permit = call.permit;
                     self.decoder = EventStreamDecoder::new();
                     self.attempt_bytes = 0;
                     return sse_bytes(events);
@@ -1411,6 +1422,7 @@ impl LiveStream {
                 .finish("success", "success", None, None, None);
         }
         self.finished = true;
+        self.permit = None;
         sse_bytes(events)
     }
 }
@@ -1889,8 +1901,11 @@ pub(crate) async fn execute_non_stream_request(
     tracer.mark_upstream_headers_received();
     let credential_id = call_result.credential_id;
 
+    let first_read = read_non_stream_attempt(call_result.response, model, &tool_name_map).await;
+    // 响应体已读完：归还账号并发位，续写请求会重新占位
+    drop(call_result.permit);
     let mut result =
-        match read_non_stream_attempt(call_result.response, model, &tool_name_map).await {
+        match first_read {
             Ok(attempt) => attempt,
             Err(error) => {
                 return Err(non_stream_read_failure(
@@ -1920,7 +1935,9 @@ pub(crate) async fn execute_non_stream_request(
         else {
             break;
         };
-        match read_non_stream_attempt(call.response, model, &tool_name_map).await {
+        let read = read_non_stream_attempt(call.response, model, &tool_name_map).await;
+        drop(call.permit);
+        match read {
             Ok(next) => {
                 continuations.push(crate::kiro::model::events::strip_tool_use_xml_leaks(
                     &next.text,

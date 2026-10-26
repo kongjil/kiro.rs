@@ -264,6 +264,26 @@ pub struct Config {
     #[serde(default = "default_account_rpm_limit")]
     pub account_rpm_limit: u32,
 
+    /// 是否启用单账号并发上限（默认 true）。
+    ///
+    /// 开启后：每个账号同时处理的模型请求不超过上限（账号可单独覆盖），流式请求
+    /// 一直占用到响应读完。账号满了先换号；粘性会话先等自己的账号空出（见
+    /// `account_concurrency_sticky_wait_secs`）；所有账号都满时排队，超时返回 429。
+    #[serde(default = "default_account_concurrency_limit_enabled")]
+    pub account_concurrency_limit_enabled: bool,
+
+    /// 单账号默认并发上限（默认 3）。
+    #[serde(default = "default_account_concurrency_limit")]
+    pub account_concurrency_limit: u32,
+
+    /// 粘性会话的绑定账号并发已满时，等它空出的最长秒数（默认 15，0 = 不等直接换号）。
+    #[serde(default = "default_account_concurrency_sticky_wait_secs")]
+    pub account_concurrency_sticky_wait_secs: u64,
+
+    /// 所有可用账号并发都满时，排队等待空位的最长秒数（默认 60，0 = 不排队直接 429）。
+    #[serde(default = "default_account_concurrency_queue_wait_secs")]
+    pub account_concurrency_queue_wait_secs: u64,
+
     /// 是否识别 403 账号封禁文案并立即禁用凭据（默认 true）。
     ///
     /// 开启后：某凭据收到 403 且响应体命中明确封禁文案（同时含 "suspended" 与
@@ -485,6 +505,22 @@ fn default_account_rpm_limit() -> u32 {
     60
 }
 
+fn default_account_concurrency_limit_enabled() -> bool {
+    true
+}
+
+fn default_account_concurrency_limit() -> u32 {
+    3
+}
+
+fn default_account_concurrency_sticky_wait_secs() -> u64 {
+    15
+}
+
+fn default_account_concurrency_queue_wait_secs() -> u64 {
+    60
+}
+
 fn default_suspended_detection_enabled() -> bool {
     true
 }
@@ -570,6 +606,10 @@ impl Default for Config {
             model_api_429_retry_enabled: default_model_api_429_retry_enabled(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
+            account_concurrency_limit_enabled: default_account_concurrency_limit_enabled(),
+            account_concurrency_limit: default_account_concurrency_limit(),
+            account_concurrency_sticky_wait_secs: default_account_concurrency_sticky_wait_secs(),
+            account_concurrency_queue_wait_secs: default_account_concurrency_queue_wait_secs(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
@@ -747,6 +787,30 @@ mod tests {
         assert!(!config.self_heal_enabled);
         assert_eq!(config.self_heal_min_interval_secs, 60);
         assert_eq!(config.self_heal_max_consecutive_rounds, 0);
+    }
+
+    /// 并发控制默认开启：升级后未写这些字段的老配置也立即生效。
+    #[test]
+    fn account_concurrency_defaults_to_enabled_with_limit_three() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.account_concurrency_limit_enabled);
+        assert_eq!(config.account_concurrency_limit, 3);
+        assert_eq!(config.account_concurrency_sticky_wait_secs, 15);
+        assert_eq!(config.account_concurrency_queue_wait_secs, 60);
+
+        let default = Config::default();
+        assert!(default.account_concurrency_limit_enabled);
+        assert_eq!(default.account_concurrency_limit, 3);
+
+        let explicit: Config = serde_json::from_str(
+            r#"{"accountConcurrencyLimitEnabled":false,"accountConcurrencyLimit":8,
+                "accountConcurrencyStickyWaitSecs":0,"accountConcurrencyQueueWaitSecs":5}"#,
+        )
+        .unwrap();
+        assert!(!explicit.account_concurrency_limit_enabled);
+        assert_eq!(explicit.account_concurrency_limit, 8);
+        assert_eq!(explicit.account_concurrency_sticky_wait_secs, 0);
+        assert_eq!(explicit.account_concurrency_queue_wait_secs, 5);
     }
 
     #[test]

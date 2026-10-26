@@ -29,14 +29,16 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
-    IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError,
+    IdcReloginCredentials, MAX_ACCOUNT_CONCURRENCY, MAX_ACCOUNT_RPM, MultiTokenManager,
+    RefreshTokenInvalidError,
 };
 use crate::model::config::Config;
 
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
+    AccountConcurrencyConfigResponse, AccountRpmLimitConfigResponse,
+    AccountThrottleConfigResponse, AddCredentialRequest,
     AddCredentialResponse, ApiDomainConfig, AssignProxyRequest, AssignRoundRobinResponse,
     AvailableModelItem,
     AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
@@ -49,7 +51,8 @@ use super::types::{
     ModelTestResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
     ProxyPoolEntry, ProxyPoolResponse, ProxyQualityConfigResponse, ProxyQualityRunResponse,
     QuotaExceededResult, QuotaResetRecoveryConfigResponse,
-    SelfHealConfigResponse, SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
+    SelfHealConfigResponse, SessionAffinityConfigResponse, SetAccountConcurrencyConfigRequest,
+    SetAccountRpmLimitConfigRequest,
     SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomModelsRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
     SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
@@ -889,6 +892,12 @@ impl AdminService {
                     created_at: entry.created_at,
                     account_cost_cny,
                     cost_multiplier,
+                    in_flight: entry.in_flight,
+                    max_concurrency: entry.max_concurrency,
+                    effective_max_concurrency: entry.effective_max_concurrency,
+                    rpm_limit: entry.rpm_limit,
+                    effective_rpm_limit: entry.effective_rpm_limit,
+                    rpm_used: entry.rpm_used,
                 }
             })
             .collect();
@@ -1660,6 +1669,9 @@ impl AdminService {
             groups: req.groups,
             source_channel: req.source_channel,
             metadata,
+            // 并发 / RPM 默认跟随全局配置，添加后在编辑里单独覆盖
+            max_concurrency: None,
+            rpm_limit: None,
             // 创建时间由 token_manager.add_credential 在入库时统一写入
             created_at: None,
         };
@@ -1816,6 +1828,20 @@ impl AdminService {
                 serde_json::json!(value),
             );
         }
+        if let Some(Some(value)) = req.max_concurrency {
+            if value > MAX_ACCOUNT_CONCURRENCY {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "maxConcurrency 必须在 0..={MAX_ACCOUNT_CONCURRENCY} 内"
+                )));
+            }
+        }
+        if let Some(Some(value)) = req.rpm_limit {
+            if value > MAX_ACCOUNT_RPM {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "rpmLimit 必须在 0..={MAX_ACCOUNT_RPM} 内"
+                )));
+            }
+        }
         self.token_manager
             .update_credential(
                 id,
@@ -1831,6 +1857,9 @@ impl AdminService {
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
                 metadata,
             )
+            .map_err(|e| self.classify_error(e, id))?;
+        self.token_manager
+            .set_credential_limits(id, req.max_concurrency, req.rpm_limit)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -2708,6 +2737,45 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_rpm_limit_config())
+    }
+
+    /// 获取单账号并发控制配置
+    pub fn get_account_concurrency_config(&self) -> AccountConcurrencyConfigResponse {
+        let (enabled, limit, sticky_wait_secs, queue_wait_secs) =
+            self.token_manager.get_account_concurrency_config();
+        AccountConcurrencyConfigResponse {
+            enabled,
+            limit,
+            sticky_wait_secs,
+            queue_wait_secs,
+        }
+    }
+
+    /// 更新单账号并发控制配置
+    pub fn set_account_concurrency_config(
+        &self,
+        req: SetAccountConcurrencyConfigRequest,
+    ) -> Result<AccountConcurrencyConfigResponse, AdminServiceError> {
+        if req.enabled.is_none()
+            && req.limit.is_none()
+            && req.sticky_wait_secs.is_none()
+            && req.queue_wait_secs.is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 enabled、limit、stickyWaitSecs、queueWaitSecs 中的一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_account_concurrency_config(
+                req.enabled,
+                req.limit,
+                req.sticky_wait_secs,
+                req.queue_wait_secs,
+            )
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_account_concurrency_config())
     }
 
     /// 获取月度额度重置后自动恢复配置。

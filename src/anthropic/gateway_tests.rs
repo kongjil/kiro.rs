@@ -711,6 +711,61 @@ async fn gateway_truncated_tool_call_ends_with_max_tokens_after_retries() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+fn in_flight(f: &Fixture) -> u32 {
+    f.state
+        .kiro_provider
+        .as_ref()
+        .unwrap()
+        .token_manager()
+        .snapshot()
+        .entries[0]
+        .in_flight
+}
+
+/// 账号并发位跟着响应走：流式在整条流结束前一直占着，读完或客户端断开即归还；
+/// 非流式在响应体读完、返回前归还。
+#[tokio::test]
+async fn gateway_concurrency_slot_follows_the_response_body() {
+    let mut failures = Vec::new();
+    for endpoint in ["messages", "cc", "chat", "responses"] {
+        let f = fixture(Mode::Normal(Duration::from_millis(300))).await;
+        let mut body = request(f.state.clone(), endpoint, true)
+            .await
+            .into_body()
+            .into_data_stream();
+        first_content(&mut body).await;
+        let during = in_flight(&f);
+        while let Some(chunk) = body.next().await {
+            chunk.unwrap();
+        }
+        let after = in_flight(&f);
+        if during != 1 || after != 0 {
+            failures.push(format!("{endpoint} stream: during={during}, after={after}"));
+        }
+
+        let f = fixture(Mode::Normal(Duration::from_millis(300))).await;
+        let mut body = request(f.state.clone(), endpoint, true)
+            .await
+            .into_body()
+            .into_data_stream();
+        first_content(&mut body).await;
+        drop(body);
+        let after_disconnect = in_flight(&f);
+        if after_disconnect != 0 {
+            failures.push(format!("{endpoint} disconnect: after={after_disconnect}"));
+        }
+
+        let f = fixture(Mode::Normal(Duration::from_millis(10))).await;
+        let response = request(f.state.clone(), endpoint, false).await;
+        let after = in_flight(&f);
+        let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        if after != 0 {
+            failures.push(format!("{endpoint} non-stream: after={after}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// 直连 Claude 端点经 `claude_wire` 出站：键序与官方一致，计费字段一个不少
 /// （credit_* 与 cache_creation 的 TTL 拆分都要给下游）。
 #[tokio::test]

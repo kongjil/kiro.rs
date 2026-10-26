@@ -569,6 +569,16 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub metadata: CredentialMetadata,
 
+    /// 本账号的并发上限覆盖。None 使用全局默认；0 表示本账号不限并发。
+    /// 只在全局并发控制开启时生效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
+
+    /// 本账号的每分钟请求数上限覆盖。None 使用全局默认；0 表示本账号不限 RPM。
+    /// 只在全局 RPM 限流开启时生效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpm_limit: Option<u32>,
+
     /// 凭据添加（创建）时间（RFC3339 格式）
     ///
     /// 由 `add_credential` 在首次入库时写入，此后随凭据一起持久化。
@@ -1242,6 +1252,8 @@ mod tests {
             source_channel: None,
             metadata: CredentialMetadata::default(),
             created_at: None,
+            max_concurrency: None,
+            rpm_limit: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1519,6 +1531,8 @@ mod tests {
             source_channel: None,
             metadata: CredentialMetadata::default(),
             created_at: None,
+            max_concurrency: None,
+            rpm_limit: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1564,6 +1578,8 @@ mod tests {
             source_channel: None,
             metadata: CredentialMetadata::default(),
             created_at: None,
+            max_concurrency: None,
+            rpm_limit: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1692,6 +1708,8 @@ mod tests {
             source_channel: None,
             metadata: CredentialMetadata::default(),
             created_at: None,
+            max_concurrency: None,
+            rpm_limit: None,
         };
 
         let json = original.to_pretty_json().unwrap();

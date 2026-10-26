@@ -24,7 +24,8 @@ use super::{
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
         CreateClientKeyResponse, ModelTestRequest,
         CredentialMetadataSchemaConfig,
-        SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
+        SetAccountConcurrencyConfigRequest, SetAccountRpmLimitConfigRequest,
+        SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetGlobalProxyRequest,
         SetCacheMeteringConfigRequest, SetSessionAffinityConfigRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
@@ -659,6 +660,26 @@ pub async fn set_account_rpm_limit_config(
     Json(payload): Json<SetAccountRpmLimitConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_account_rpm_limit_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/account-concurrency-limit
+/// 获取单账号并发控制配置
+pub async fn get_account_concurrency_config(
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    Json(state.service.get_account_concurrency_config())
+}
+
+/// PUT /api/admin/config/account-concurrency-limit
+/// 更新单账号并发控制配置
+pub async fn set_account_concurrency_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetAccountConcurrencyConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_account_concurrency_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
