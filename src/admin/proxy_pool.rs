@@ -787,6 +787,15 @@ impl ProxyPoolManager {
         generated
     }
 
+    /// 取尚未参与本轮检查的备用链接，数量按缺口限制，避免无意义地探测整个池。
+    pub fn candidate_urls(&self, excluded: &std::collections::HashSet<String>, limit: usize) -> Vec<String> {
+        self.entries.lock().iter()
+            .filter(|entry| entry.enabled && !excluded.contains(&entry.url))
+            .map(|entry| entry.url.clone())
+            .take(limit)
+            .collect()
+    }
+
     pub fn clean_entries(&self) -> Vec<ProxyEntry> {
         self.entries.lock().iter()
             .filter(|entry| entry.enabled && entry.health != ProxyHealth::Unhealthy && entry.quality_status == ProxyQualityStatus::Clean)

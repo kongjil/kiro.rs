@@ -3303,6 +3303,19 @@ impl AdminService {
         let mut clean = self.proxy_pool.clean_entries();
         clean.retain(|entry| entry.last_quality_checked_at.as_deref().is_some_and(|checked_at| checked_at >= run_started.as_str()));
         if self.proxy_pool.quality_config().auto_assign && clean.len() < required {
+            // 先检查池中已有的备用链接，只有备用链接不足时才生成新的 sid。
+            let standby_urls = self.proxy_pool.candidate_urls(&used_urls, required - clean.len());
+            used_urls.extend(standby_urls);
+            let standby_summary = self.proxy_pool.quality_check_urls(Some(&used_urls)).await;
+            summary.checked += standby_summary.checked;
+            summary.clean += standby_summary.clean;
+            summary.dirty += standby_summary.dirty;
+            summary.errors += standby_summary.errors;
+            summary.disabled += standby_summary.disabled;
+            clean = self.proxy_pool.clean_entries();
+            clean.retain(|entry| entry.last_quality_checked_at.as_deref().is_some_and(|checked_at| checked_at >= run_started.as_str()));
+        }
+        if self.proxy_pool.quality_config().auto_assign && clean.len() < required {
             let needed = required - clean.len();
             let before: HashSet<String> = self.proxy_pool.list().into_iter().map(|entry| entry.url).collect();
             let generated = self.proxy_pool.generate_candidates(needed);
