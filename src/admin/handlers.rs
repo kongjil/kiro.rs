@@ -30,6 +30,7 @@ use super::{
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetModelApiRetryConfigRequest, SetQuotaResetRecoveryConfigRequest,
         SetSelfHealConfigRequest,
+        SetProxyQualityConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -534,6 +535,27 @@ pub async fn check_proxy(
 /// 触发全部代理的健康检查
 pub async fn check_all_proxies(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.check_all_proxies().await)
+}
+
+/// GET /api/admin/proxy-quality
+pub async fn get_proxy_quality_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_proxy_quality_config())
+}
+
+/// PUT /api/admin/proxy-quality
+pub async fn set_proxy_quality_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetProxyQualityConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_proxy_quality_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-quality/check
+pub async fn run_proxy_quality_check(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.run_proxy_quality_check().await)
 }
 
 /// POST /api/admin/proxy-pool/assign-round-robin

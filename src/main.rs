@@ -395,6 +395,7 @@ async fn main() {
             admin_state
                 .service
                 .start_proxy_health_checker(std::time::Duration::from_secs(300));
+            admin_state.service.start_proxy_quality_scheduler();
 
             // 启动自动更新调度器：每分钟检查一次本地时间，到达 update_auto_apply_time
             // 且开启 update_auto_apply 时执行一次更新；否则静默等待。

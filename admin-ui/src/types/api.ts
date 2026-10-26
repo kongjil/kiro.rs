@@ -243,6 +243,7 @@ export interface UpdateRefreshTokenRequest {
 
 // 代理健康状态
 export type ProxyHealth = 'unknown' | 'healthy' | 'unhealthy'
+export type ProxyQualityStatus = 'unknown' | 'clean' | 'dirty' | 'error'
 
 // 代理池条目
 export interface ProxyPoolEntry {
@@ -256,6 +257,11 @@ export interface ProxyPoolEntry {
   lastCheckedAt?: string
   consecutiveFailures: number
   autoDisabled: boolean
+  observedIp?: string
+  qualityScore?: number
+  qualityStatus: ProxyQualityStatus
+  qualityReason?: string
+  lastQualityCheckedAt?: string
 }
 
 // 代理池列表响应
@@ -303,6 +309,38 @@ export interface ProxyCheckAllResponse {
   healthy: number
   unhealthy: number
   autoDisabled: number
+}
+
+export interface ProxyQualityConfigResponse {
+  enabled: boolean
+  intervalSecs: number
+  concurrency: number
+  minScore: number
+  ipEchoUrl: string
+  qualityUrl: string
+  autoAssign: boolean
+}
+
+export interface SetProxyQualityConfigRequest {
+  enabled?: boolean
+  intervalSecs?: number
+  concurrency?: number
+  minScore?: number
+  ipEchoUrl?: string
+  qualityUrl?: string
+  autoAssign?: boolean
+}
+
+export interface ProxyQualityRunResponse {
+  checked: number
+  clean: number
+  dirty: number
+  errors: number
+  disabled: number
+  generated: number
+  assigned: number
+  availableClean: number
+  requiredCredentials: number
 }
 
 // 轮询批量分配请求

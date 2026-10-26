@@ -33,6 +33,9 @@ import {
   setGlobalProxy,
   checkProxy,
   checkAllProxies,
+  getProxyQualityConfig,
+  setProxyQualityConfig,
+  runProxyQualityCheck,
   assignProxiesRoundRobin,
 } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
@@ -52,6 +55,9 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const [batchText, setBatchText] = useState('')
   const [showBatch, setShowBatch] = useState(false)
   const [batchErrors, setBatchErrors] = useState<string[]>([])
+  const [qualityMinScore, setQualityMinScore] = useState<number | undefined>()
+  const [qualityInterval, setQualityInterval] = useState<number | undefined>()
+  const [qualityConcurrency, setQualityConcurrency] = useState<number | undefined>()
   const queryClient = useQueryClient()
 
   const { data, isLoading } = useQuery({
@@ -64,6 +70,43 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     queryKey: ['global-proxy'],
     queryFn: getGlobalProxy,
     enabled: open,
+  })
+
+  const { data: qualityConfig } = useQuery({
+    queryKey: ['proxy-quality-config'],
+    queryFn: getProxyQualityConfig,
+    enabled: open,
+  })
+
+  const saveQualityMutation = useMutation({
+    mutationFn: () => setProxyQualityConfig({
+      enabled: qualityConfig?.enabled ?? true,
+      minScore: qualityMinScore ?? qualityConfig?.minScore ?? 50,
+      intervalSecs: qualityInterval ?? qualityConfig?.intervalSecs ?? 6000,
+      concurrency: qualityConcurrency ?? qualityConfig?.concurrency ?? 10,
+      autoAssign: true,
+    }),
+    onSuccess: () => {
+      toast.success('纯净度配置已保存')
+      queryClient.invalidateQueries({ queryKey: ['proxy-quality-config'] })
+    },
+    onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+  })
+
+  const qualityToggleMutation = useMutation({
+    mutationFn: () => setProxyQualityConfig({ enabled: !(qualityConfig?.enabled ?? true) }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['proxy-quality-config'] }),
+    onError: (err) => toast.error(`操作失败: ${extractErrorMessage(err)}`),
+  })
+
+  const qualityRunMutation = useMutation({
+    mutationFn: runProxyQualityCheck,
+    onSuccess: (res) => {
+      toast.success(`纯净度检查完成：干净 ${res.clean}，脏 ${res.dirty}，生成 ${res.generated}，分配 ${res.assigned}`)
+      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (err) => toast.error(`检查失败: ${extractErrorMessage(err)}`),
   })
 
   const setGlobalProxyMutation = useMutation({
@@ -294,6 +337,37 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
             </div>
           </div>
 
+          <div className="rounded-md border p-3 space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium">代理 IP 纯净度调度</div>
+                <div className="text-xs text-muted-foreground">只检查账号正在使用的代理；缺口自动轮换 sid 生成链接</div>
+              </div>
+              <Button size="sm" variant={qualityConfig?.enabled ? 'default' : 'outline'} onClick={() => qualityToggleMutation.mutate()} disabled={qualityToggleMutation.isPending}>
+                {qualityConfig?.enabled ? '已开启' : '已关闭'}
+              </Button>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              <label className="text-xs text-muted-foreground">最低评分
+                <Input type="number" min={0} max={100} value={qualityMinScore ?? qualityConfig?.minScore ?? 50} onChange={(e) => setQualityMinScore(Number(e.target.value))} className="mt-1 h-8" />
+              </label>
+              <label className="text-xs text-muted-foreground">检查间隔（秒）
+                <Input type="number" min={60} value={qualityInterval ?? qualityConfig?.intervalSecs ?? 6000} onChange={(e) => setQualityInterval(Number(e.target.value))} className="mt-1 h-8" />
+              </label>
+              <label className="text-xs text-muted-foreground">并发
+                <Input type="number" min={1} max={64} value={qualityConcurrency ?? qualityConfig?.concurrency ?? 10} onChange={(e) => setQualityConcurrency(Number(e.target.value))} className="mt-1 h-8" />
+              </label>
+            </div>
+            <div className="flex gap-2">
+              <Button size="sm" variant="outline" onClick={() => saveQualityMutation.mutate()} disabled={saveQualityMutation.isPending}>保存配置</Button>
+              <Button size="sm" onClick={() => qualityRunMutation.mutate()} disabled={qualityRunMutation.isPending || !qualityConfig?.enabled}>
+                <Activity className="h-3 w-3 mr-1" />
+                {qualityRunMutation.isPending ? '检查中...' : '立即检查并分配'}
+              </Button>
+              <span className="text-xs text-muted-foreground self-center">默认 6000 秒 / 100 分钟，10 并发</span>
+            </div>
+          </div>
+
           {/* 代理列表 */}
           <div className="space-y-1">
             <div className="flex items-center justify-between">
@@ -350,6 +424,12 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                         <Badge variant="secondary" className="text-xs">{proxy.label}</Badge>
                       )}
                       {renderHealthBadge(proxy)}
+                      {proxy.qualityStatus === 'clean' && (
+                        <Badge variant="outline" className="text-xs border-green-500/50 text-green-600 dark:text-green-400">纯净{proxy.qualityScore != null ? ` ${proxy.qualityScore}` : ''}</Badge>
+                      )}
+                      {proxy.qualityStatus === 'dirty' && (
+                        <Badge variant="outline" className="text-xs border-destructive/50 text-destructive">脏 IP</Badge>
+                      )}
                       {!proxy.enabled && (
                         <Badge variant="outline" className="text-xs text-muted-foreground">
                           {proxy.autoDisabled ? '自动禁用' : '已禁用'}
@@ -367,6 +447,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                           检测于 {new Date(proxy.lastCheckedAt).toLocaleString()}
                         </span>
                       )}
+                      {proxy.observedIp && <span className="text-xs text-muted-foreground">出口 {proxy.observedIp}</span>}
                     </div>
                   </div>
                   <div className="flex items-center gap-1 shrink-0">

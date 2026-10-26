@@ -7,8 +7,11 @@
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
+use futures::stream::{self, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -19,6 +22,13 @@ const PROXY_HEALTH_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
 const PROXY_PROBE_TIMEOUT_SECS: u64 = 8;
 /// 连续探测失败阈值：达到后自动禁用（与凭据的 MAX_FAILURES_PER_CREDENTIAL 对齐）
 const MAX_PROXY_PROBE_FAILURES: u32 = 3;
+/// 纯净度检查默认每 100 分钟执行一次。
+pub const DEFAULT_QUALITY_INTERVAL_SECS: u64 = 6_000;
+pub const DEFAULT_QUALITY_CONCURRENCY: usize = 10;
+pub const DEFAULT_QUALITY_MIN_SCORE: u8 = 50;
+const DEFAULT_IP_ECHO_URL: &str = "https://api.ipify.org?format=json";
+const DEFAULT_QUALITY_URL: &str = "https://proxycheck.io/v2/{ip}?vpn=1&asn=1";
+const SID_PLACEHOLDER: &str = "{sid}";
 
 /// 代理健康状态
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +41,17 @@ pub enum ProxyHealth {
     Healthy,
     /// 最近一次探测失败
     Unhealthy,
+}
+
+/// 出口 IP 纯净度检查状态。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyQualityStatus {
+    #[default]
+    Unknown,
+    Clean,
+    Dirty,
+    Error,
 }
 
 /// 持久化的代理条目
@@ -58,10 +79,76 @@ pub struct ProxyEntry {
     /// 是否由健康检查自动禁用（区别于用户手动禁用）
     #[serde(default)]
     pub auto_disabled: bool,
+    /// 经该代理访问公网后观测到的出口 IP。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_ip: Option<String>,
+    /// 质量评分（0-100，越高越干净）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_score: Option<u8>,
+    #[serde(default)]
+    pub quality_status: ProxyQualityStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_quality_checked_at: Option<String>,
+    /// 从代理 URL 推导出的可生成模板，例如 sid-{sid}。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_template: Option<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// 纯净度插件配置，单独落盘以避免破坏主 config.json 的兼容性。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyQualityConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_quality_interval")]
+    pub interval_secs: u64,
+    #[serde(default = "default_quality_concurrency")]
+    pub concurrency: usize,
+    #[serde(default = "default_quality_min_score")]
+    pub min_score: u8,
+    #[serde(default = "default_ip_echo_url")]
+    pub ip_echo_url: String,
+    #[serde(default = "default_quality_url")]
+    pub quality_url: String,
+    #[serde(default = "default_true")]
+    pub auto_assign: bool,
+}
+
+fn default_quality_interval() -> u64 { DEFAULT_QUALITY_INTERVAL_SECS }
+fn default_quality_concurrency() -> usize { DEFAULT_QUALITY_CONCURRENCY }
+fn default_quality_min_score() -> u8 { DEFAULT_QUALITY_MIN_SCORE }
+fn default_ip_echo_url() -> String { DEFAULT_IP_ECHO_URL.to_string() }
+fn default_quality_url() -> String { DEFAULT_QUALITY_URL.to_string() }
+
+impl Default for ProxyQualityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: DEFAULT_QUALITY_INTERVAL_SECS,
+            concurrency: DEFAULT_QUALITY_CONCURRENCY,
+            min_score: DEFAULT_QUALITY_MIN_SCORE,
+            ip_echo_url: default_ip_echo_url(),
+            quality_url: default_quality_url(),
+            auto_assign: true,
+        }
+    }
+}
+
+impl ProxyQualityConfig {
+    pub fn normalized(mut self) -> Self {
+        self.interval_secs = self.interval_secs.clamp(60, 86_400);
+        self.concurrency = self.concurrency.clamp(1, 64);
+        self.min_score = self.min_score.min(100);
+        if self.ip_echo_url.trim().is_empty() { self.ip_echo_url = default_ip_echo_url(); }
+        if self.quality_url.trim().is_empty() { self.quality_url = default_quality_url(); }
+        self
+    }
 }
 
 /// 代理分配结果
@@ -85,10 +172,30 @@ pub struct CheckSummary {
     pub auto_disabled: usize,
 }
 
+/// 一次纯净度调度的统计结果。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityRunSummary {
+    pub checked: usize,
+    pub clean: usize,
+    pub dirty: usize,
+    pub errors: usize,
+    pub disabled: usize,
+    pub generated: usize,
+}
+
 /// 单个代理探测结果
 enum ProbeResult {
     Ok { latency_ms: u32 },
     Err { error: String },
+}
+
+#[derive(Debug, Clone, Default)]
+struct QualityResult {
+    ip: Option<String>,
+    score: Option<u8>,
+    dirty: bool,
+    reason: Option<String>,
 }
 
 pub struct ProxyPoolManager {
@@ -98,6 +205,11 @@ pub struct ProxyPoolManager {
     path: Option<PathBuf>,
     /// TLS 后端，构建探测用 HTTP client 时需要
     tls_backend: TlsBackend,
+    /// 可生成的代理模板，独立于当前已通过检查的条目保存。
+    templates: Mutex<Vec<String>>,
+    templates_path: Option<PathBuf>,
+    quality_config: Mutex<ProxyQualityConfig>,
+    quality_config_path: Option<PathBuf>,
 }
 
 /// 校验代理 URL 的 scheme 是否合法
@@ -123,6 +235,34 @@ fn validate_proxy_url(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 把示例中的 `sid-XXXXXXXX` 变成可轮换模板；无 sid 的代理仍可手工使用，
+/// 但不会被自动复制生成。
+fn derive_template(url: &str) -> Option<String> {
+    let bytes = url.as_bytes();
+    let marker = b"sid-";
+    let start = bytes.windows(marker.len()).position(|w| w.eq_ignore_ascii_case(marker))?;
+    let value_start = start + marker.len();
+    let value_end = bytes[value_start..]
+        .iter()
+        .position(|b| !b.is_ascii_alphanumeric())
+        .map(|offset| value_start + offset)
+        .unwrap_or(bytes.len());
+    if value_end.saturating_sub(value_start) < 4 { return None; }
+    let mut out = String::with_capacity(url.len());
+    out.push_str(&url[..value_start]);
+    out.push_str(SID_PLACEHOLDER);
+    out.push_str(&url[value_end..]);
+    Some(out)
+}
+
+fn generate_from_template(template: &str) -> String {
+    let sid: String = (0..8).map(|_| {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        ALPHABET[fastrand::usize(..ALPHABET.len())] as char
+    }).collect();
+    template.replace(SID_PLACEHOLDER, &sid)
+}
+
 impl ProxyPoolManager {
     pub fn new(path: Option<PathBuf>, tls_backend: TlsBackend) -> Self {
         let entries = path
@@ -131,6 +271,27 @@ impl ProxyPoolManager {
             .and_then(|s| serde_json::from_str::<Vec<ProxyEntry>>(&s).ok())
             .unwrap_or_default();
 
+        let templates_path = path.as_ref().map(|p| p.with_file_name("proxy_templates.json"));
+        let mut templates = templates_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default();
+        for entry in &entries {
+            if let Some(template) = entry.source_template.clone().or_else(|| derive_template(&entry.url)) {
+                if !templates.iter().any(|existing| existing == &template) {
+                    templates.push(template);
+                }
+            }
+        }
+        let quality_config_path = path.as_ref().map(|p| p.with_file_name("proxy_quality.json"));
+        let quality_config = quality_config_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str::<ProxyQualityConfig>(&s).ok())
+            .unwrap_or_default()
+            .normalized();
+
         let next_id = entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
 
         Self {
@@ -138,6 +299,10 @@ impl ProxyPoolManager {
             next_id: AtomicU64::new(next_id),
             path,
             tls_backend,
+            templates: Mutex::new(templates),
+            templates_path,
+            quality_config: Mutex::new(quality_config),
+            quality_config_path,
         }
     }
 
@@ -158,6 +323,7 @@ impl ProxyPoolManager {
             anyhow::bail!("代理 URL 已存在: {}", url);
         }
 
+        let source_template = derive_template(&url);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let entry = ProxyEntry {
             id,
@@ -169,7 +335,14 @@ impl ProxyPoolManager {
             last_checked_at: None,
             consecutive_failures: 0,
             auto_disabled: false,
+            observed_ip: None,
+            quality_score: None,
+            quality_status: ProxyQualityStatus::Unknown,
+            quality_reason: None,
+            last_quality_checked_at: None,
+            source_template: source_template,
         };
+        self.remember_template(entry.source_template.clone());
         entries.push(entry.clone());
         drop(entries);
 
@@ -196,6 +369,7 @@ impl ProxyPoolManager {
                 errors.push(format!("代理 URL 已存在: {}", url));
                 continue;
             }
+            let source_template = derive_template(&url);
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let entry = ProxyEntry {
                 id,
@@ -207,7 +381,18 @@ impl ProxyPoolManager {
                 last_checked_at: None,
                 consecutive_failures: 0,
                 auto_disabled: false,
+                observed_ip: None,
+                quality_score: None,
+                quality_status: ProxyQualityStatus::Unknown,
+                quality_reason: None,
+                last_quality_checked_at: None,
+                source_template,
             };
+            if let Some(template) = entry.source_template.clone() {
+                if !self.templates.lock().iter().any(|existing| existing == &template) {
+                    self.templates.lock().push(template);
+                }
+            }
             entries.push(entry.clone());
             added.push(entry);
         }
@@ -265,10 +450,15 @@ impl ProxyPoolManager {
 
     /// 获取所有「可用于分配」的代理 URL：已启用且非 Unhealthy
     pub fn assignable_urls(&self) -> Vec<String> {
+        let quality_enabled = self.quality_config.lock().enabled;
         self.entries
             .lock()
             .iter()
-            .filter(|e| e.enabled && e.health != ProxyHealth::Unhealthy)
+            .filter(|e| {
+                e.enabled
+                    && e.health != ProxyHealth::Unhealthy
+                    && (!quality_enabled || e.quality_status == ProxyQualityStatus::Clean)
+            })
             .map(|e| e.url.clone())
             .collect()
     }
@@ -433,6 +623,188 @@ impl ProxyPoolManager {
         self.persist()?;
         Ok(entry)
     }
+
+    fn remember_template(&self, template: Option<String>) {
+        let Some(template) = template else { return };
+        let mut templates = self.templates.lock();
+        if templates.iter().any(|existing| existing == &template) { return; }
+        templates.push(template);
+        drop(templates);
+        if let Err(e) = self.persist_templates() {
+            tracing::warn!("保存代理生成模板失败: {}", e);
+        }
+    }
+
+    fn persist_templates(&self) -> anyhow::Result<()> {
+        let Some(path) = &self.templates_path else { return Ok(()) };
+        let templates = self.templates.lock();
+        std::fs::write(path, serde_json::to_string_pretty(&*templates)?)?;
+        Ok(())
+    }
+
+    fn persist_quality_config(&self) -> anyhow::Result<()> {
+        let Some(path) = &self.quality_config_path else { return Ok(()) };
+        let config = self.quality_config.lock();
+        std::fs::write(path, serde_json::to_string_pretty(&*config)?)?;
+        Ok(())
+    }
+
+    pub fn quality_config(&self) -> ProxyQualityConfig {
+        self.quality_config.lock().clone()
+    }
+
+    pub fn set_quality_config(&self, config: ProxyQualityConfig) -> anyhow::Result<ProxyQualityConfig> {
+        let config = config.normalized();
+        *self.quality_config.lock() = config.clone();
+        self.persist_quality_config()?;
+        Ok(config)
+    }
+
+    async fn inspect_quality(&self, url: &str, config: &ProxyQualityConfig) -> anyhow::Result<QualityResult> {
+        let proxy = ProxyConfig::new(url);
+        let via_proxy = build_client(Some(&proxy), PROXY_PROBE_TIMEOUT_SECS, self.tls_backend)?;
+        let ip_response = via_proxy.get(&config.ip_echo_url).send().await?;
+        if !ip_response.status().is_success() {
+            anyhow::bail!("出口 IP 服务返回 {}", ip_response.status());
+        }
+        let ip_body = ip_response.text().await?;
+        let ip = serde_json::from_str::<Value>(&ip_body)
+            .ok()
+            .and_then(|v| v.get("ip").and_then(Value::as_str).map(str::to_owned))
+            .or_else(|| {
+                let value = ip_body.trim();
+                (!value.is_empty() && value.len() <= 128).then(|| value.to_string())
+            })
+            .ok_or_else(|| anyhow::anyhow!("出口 IP 服务响应中没有 ip 字段"))?;
+
+        let quality_url = config.quality_url.replace("{ip}", &ip);
+        let direct = build_client(None, PROXY_PROBE_TIMEOUT_SECS, self.tls_backend)?;
+        let quality_response = direct.get(quality_url).send().await?;
+        if !quality_response.status().is_success() {
+            anyhow::bail!("纯净度服务返回 {}", quality_response.status());
+        }
+        let body: Value = quality_response.json().await?;
+        let details = body.get(&ip).or_else(|| body.get("data")).unwrap_or(&body);
+        let score = details
+            .get("score").or_else(|| details.get("risk"))
+            .and_then(parse_score)
+            .map(|value| if details.get("score").is_some() { value } else { 100u8.saturating_sub(value) });
+        let proxy_flag = quality_flag(details, &["proxy", "is_proxy"]);
+        let vpn = quality_flag(details, &["vpn", "is_vpn"]);
+        let tor = quality_flag(details, &["tor", "is_tor"]);
+        let hosting = quality_flag(details, &["hosting", "is_hosting", "datacenter"]);
+        let mut reasons = Vec::new();
+        if proxy_flag { reasons.push("proxy"); }
+        if vpn { reasons.push("vpn"); }
+        if tor { reasons.push("tor"); }
+        if hosting { reasons.push("hosting"); }
+        if let Some(score) = score.filter(|value| *value < config.min_score) {
+            reasons.push("score_low");
+            return Ok(QualityResult { ip: Some(ip), score: Some(score), dirty: true, reason: Some(reasons.join(",")) });
+        }
+        Ok(QualityResult {
+            ip: Some(ip),
+            score,
+            dirty: !reasons.is_empty(),
+            reason: (!reasons.is_empty()).then(|| reasons.join(",")),
+        })
+    }
+
+    pub async fn quality_check_urls(&self, only_urls: Option<&std::collections::HashSet<String>>) -> QualityRunSummary {
+        let config = self.quality_config();
+        let targets: Vec<(u64, String)> = self.entries.lock().iter()
+            .filter(|entry| entry.enabled && only_urls.map(|urls| urls.contains(&entry.url)).unwrap_or(true))
+            .map(|entry| (entry.id, entry.url.clone()))
+            .collect();
+        if targets.is_empty() { return QualityRunSummary::default(); }
+
+        let concurrency = config.concurrency.clamp(1, 64);
+        let results: Vec<(u64, anyhow::Result<QualityResult>)> = stream::iter(targets)
+            .map(|(id, url)| {
+                let config = config.clone();
+                async move { (id, self.inspect_quality(&url, &config).await) }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+        let mut summary = QualityRunSummary { checked: results.len(), ..Default::default() };
+        let mut observed_ips: HashMap<String, u64> = HashMap::new();
+        {
+            let mut entries = self.entries.lock();
+            for (id, result) in results {
+                let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else { continue };
+                entry.last_quality_checked_at = Some(chrono::Utc::now().to_rfc3339());
+                match result {
+                    Ok(result) => {
+                        entry.observed_ip = result.ip.clone();
+                        entry.quality_score = result.score;
+                        entry.quality_reason = result.reason.clone();
+                        if result.dirty {
+                            entry.quality_status = ProxyQualityStatus::Dirty;
+                            if entry.enabled { entry.enabled = false; entry.auto_disabled = true; summary.disabled += 1; }
+                            summary.dirty += 1;
+                        } else if let Some(ip) = result.ip {
+                            if observed_ips.insert(ip, entry.id).is_some() {
+                                entry.quality_status = ProxyQualityStatus::Dirty;
+                                entry.quality_reason = Some("duplicate_exit_ip".to_string());
+                                if entry.enabled { entry.enabled = false; entry.auto_disabled = true; summary.disabled += 1; }
+                                summary.dirty += 1;
+                            } else {
+                                entry.quality_status = ProxyQualityStatus::Clean;
+                                summary.clean += 1;
+                            }
+                        } else {
+                            entry.quality_status = ProxyQualityStatus::Error;
+                            entry.quality_reason = Some("missing_exit_ip".to_string());
+                            summary.errors += 1;
+                        }
+                    }
+                    Err(error) => {
+                        entry.quality_status = ProxyQualityStatus::Error;
+                        entry.quality_reason = Some(error.to_string());
+                        summary.errors += 1;
+                    }
+                }
+            }
+        }
+        if let Err(error) = self.persist() { tracing::warn!("纯净度检查后保存代理池失败: {}", error); }
+        summary
+    }
+
+    /// 从已记录的 sid 模板生成候选链接；候选先入池，随后由质量检查决定是否启用。
+    pub fn generate_candidates(&self, count: usize) -> usize {
+        if count == 0 { return 0; }
+        let templates = self.templates.lock().clone();
+        if templates.is_empty() { return 0; }
+        let existing: std::collections::HashSet<String> = self.entries.lock().iter().map(|entry| entry.url.clone()).collect();
+        let mut generated = 0;
+        for index in 0..count.saturating_mul(4).max(count) {
+            let url = generate_from_template(&templates[index % templates.len()]);
+            if existing.contains(&url) { continue; }
+            if self.add(url, Some("auto-generated".to_string())).is_ok() { generated += 1; }
+            if generated >= count { break; }
+        }
+        generated
+    }
+
+    pub fn clean_entries(&self) -> Vec<ProxyEntry> {
+        self.entries.lock().iter()
+            .filter(|entry| entry.enabled && entry.health != ProxyHealth::Unhealthy && entry.quality_status == ProxyQualityStatus::Clean)
+            .cloned().collect()
+    }
+}
+
+fn parse_score(value: &Value) -> Option<u8> {
+    value.as_u64().or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok())).map(|value| value.min(100) as u8)
+}
+
+fn quality_flag(value: &Value, keys: &[&str]) -> bool {
+    keys.iter().find_map(|key| value.get(*key)).is_some_and(|value| match value {
+        Value::Bool(flag) => *flag,
+        Value::String(text) => matches!(text.to_ascii_lowercase().as_str(), "yes" | "true" | "1" | "y"),
+        Value::Number(number) => number.as_u64().is_some_and(|number| number > 0),
+        _ => false,
+    })
 }
 
 #[cfg(test)]
@@ -450,6 +822,12 @@ mod tests {
             last_checked_at: None,
             consecutive_failures: 0,
             auto_disabled: false,
+            observed_ip: None,
+            quality_score: None,
+            quality_status: ProxyQualityStatus::Unknown,
+            quality_reason: None,
+            last_quality_checked_at: None,
+            source_template: derive_template(url),
         }
     }
 
@@ -464,6 +842,31 @@ mod tests {
         assert_eq!(e.latency_ms, None);
         assert_eq!(e.consecutive_failures, 0);
         assert!(!e.auto_disabled);
+        assert_eq!(e.quality_status, ProxyQualityStatus::Unknown);
+        assert_eq!(e.source_template, None);
+    }
+
+    #[test]
+    fn sid_url_derives_generation_template() {
+        let url = "socks5://user:pass@host:3010/path-sid-AbC12345-t-5";
+        assert_eq!(derive_template(url), Some("socks5://user:pass@host:3010/path-sid-{sid}-t-5".to_string()));
+    }
+
+    #[test]
+    fn quality_config_normalizes_limits_and_defaults() {
+        let config = ProxyQualityConfig {
+            interval_secs: 1,
+            concurrency: 1000,
+            min_score: 255,
+            ip_echo_url: String::new(),
+            quality_url: String::new(),
+            ..Default::default()
+        }.normalized();
+        assert_eq!(config.interval_secs, 60);
+        assert_eq!(config.concurrency, 64);
+        assert_eq!(config.min_score, 100);
+        assert_eq!(config.ip_echo_url, DEFAULT_IP_ECHO_URL);
+        assert_eq!(config.quality_url, DEFAULT_QUALITY_URL);
     }
 
     #[test]

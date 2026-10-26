@@ -47,12 +47,13 @@ use super::types::{
     GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, ModelApiRetryConfigResponse, ModelSelectionMode, ModelTestRequest,
     ModelTestResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse,
+    ProxyPoolEntry, ProxyPoolResponse, ProxyQualityConfigResponse, ProxyQualityRunResponse,
+    QuotaExceededResult, QuotaResetRecoveryConfigResponse,
     SelfHealConfigResponse, SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
     SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomModelsRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
     SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
-    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+    SetProxyQualityConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
     UpdateRefreshTokenRequest,
 };
@@ -1401,6 +1402,29 @@ impl AdminService {
                     started.elapsed().as_secs_f32()
                 );
                 tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
+    /// 启动代理出口 IP 纯净度调度器。默认配置为每 100 分钟、并发 10；
+    /// 每轮只检查账号正在使用的代理，缺口才从 sid 模板生成候选。
+    pub fn start_proxy_quality_scheduler(self: &Arc<Self>) {
+        let svc = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            loop {
+                let config = svc.proxy_pool.quality_config();
+                if config.enabled {
+                    let result = svc.run_proxy_quality_check().await;
+                    tracing::info!(
+                        "代理 IP 纯净度检查完成：检查 {}，干净 {}，脏 {}，错误 {}，自动禁用 {}，生成 {}，重新分配 {}",
+                        result.checked, result.clean, result.dirty, result.errors,
+                        result.disabled, result.generated, result.assigned
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(config.interval_secs)).await;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
             }
         });
     }
@@ -3054,6 +3078,11 @@ impl AdminService {
                     last_checked_at: p.last_checked_at,
                     consecutive_failures: p.consecutive_failures,
                     auto_disabled: p.auto_disabled,
+                    observed_ip: p.observed_ip,
+                    quality_score: p.quality_score,
+                    quality_status: p.quality_status,
+                    quality_reason: p.quality_reason,
+                    last_quality_checked_at: p.last_quality_checked_at,
                 }
             })
             .collect();
@@ -3085,6 +3114,11 @@ impl AdminService {
             last_checked_at: entry.last_checked_at,
             consecutive_failures: entry.consecutive_failures,
             auto_disabled: entry.auto_disabled,
+            observed_ip: entry.observed_ip,
+            quality_score: entry.quality_score,
+            quality_status: entry.quality_status,
+            quality_reason: entry.quality_reason,
+            last_quality_checked_at: entry.last_quality_checked_at,
         })
     }
 
@@ -3107,6 +3141,11 @@ impl AdminService {
                 last_checked_at: e.last_checked_at,
                 consecutive_failures: e.consecutive_failures,
                 auto_disabled: e.auto_disabled,
+                observed_ip: e.observed_ip,
+                quality_score: e.quality_score,
+                quality_status: e.quality_status,
+                quality_reason: e.quality_reason,
+                last_quality_checked_at: e.last_quality_checked_at,
             })
             .collect();
         (result, errors)
@@ -3201,6 +3240,117 @@ impl AdminService {
             healthy: summary.healthy,
             unhealthy: summary.unhealthy,
             auto_disabled: summary.auto_disabled,
+        }
+    }
+
+    pub fn get_proxy_quality_config(&self) -> ProxyQualityConfigResponse {
+        let config = self.proxy_pool.quality_config();
+        ProxyQualityConfigResponse {
+            enabled: config.enabled,
+            interval_secs: config.interval_secs,
+            concurrency: config.concurrency,
+            min_score: config.min_score,
+            ip_echo_url: config.ip_echo_url,
+            quality_url: config.quality_url,
+            auto_assign: config.auto_assign,
+        }
+    }
+
+    pub fn set_proxy_quality_config(
+        &self,
+        request: SetProxyQualityConfigRequest,
+    ) -> Result<ProxyQualityConfigResponse, AdminServiceError> {
+        let mut config = self.proxy_pool.quality_config();
+        if let Some(value) = request.enabled { config.enabled = value; }
+        if let Some(value) = request.interval_secs { config.interval_secs = value; }
+        if let Some(value) = request.concurrency { config.concurrency = value; }
+        if let Some(value) = request.min_score { config.min_score = value; }
+        if let Some(value) = request.ip_echo_url { config.ip_echo_url = value; }
+        if let Some(value) = request.quality_url { config.quality_url = value; }
+        if let Some(value) = request.auto_assign { config.auto_assign = value; }
+        let config = self.proxy_pool.set_quality_config(config).map_err(|error| {
+            AdminServiceError::InternalError(format!("保存代理纯净度配置失败: {}", error))
+        })?;
+        Ok(ProxyQualityConfigResponse {
+            enabled: config.enabled,
+            interval_secs: config.interval_secs,
+            concurrency: config.concurrency,
+            min_score: config.min_score,
+            ip_echo_url: config.ip_echo_url,
+            quality_url: config.quality_url,
+            auto_assign: config.auto_assign,
+        })
+    }
+
+    /// 检查正在使用的代理；若账号数大于健康且出口 IP 唯一的代理数，
+    /// 从 sid 模板生成候选链接并继续检查，直到满足账号数或模板耗尽。
+    pub async fn run_proxy_quality_check(&self) -> ProxyQualityRunResponse {
+        let snapshot = self.token_manager.snapshot();
+        let active_credentials: Vec<_> = snapshot.entries.iter().filter(|entry| !entry.disabled).collect();
+        let run_started = Utc::now().to_rfc3339();
+        // 兼容直接在凭据编辑器中填入代理的旧用法：先把这些 URL 纳入代理池，
+        // 这样插件可以记录 sid 模板并在后续缺口时自动生成替代链接。
+        let known_urls: HashSet<String> = self.proxy_pool.list().into_iter().map(|entry| entry.url).collect();
+        for url in active_credentials.iter().filter_map(|entry| entry.proxy_url.clone()) {
+            if !known_urls.contains(&url) {
+                let _ = self.proxy_pool.add(url, Some("credential-imported".to_string()));
+            }
+        }
+        let mut used_urls: HashSet<String> = active_credentials.iter()
+            .filter_map(|entry| entry.proxy_url.clone()).collect();
+        let mut summary = self.proxy_pool.quality_check_urls(Some(&used_urls)).await;
+        let required = active_credentials.len();
+        let mut clean = self.proxy_pool.clean_entries();
+        clean.retain(|entry| entry.last_quality_checked_at.as_deref().is_some_and(|checked_at| checked_at >= run_started.as_str()));
+        if self.proxy_pool.quality_config().auto_assign && clean.len() < required {
+            let needed = required - clean.len();
+            let before: HashSet<String> = self.proxy_pool.list().into_iter().map(|entry| entry.url).collect();
+            let generated = self.proxy_pool.generate_candidates(needed);
+            let generated_urls: HashSet<String> = self.proxy_pool.list().into_iter()
+                .filter(|entry| !before.contains(&entry.url))
+                .map(|entry| entry.url).collect();
+            used_urls.extend(generated_urls.iter().cloned());
+            let generated_summary = self.proxy_pool.quality_check_urls(Some(&used_urls)).await;
+            summary.checked += generated_summary.checked;
+            summary.clean += generated_summary.clean;
+            summary.dirty += generated_summary.dirty;
+            summary.errors += generated_summary.errors;
+            summary.disabled += generated_summary.disabled;
+            summary.generated = generated;
+            clean = self.proxy_pool.clean_entries();
+            clean.retain(|entry| entry.last_quality_checked_at.as_deref().is_some_and(|checked_at| checked_at >= run_started.as_str()));
+        }
+
+        let mut used_ips = HashSet::new();
+        let mut assigned = 0;
+        let mut clean_iter = clean.iter();
+        for credential in active_credentials {
+            let current = credential.proxy_url.as_deref().and_then(|url| {
+                clean.iter().find(|entry| entry.url == url && entry.observed_ip.as_ref().is_some_and(|ip| used_ips.insert(ip.clone())))
+            });
+            let selected = current.or_else(|| clean_iter.find(|entry| entry.observed_ip.as_ref().is_some_and(|ip| !used_ips.contains(ip))));
+            let Some(selected) = selected else {
+                if credential.proxy_url.is_some() {
+                    let _ = self.token_manager.update_credential(credential.id, None, Some(None), None, None, None, None, None);
+                }
+                continue;
+            };
+            if credential.proxy_url.as_deref() != Some(selected.url.as_str()) {
+                if self.token_manager.update_credential(credential.id, None, Some(Some(selected.url.clone())), None, None, None, None, None).is_ok() {
+                    assigned += 1;
+                }
+            }
+        }
+        ProxyQualityRunResponse {
+            checked: summary.checked,
+            clean: summary.clean,
+            dirty: summary.dirty,
+            errors: summary.errors,
+            disabled: summary.disabled,
+            generated: summary.generated,
+            assigned,
+            available_clean: clean.len(),
+            required_credentials: required,
         }
     }
 

@@ -1,6 +1,6 @@
 //! Admin API 类型定义
 
-use crate::admin::proxy_pool::ProxyHealth;
+use crate::admin::proxy_pool::{ProxyHealth, ProxyQualityStatus};
 use crate::kiro::model::credentials::CredentialMetadata;
 use serde::{Deserialize, Serialize};
 
@@ -763,6 +763,16 @@ pub struct ProxyPoolEntry {
     pub consecutive_failures: u32,
     /// 是否由健康检查自动禁用
     pub auto_disabled: bool,
+    /// 代理出口 IP（由纯净度检查观测）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality_score: Option<u8>,
+    pub quality_status: ProxyQualityStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_quality_checked_at: Option<String>,
 }
 
 /// 代理池列表响应
@@ -794,6 +804,52 @@ pub struct ProxyCheckAllResponse {
     pub healthy: usize,
     pub unhealthy: usize,
     pub auto_disabled: usize,
+}
+
+/// 代理纯净度检查配置。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyQualityConfigResponse {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub concurrency: usize,
+    pub min_score: u8,
+    pub ip_echo_url: String,
+    pub quality_url: String,
+    pub auto_assign: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetProxyQualityConfigRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+    #[serde(default)]
+    pub concurrency: Option<usize>,
+    #[serde(default)]
+    pub min_score: Option<u8>,
+    #[serde(default)]
+    pub ip_echo_url: Option<String>,
+    #[serde(default)]
+    pub quality_url: Option<String>,
+    #[serde(default)]
+    pub auto_assign: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyQualityRunResponse {
+    pub checked: usize,
+    pub clean: usize,
+    pub dirty: usize,
+    pub errors: usize,
+    pub disabled: usize,
+    pub generated: usize,
+    pub assigned: usize,
+    pub available_clean: usize,
+    pub required_credentials: usize,
 }
 
 /// 轮询批量分配请求

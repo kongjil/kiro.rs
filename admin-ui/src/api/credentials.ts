@@ -20,6 +20,9 @@ import type {
   BatchAddProxyResponse,
   AssignProxyRequest,
   ProxyCheckResponse,
+  ProxyQualityConfigResponse,
+  ProxyQualityRunResponse,
+  SetProxyQualityConfigRequest,
   ProxyCheckAllResponse,
   AssignRoundRobinResponse,
   StartIdcLoginRequest,
@@ -423,6 +426,21 @@ export async function checkProxy(id: number): Promise<ProxyCheckResponse> {
 // 触发全部代理健康检查
 export async function checkAllProxies(): Promise<ProxyCheckAllResponse> {
   const { data } = await api.post<ProxyCheckAllResponse>('/proxy-pool/check-all')
+  return data
+}
+
+export async function getProxyQualityConfig(): Promise<ProxyQualityConfigResponse> {
+  const { data } = await api.get<ProxyQualityConfigResponse>('/proxy-quality')
+  return data
+}
+
+export async function setProxyQualityConfig(req: SetProxyQualityConfigRequest): Promise<ProxyQualityConfigResponse> {
+  const { data } = await api.put<ProxyQualityConfigResponse>('/proxy-quality', req)
+  return data
+}
+
+export async function runProxyQualityCheck(): Promise<ProxyQualityRunResponse> {
+  const { data } = await api.post<ProxyQualityRunResponse>('/proxy-quality/check')
   return data
 }
 

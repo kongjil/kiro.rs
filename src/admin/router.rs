@@ -21,6 +21,7 @@ use super::{
         get_api_domain, get_cache_metering_config, get_session_affinity_config,
         get_load_balancing_mode, get_log_governance_config, get_model_api_retry_config,
         get_proxy_pool, get_quota_reset_recovery_config, get_self_heal_config, get_update_config, list_client_keys, list_groups,
+        get_proxy_quality_config, run_proxy_quality_check, set_proxy_quality_config,
         list_traces, poll_idc_login,
         poll_idc_relogin, poll_social_login, poll_social_relogin, pull_update_image,
         reset_all_success_count, reset_client_key_stats, reset_failure_count, reset_success_count,
@@ -108,6 +109,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/proxy-pool/{id}", delete(delete_proxy))
         .route("/proxy-pool/{id}/enabled", post(set_proxy_enabled))
         .route("/proxy-pool/{id}/check", post(check_proxy))
+        .route(
+            "/proxy-quality",
+            get(get_proxy_quality_config).put(set_proxy_quality_config),
+        )
+        .route("/proxy-quality/check", post(run_proxy_quality_check))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
