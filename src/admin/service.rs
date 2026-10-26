@@ -1608,6 +1608,7 @@ impl AdminService {
 
         // 构建凭据对象
         let email = req.email.clone();
+        let wait_for_proxy_precheck = self.proxy_pool.quality_config().enabled;
         let new_cred = KiroCredentials {
             id: None,
             access_token: req.access_token,
@@ -1632,8 +1633,8 @@ impl AdminService {
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
-            disabled: false, // 新添加的凭据默认启用
-            disabled_reason: None,
+            disabled: wait_for_proxy_precheck,
+            disabled_reason: wait_for_proxy_precheck.then(|| "ProxyPrecheck".to_string()),
             self_heal_consecutive_rounds: 0,
             self_heal_total_count: 0,
             last_self_heal_at: None,
@@ -3250,6 +3251,7 @@ impl AdminService {
             interval_secs: config.interval_secs,
             concurrency: config.concurrency,
             min_score: config.min_score,
+            precheck_min_ips: config.precheck_min_ips,
             ip_echo_url: config.ip_echo_url,
             quality_url: config.quality_url,
             auto_assign: config.auto_assign,
@@ -3265,6 +3267,7 @@ impl AdminService {
         if let Some(value) = request.interval_secs { config.interval_secs = value; }
         if let Some(value) = request.concurrency { config.concurrency = value; }
         if let Some(value) = request.min_score { config.min_score = value; }
+        if let Some(value) = request.precheck_min_ips { config.precheck_min_ips = value; }
         if let Some(value) = request.ip_echo_url { config.ip_echo_url = value; }
         if let Some(value) = request.quality_url { config.quality_url = value; }
         if let Some(value) = request.auto_assign { config.auto_assign = value; }
@@ -3276,6 +3279,7 @@ impl AdminService {
             interval_secs: config.interval_secs,
             concurrency: config.concurrency,
             min_score: config.min_score,
+            precheck_min_ips: config.precheck_min_ips,
             ip_echo_url: config.ip_echo_url,
             quality_url: config.quality_url,
             auto_assign: config.auto_assign,
@@ -3286,20 +3290,29 @@ impl AdminService {
     /// 从 sid 模板生成候选链接并继续检查，直到满足账号数或模板耗尽。
     pub async fn run_proxy_quality_check(&self) -> ProxyQualityRunResponse {
         let snapshot = self.token_manager.snapshot();
-        let active_credentials: Vec<_> = snapshot.entries.iter().filter(|entry| !entry.disabled).collect();
+        // 正常账号 + 等待代理预检的新账号都需要占用一个独立出口；手动禁用或
+        // 因额度/鉴权失败禁用的账号不参与本轮预检。
+        let target_credentials: Vec<_> = snapshot.entries.iter()
+            .filter(|entry| !entry.disabled || entry.disabled_reason.as_deref() == Some("ProxyPrecheck"))
+            .collect();
+        let pending_ids: HashSet<u64> = target_credentials.iter()
+            .filter(|entry| entry.disabled_reason.as_deref() == Some("ProxyPrecheck"))
+            .map(|entry| entry.id)
+            .collect();
         let run_started = Utc::now().to_rfc3339();
         // 兼容直接在凭据编辑器中填入代理的旧用法：先把这些 URL 纳入代理池，
         // 这样插件可以记录 sid 模板并在后续缺口时自动生成替代链接。
         let known_urls: HashSet<String> = self.proxy_pool.list().into_iter().map(|entry| entry.url).collect();
-        for url in active_credentials.iter().filter_map(|entry| entry.proxy_url.clone()) {
+        for url in target_credentials.iter().filter_map(|entry| entry.proxy_url.clone()) {
             if !known_urls.contains(&url) {
                 let _ = self.proxy_pool.add(url, Some("credential-imported".to_string()));
             }
         }
-        let mut used_urls: HashSet<String> = active_credentials.iter()
+        let mut used_urls: HashSet<String> = target_credentials.iter()
             .filter_map(|entry| entry.proxy_url.clone()).collect();
         let mut summary = self.proxy_pool.quality_check_urls(Some(&used_urls)).await;
-        let required = active_credentials.len();
+        let required_credentials = target_credentials.len();
+        let required = required_credentials.max(self.proxy_pool.quality_config().precheck_min_ips);
         let mut clean = self.proxy_pool.clean_entries();
         clean.retain(|entry| entry.last_quality_checked_at.as_deref().is_some_and(|checked_at| checked_at >= run_started.as_str()));
         if self.proxy_pool.quality_config().auto_assign && clean.len() < required {
@@ -3337,7 +3350,8 @@ impl AdminService {
         let mut used_ips = HashSet::new();
         let mut assigned = 0;
         let mut clean_iter = clean.iter();
-        for credential in active_credentials {
+        let mut ready_pending_ids = HashSet::new();
+        for credential in target_credentials {
             let current = credential.proxy_url.as_deref().and_then(|url| {
                 clean.iter().find(|entry| entry.url == url && entry.observed_ip.as_ref().is_some_and(|ip| used_ips.insert(ip.clone())))
             });
@@ -3348,9 +3362,20 @@ impl AdminService {
                 }
                 continue;
             };
+            if pending_ids.contains(&credential.id) {
+                ready_pending_ids.insert(credential.id);
+            }
             if credential.proxy_url.as_deref() != Some(selected.url.as_str()) {
                 if self.token_manager.update_credential(credential.id, None, Some(Some(selected.url.clone())), None, None, None, None, None).is_ok() {
                     assigned += 1;
+                }
+            }
+        }
+        // 只有预检达到最低库存，且每个等待账号都已经拿到唯一 IP，才解除等待状态。
+        if clean.len() >= required {
+            for id in pending_ids.intersection(&ready_pending_ids) {
+                if let Err(error) = self.token_manager.set_disabled(*id, false) {
+                    tracing::warn!("代理预检完成后启用凭据 #{} 失败: {}", id, error);
                 }
             }
         }
@@ -3363,7 +3388,7 @@ impl AdminService {
             generated: summary.generated,
             assigned,
             available_clean: clean.len(),
-            required_credentials: required,
+            required_credentials,
         }
     }
 

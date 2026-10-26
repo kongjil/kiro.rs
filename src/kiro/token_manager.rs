@@ -1043,6 +1043,8 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 代理纯净度预检未完成，暂不参与路由。
+    ProxyPrecheck,
 }
 
 impl DisabledReason {
@@ -1055,6 +1057,7 @@ impl DisabledReason {
             Self::QuotaExceeded => "QuotaExceeded",
             Self::InvalidRefreshToken => "InvalidRefreshToken",
             Self::InvalidConfig => "InvalidConfig",
+            Self::ProxyPrecheck => "ProxyPrecheck",
         }
     }
 
@@ -1067,6 +1070,7 @@ impl DisabledReason {
             "QuotaExceeded" => Some(Self::QuotaExceeded),
             "InvalidRefreshToken" => Some(Self::InvalidRefreshToken),
             "InvalidConfig" => Some(Self::InvalidConfig),
+            "ProxyPrecheck" => Some(Self::ProxyPrecheck),
             _ => None,
         }
     }

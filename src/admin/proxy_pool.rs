@@ -112,6 +112,9 @@ pub struct ProxyQualityConfig {
     pub concurrency: usize,
     #[serde(default = "default_quality_min_score")]
     pub min_score: u8,
+    /// 预检时至少保持的干净且出口 IP 唯一的备用数量。
+    #[serde(default)]
+    pub precheck_min_ips: usize,
     #[serde(default = "default_ip_echo_url")]
     pub ip_echo_url: String,
     #[serde(default = "default_quality_url")]
@@ -133,6 +136,7 @@ impl Default for ProxyQualityConfig {
             interval_secs: DEFAULT_QUALITY_INTERVAL_SECS,
             concurrency: DEFAULT_QUALITY_CONCURRENCY,
             min_score: DEFAULT_QUALITY_MIN_SCORE,
+            precheck_min_ips: 0,
             ip_echo_url: default_ip_echo_url(),
             quality_url: default_quality_url(),
             auto_assign: true,
@@ -145,6 +149,7 @@ impl ProxyQualityConfig {
         self.interval_secs = self.interval_secs.clamp(60, 86_400);
         self.concurrency = self.concurrency.clamp(1, 64);
         self.min_score = self.min_score.min(100);
+        self.precheck_min_ips = self.precheck_min_ips.min(100_000);
         if self.ip_echo_url.trim().is_empty() { self.ip_echo_url = default_ip_echo_url(); }
         if self.quality_url.trim().is_empty() { self.quality_url = default_quality_url(); }
         self

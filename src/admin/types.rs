@@ -814,6 +814,7 @@ pub struct ProxyQualityConfigResponse {
     pub interval_secs: u64,
     pub concurrency: usize,
     pub min_score: u8,
+    pub precheck_min_ips: usize,
     pub ip_echo_url: String,
     pub quality_url: String,
     pub auto_assign: bool,
@@ -830,6 +831,8 @@ pub struct SetProxyQualityConfigRequest {
     pub concurrency: Option<usize>,
     #[serde(default)]
     pub min_score: Option<u8>,
+    #[serde(default)]
+    pub precheck_min_ips: Option<usize>,
     #[serde(default)]
     pub ip_echo_url: Option<String>,
     #[serde(default)]

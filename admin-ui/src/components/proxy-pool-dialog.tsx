@@ -56,6 +56,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const [showBatch, setShowBatch] = useState(false)
   const [batchErrors, setBatchErrors] = useState<string[]>([])
   const [qualityMinScore, setQualityMinScore] = useState<number | undefined>()
+  const [precheckMinIps, setPrecheckMinIps] = useState<number | undefined>()
   const [qualityInterval, setQualityInterval] = useState<number | undefined>()
   const [qualityConcurrency, setQualityConcurrency] = useState<number | undefined>()
   const queryClient = useQueryClient()
@@ -82,6 +83,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     mutationFn: () => setProxyQualityConfig({
       enabled: qualityConfig?.enabled ?? true,
       minScore: qualityMinScore ?? qualityConfig?.minScore ?? 50,
+      precheckMinIps: precheckMinIps ?? qualityConfig?.precheckMinIps ?? 0,
       intervalSecs: qualityInterval ?? qualityConfig?.intervalSecs ?? 6000,
       concurrency: qualityConcurrency ?? qualityConfig?.concurrency ?? 10,
       autoAssign: true,
@@ -347,7 +349,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                 {qualityConfig?.enabled ? '已开启' : '已关闭'}
               </Button>
             </div>
-            <div className="grid grid-cols-3 gap-2">
+            <div className="grid grid-cols-4 gap-2">
               <label className="text-xs text-muted-foreground">最低评分
                 <Input type="number" min={0} max={100} value={qualityMinScore ?? qualityConfig?.minScore ?? 50} onChange={(e) => setQualityMinScore(Number(e.target.value))} className="mt-1 h-8" />
               </label>
@@ -356,6 +358,9 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
               </label>
               <label className="text-xs text-muted-foreground">并发
                 <Input type="number" min={1} max={64} value={qualityConcurrency ?? qualityConfig?.concurrency ?? 10} onChange={(e) => setQualityConcurrency(Number(e.target.value))} className="mt-1 h-8" />
+              </label>
+              <label className="text-xs text-muted-foreground">预检最少 IP
+                <Input type="number" min={0} value={precheckMinIps ?? qualityConfig?.precheckMinIps ?? 0} onChange={(e) => setPrecheckMinIps(Number(e.target.value))} className="mt-1 h-8" />
               </label>
             </div>
             <div className="flex gap-2">

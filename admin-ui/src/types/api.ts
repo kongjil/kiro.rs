@@ -316,6 +316,7 @@ export interface ProxyQualityConfigResponse {
   intervalSecs: number
   concurrency: number
   minScore: number
+  precheckMinIps: number
   ipEchoUrl: string
   qualityUrl: string
   autoAssign: boolean
@@ -326,6 +327,7 @@ export interface SetProxyQualityConfigRequest {
   intervalSecs?: number
   concurrency?: number
   minScore?: number
+  precheckMinIps?: number
   ipEchoUrl?: string
   qualityUrl?: string
   autoAssign?: boolean
