@@ -144,8 +144,6 @@ pub struct KiroProvider {
     /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
-    /// Short per-model cooldowns prevent concurrent clients from amplifying overload.
-    model_cooldowns: Mutex<HashMap<String, Instant>>,
 }
 
 impl KiroProvider {
@@ -191,7 +189,6 @@ impl KiroProvider {
             endpoints,
             default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
-            model_cooldowns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -766,20 +763,6 @@ impl KiroProvider {
         // 尝试从请求体中提取模型与会话标识
         let (model, session_id) = Self::extract_routing_hints(request_body);
 
-        if let Some(model) = model.as_ref() {
-            let now = Instant::now();
-            let mut cooldowns = self.model_cooldowns.lock();
-            cooldowns.retain(|_, until| *until > now);
-            if let Some(until) = cooldowns.get(&model.to_ascii_lowercase()) {
-                let remaining = until.saturating_duration_since(now);
-                let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
-                return Err(UpstreamModelUnavailableError {
-                    retry_after: seconds.max(1).to_string(),
-                }
-                .into());
-            }
-        }
-
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）；同一会话优先沿用上一轮凭据
@@ -982,28 +965,9 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
+                // 只让本次请求失败，不做模型级全局冷却：过载通常只落在个别账号/节点上，
+                // 全局冷却会把一次过载放大成冷却期内该模型的所有请求都直接 503。
                 let delay = retry_after.retry_after().unwrap_or("5").to_string();
-                let seconds = delay
-                    .parse::<u64>()
-                    .ok()
-                    .or_else(|| {
-                        httpdate::parse_http_date(&delay).ok().map(|date| {
-                            date.duration_since(std::time::SystemTime::now())
-                                .unwrap_or_default()
-                                .as_secs()
-                                .saturating_add(1)
-                        })
-                    })
-                    .unwrap_or(5)
-                    .max(1);
-                if let Some(model) = model.as_ref() {
-                    let mut cooldowns = self.model_cooldowns.lock();
-                    let now = Instant::now();
-                    cooldowns.retain(|_, until| *until > now);
-                    if let Some(until) = now.checked_add(Duration::from_secs(seconds)) {
-                        cooldowns.insert(model.to_ascii_lowercase(), until);
-                    }
-                }
                 return Err(UpstreamModelUnavailableError { retry_after: delay }.into());
             }
 
