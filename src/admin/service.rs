@@ -3212,6 +3212,21 @@ impl AdminService {
             None => None, // 清除代理
         };
 
+        if let Some(ref url) = proxy_url {
+            let duplicate_owner = self
+                .token_manager
+                .snapshot()
+                .entries
+                .into_iter()
+                .find(|entry| entry.id != credential_id && entry.proxy_url.as_deref() == Some(url));
+            if let Some(owner) = duplicate_owner {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "该代理已分配给账号 #{}；一账号一代理，请选择未使用的代理",
+                    owner.id
+                )));
+            }
+        }
+
         self.token_manager
             .update_credential(
                 credential_id,
@@ -3369,15 +3384,24 @@ impl AdminService {
         let mut ready_pending_ids = HashSet::new();
         for credential in target_credentials {
             let current = credential.proxy_url.as_deref().and_then(|url| {
-                clean.iter().find(|entry| entry.url == url && entry.observed_ip.as_ref().is_some_and(|ip| used_ips.insert(ip.clone())))
+                clean.iter().find(|entry| {
+                    entry.url == url
+                        && entry.observed_ip.as_ref().is_some_and(|ip| used_ips.insert(ip.clone()))
+                })
             });
-            let selected = current.or_else(|| clean_iter.find(|entry| entry.observed_ip.as_ref().is_some_and(|ip| !used_ips.contains(ip))));
+            let selected = current.or_else(|| {
+                clean_iter
+                    .find(|entry| entry.observed_ip.as_ref().is_some_and(|ip| !used_ips.contains(ip)))
+            });
             let Some(selected) = selected else {
                 if credential.proxy_url.is_some() {
                     let _ = self.token_manager.update_credential(credential.id, None, Some(None), None, None, None, None, None);
                 }
                 continue;
             };
+            if let Some(ip) = selected.observed_ip.as_ref() {
+                used_ips.insert(ip.clone());
+            }
             if pending_ids.contains(&credential.id) {
                 ready_pending_ids.insert(credential.id);
             }
@@ -3416,7 +3440,9 @@ impl AdminService {
         &self,
         credential_ids: Option<Vec<u64>>,
     ) -> Result<AssignRoundRobinResponse, AdminServiceError> {
-        let urls = self.proxy_pool.assignable_urls();
+        let mut urls = self.proxy_pool.assignable_urls();
+        urls.sort();
+        urls.dedup();
         if urls.is_empty() {
             return Err(AdminServiceError::InvalidCredential(
                 "没有可用代理（需已启用且健康检查未失败）".to_string(),
@@ -3434,15 +3460,22 @@ impl AdminService {
                 .collect(),
         };
 
+        if urls.len() < target_ids.len() {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "一账号一代理需要至少 {} 条可用且互不重复的代理，当前只有 {} 条；未执行分配",
+                target_ids.len(),
+                urls.len()
+            )));
+        }
+
         let mut assigned = 0;
-        for (i, cred_id) in target_ids.iter().enumerate() {
-            let url = urls[i % urls.len()].clone();
+        for (cred_id, url) in target_ids.iter().zip(urls.iter()) {
             if self
                 .token_manager
                 .update_credential(
                     *cred_id,
                     None,
-                    Some(Some(url)),
+                    Some(Some(url.clone())),
                     None,
                     None,
                     None,

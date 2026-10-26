@@ -1,53 +1,33 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { toast } from 'sonner'
+import { Activity, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { SettingGroup, SettingRow } from '@/components/console/setting-row'
 import {
-  SettingGroup,
-  SettingRow,
-  useFieldSaver,
-} from '@/components/console/setting-row'
-import { useGlobalProxy, useSetGlobalProxy } from '@/hooks/use-credentials'
-import { batchAddProxies, getProxyPool, setGlobalProxy } from '@/api/credentials'
-import { maskProxyUrl, extractErrorMessage } from '@/lib/utils'
-import { reportSaveError } from '@/components/settings/report-error'
+  batchAddProxies,
+  assignProxiesRoundRobin,
+  getCredentials,
+  getGlobalProxy,
+  getProxyPool,
+  getProxyQualityConfig,
+  runProxyQualityCheck,
+  setProxyQualityConfig,
+  setGlobalProxy,
+} from '@/api/credentials'
+import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-/**
- * 网络分区：全局出站代理。
- *
- * 代理地址填错会让**所有**上游请求立刻失败，所以要求显式「应用」按钮，
- * 并对 URL 做基本协议校验。
- */
-const PROXY_SCHEMES = [
-  'http://',
-  'https://',
-  'socks4://',
-  'socks4a://',
-  'socks5://',
-  'socks5h://',
-]
-
 export function NetworkSection() {
-  const { data, isLoading } = useGlobalProxy()
-  const { mutate } = useSetGlobalProxy()
-  const saver = useFieldSaver(mutate, reportSaveError)
-  const isPending = saver.isSaving('proxy')
-  const saved = saver.isSaved('proxy')
-  const queryClient = useQueryClient()
-  const { data: proxyPool } = useQuery({
-    queryKey: ['proxy-pool'],
-    queryFn: getProxyPool,
-  })
-
-  const currentUrl = data?.proxyUrl ?? null
-  const currentUsername = data?.proxyUsername ?? null
-  const currentPasswordSet = data?.proxyPasswordSet ?? false
-
-  const [draftUrl, setDraftUrl] = useState('')
-  const [draftUsername, setDraftUsername] = useState('')
-  const [draftPassword, setDraftPassword] = useState('')
   const [batchText, setBatchText] = useState('')
+  const [precheckMinIps, setPrecheckMinIps] = useState<number | undefined>()
+  const queryClient = useQueryClient()
+
+  const { data: pool } = useQuery({ queryKey: ['proxy-pool'], queryFn: getProxyPool })
+  const { data: credentials } = useQuery({ queryKey: ['credentials'], queryFn: getCredentials })
+  const { data: globalProxy } = useQuery({ queryKey: ['global-proxy'], queryFn: getGlobalProxy })
+  const { data: qualityConfig } = useQuery({ queryKey: ['proxy-quality-config'], queryFn: getProxyQualityConfig })
 
   const batchMutation = useMutation({
     mutationFn: () => batchAddProxies({
@@ -58,209 +38,158 @@ export function NetworkSection() {
       queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
       toast.success(`代理池导入完成：成功 ${result.added} 条，跳过 ${result.errors} 条`)
     },
-    onError: (error) => toast.error(`代理池导入失败：${extractErrorMessage(error)}`),
+    onError: (error) => toast.error(`代理导入失败：${extractErrorMessage(error)}`),
   })
 
-  const usePoolProxyMutation = useMutation({
-    mutationFn: (url: string) => setGlobalProxy({ proxyUrl: url }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['global-proxy'] }),
-    onError: (error) => toast.error(`设置全局代理失败：${extractErrorMessage(error)}`),
+  const assignMutation = useMutation({
+    mutationFn: () => assignProxiesRoundRobin(),
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
+      toast.success(`一对一分配完成：${result.assigned} 个账号，使用 ${result.proxyCount} 条代理`)
+    },
+    onError: (error) => toast.error(`分配失败：${extractErrorMessage(error)}`),
   })
 
-  useEffect(() => {
-    setDraftUrl(currentUrl ?? '')
-    setDraftUsername(currentUsername ?? '')
-    setDraftPassword('')
-  }, [currentUrl, currentUsername, currentPasswordSet])
+  const precheckMutation = useMutation({
+    mutationFn: async () => {
+      await setProxyQualityConfig({
+        enabled: true,
+        autoAssign: true,
+        precheckMinIps: precheckMinIps ?? qualityConfig?.precheckMinIps ?? 0,
+      })
+      return runProxyQualityCheck()
+    },
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['proxy-quality-config'] })
+      toast.success(
+        `预检完成：已检查 ${result.checked} 条，干净 ${result.clean} 条，新增 ${result.generated} 条；账号 ${result.requiredCredentials} 个，干净 IP ${result.availableClean} 条，分配/更新 ${result.assigned} 个。`
+      )
+    },
+    onError: (error) => toast.error(`预检失败：${extractErrorMessage(error)}`),
+  })
 
-  const buildPayload = () => {
-    const url = draftUrl.trim() || null
-    if (!url) return null
-    return {
-      proxyUrl: url,
-      proxyUsername: draftUsername.trim() || null,
-      ...(draftPassword ? { proxyPassword: draftPassword } : {}),
+  const clearLegacyGlobalMutation = useMutation({
+    mutationFn: () => setGlobalProxy({ proxyUrl: null }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['global-proxy'] })
+      toast.success('旧的全局代理兜底已清除；后续只走账号专属代理')
+    },
+    onError: (error) => toast.error(`清除失败：${extractErrorMessage(error)}`),
+  })
+
+  const handleClearLegacyGlobal = () => {
+    if (window.confirm('清除旧的全局代理兜底？只有已绑定账号专属代理的账号还能通过代理访问上游。')) {
+      clearLegacyGlobalMutation.mutate()
     }
   }
 
-  const apply = () => {
-    const url = draftUrl.trim()
-    if (!url) {
-      toast.error('代理地址不能为空。要停用请点「清除」。')
-      return
-    }
-    if (!PROXY_SCHEMES.some((s) => url.toLowerCase().startsWith(s))) {
-      toast.error(`代理地址需以 ${PROXY_SCHEMES.join(' / ')} 开头`)
-      return
-    }
-    const payload = buildPayload()
-    if (!payload) return
-    saver.save('proxy', payload)
-  }
-
-  const clear = () => {
-    setDraftUrl('')
-    setDraftUsername('')
-    setDraftPassword('')
-    saver.save('proxy', { proxyUrl: null })
-  }
-
-  const hint = currentUrl
-    ? `当前生效：${maskProxyUrl(currentUrl)}${currentUsername ? ` (${currentUsername})` : ''}`
-    : '未配置，直连上游。支持 HTTP / HTTPS / SOCKS，可填写认证凭据'
+  const enabledProxies = pool?.proxies.filter((proxy) => proxy.enabled) ?? []
 
   return (
     <SettingGroup
-      title="全局出站代理"
-      description="所有上游请求默认走这个代理；未绑定专属代理的凭据都受它影响"
+      title="账号专属代理"
+      description="每个 Kiro 账号单独绑定一条代理；预检通过后按出口 IP 去重分配，不把代理设为全局共享。"
     >
-      <SettingRow label="代理地址" hint={hint} pending={isPending} saved={saved}>
-        <div className="flex flex-wrap items-center gap-1.5">
-          <Input
-            value={draftUrl}
-            onChange={(e) => setDraftUrl(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') apply()
-              if (e.key === 'Escape') {
-                setDraftUrl(currentUrl ?? '')
-                setDraftUsername(currentUsername ?? '')
-                setDraftPassword('')
-              }
-            }}
-            placeholder="socks5://host:1080"
-            disabled={isLoading || isPending}
-            spellCheck={false}
-            autoComplete="off"
-            className="console-num h-8 w-[min(20rem,60vw)] text-[12.5px]"
-          />
+      {globalProxy?.proxyUrl && (
+        <SettingRow
+          label="旧的全局代理兜底"
+          hint={`仍有全局代理配置：${maskProxyUrl(globalProxy.proxyUrl)}。未绑定专属代理的账号会回退使用它。`}
+        >
           <Button
             size="sm"
-            variant="outline"
-            onClick={apply}
-            disabled={isLoading || isPending || !draftUrl.trim()}
+            variant="destructive"
+            onClick={handleClearLegacyGlobal}
+            disabled={clearLegacyGlobalMutation.isPending}
           >
-            应用
+            <Trash2 className="mr-1 h-3.5 w-3.5" />
+            {clearLegacyGlobalMutation.isPending ? '清除中…' : '清除全局兜底'}
           </Button>
-          {currentUrl && (
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={clear}
-              disabled={isPending}
-              title="停用全局代理，恢复直连"
-            >
-              清除
-            </Button>
-          )}
-        </div>
-      </SettingRow>
-
-      {(currentUrl || draftUrl.trim()) && (
-        <>
-          <SettingRow
-            label="认证用户名"
-            hint="选填，代理要求 Basic Auth 时填写"
-            pending={isPending}
-            saved={saved}
-          >
-            <Input
-              value={draftUsername}
-              onChange={(e) => setDraftUsername(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Escape') setDraftUsername(currentUsername ?? '')
-              }}
-              placeholder="留空则不认证"
-              disabled={isLoading || isPending}
-              spellCheck={false}
-              autoComplete="off"
-              className="console-num h-8 w-[min(16rem,50vw)] text-[12.5px]"
-            />
-          </SettingRow>
-          <SettingRow
-            label="认证密码"
-            hint={currentPasswordSet ? '已配置密码；留空保存时保留现有密码' : '选填，与用户名配合使用'}
-            pending={isPending}
-            saved={saved}
-          >
-            <Input
-              type="password"
-              value={draftPassword}
-              onChange={(e) => setDraftPassword(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Escape') setDraftPassword('')
-              }}
-              placeholder={currentPasswordSet ? '已配置，留空则保留' : '留空则不认证'}
-              disabled={isLoading || isPending}
-              spellCheck={false}
-              autoComplete="new-password"
-              className="console-num h-8 w-[min(16rem,50vw)] text-[12.5px]"
-            />
-            {currentPasswordSet && (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  setDraftPassword('')
-                  saver.save('proxy', {
-                    proxyUrl: currentUrl,
-                    proxyUsername: currentUsername,
-                    proxyPassword: null,
-                  })
-                }}
-                disabled={isLoading || isPending}
-                title="清除已保存的代理密码"
-              >
-                清除密码
-              </Button>
-            )}
-          </SettingRow>
-        </>
+        </SettingRow>
       )}
 
       <SettingRow
-        label="同步代理池"
-        hint="与凭据管理中的代理池共用数据；每行一个完整 URL，可包含用户名和密码"
-        pending={batchMutation.isPending || usePoolProxyMutation.isPending}
+        label="导入代理池"
+        hint="每行一条完整代理 URL；支持 socks5://用户名:密码@主机:端口，认证信息会保留在该代理链接内。"
       >
         <div className="w-full space-y-2">
           <textarea
             value={batchText}
             onChange={(event) => setBatchText(event.target.value)}
             placeholder={'socks5://用户名:密码@主机:端口\nsocks5://用户名:密码@主机:端口'}
-            className="min-h-[76px] w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-[12px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+            className="min-h-[96px] w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-[12px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
             spellCheck={false}
           />
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-2">
             <Button
               size="sm"
               variant="outline"
               onClick={() => batchMutation.mutate()}
               disabled={batchMutation.isPending || !batchText.trim()}
             >
-              批量导入到代理池
+              {batchMutation.isPending ? '导入中…' : '批量导入'}
             </Button>
-            <span className="text-xs text-muted-foreground">
-              已有 {proxyPool?.total ?? 0} 条
-            </span>
+            <span className="text-xs text-muted-foreground">代理池 {pool?.total ?? 0} 条</span>
           </div>
-          {proxyPool && proxyPool.proxies.length > 0 && (
-            <div className="max-h-36 space-y-1 overflow-y-auto rounded-md border p-1.5">
-              {proxyPool.proxies.filter((proxy) => proxy.enabled).map((proxy) => (
-                <div key={proxy.id} className="flex items-center justify-between gap-2 px-1 text-xs">
-                  <span className="min-w-0 truncate font-mono" title={proxy.url}>{maskProxyUrl(proxy.url)}</span>
-                  <Button
-                    size="sm"
-                    variant={proxy.url === currentUrl ? 'secondary' : 'ghost'}
-                    className="h-7 shrink-0 px-2 text-xs"
-                    onClick={() => usePoolProxyMutation.mutate(proxy.url)}
-                    disabled={usePoolProxyMutation.isPending || proxy.url === currentUrl}
-                  >
-                    {proxy.url === currentUrl ? '当前全局' : '设为全局'}
-                  </Button>
-                </div>
-              ))}
-            </div>
+        </div>
+      </SettingRow>
+
+      <SettingRow
+        label="一账号一代理预检"
+        hint={`当前账号 ${credentials?.total ?? 0} 个；启用前检查出口 IP、去重，不足时先检查备用链接并按 sid 模板补充。`}
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="text-xs text-muted-foreground">
+            最少保留干净 IP
+            <Input
+              type="number"
+              min={0}
+              value={precheckMinIps ?? qualityConfig?.precheckMinIps ?? 0}
+              onChange={(event) => setPrecheckMinIps(Math.max(0, Number(event.target.value)))}
+              className="mt-1 h-8 w-36"
+            />
+          </label>
+          <Button
+            size="sm"
+            onClick={() => precheckMutation.mutate()}
+            disabled={precheckMutation.isPending}
+          >
+            <Activity className="mr-1 h-3.5 w-3.5" />
+            {precheckMutation.isPending ? '预检中…' : '预检并一对一分配'}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => assignMutation.mutate()}
+            disabled={assignMutation.isPending}
+          >
+            {assignMutation.isPending ? '分配中…' : '一对一分配现有代理'}
+          </Button>
+          <span className="text-xs text-muted-foreground">默认每 100 分钟自动检查，并发 10</span>
+        </div>
+      </SettingRow>
+
+      <SettingRow label="代理池状态" hint="同一条代理不会被手动分配给多个账号；质量检查通过的出口 IP 会显示在这里。">
+        <div className="max-h-56 w-full space-y-1 overflow-y-auto rounded-md border p-2">
+          {enabledProxies.length === 0 && (
+            <div className="py-3 text-center text-xs text-muted-foreground">代理池暂无启用代理</div>
           )}
+          {enabledProxies.map((proxy) => (
+            <div key={proxy.id} className="flex items-center justify-between gap-2 rounded px-1 py-1 text-xs">
+              <div className="min-w-0">
+                <div className="truncate font-mono" title={proxy.url}>{maskProxyUrl(proxy.url)}</div>
+                <div className="mt-0.5 flex flex-wrap gap-2 text-muted-foreground">
+                  {proxy.observedIp && <span>出口 IP {proxy.observedIp}</span>}
+                  {proxy.credentialCount > 0 && <span>绑定 {proxy.credentialCount} 个账号</span>}
+                </div>
+              </div>
+              <Badge variant={proxy.qualityStatus === 'clean' ? 'secondary' : 'outline'}>
+                {proxy.qualityStatus === 'clean' ? '纯净' : proxy.qualityStatus === 'dirty' ? '脏 IP' : proxy.qualityStatus === 'error' ? '检查错误' : '待检查'}
+              </Badge>
+            </div>
+          ))}
         </div>
       </SettingRow>
     </SettingGroup>
