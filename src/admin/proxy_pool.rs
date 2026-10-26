@@ -219,22 +219,19 @@ pub struct ProxyPoolManager {
 
 /// 校验代理 URL 的 scheme 是否合法
 fn validate_proxy_url(url: &str) -> anyhow::Result<()> {
-    let valid_schemes = ["http://", "https://", "socks5://", "socks4://"];
-    if !valid_schemes.iter().any(|s| url.starts_with(s)) {
+    let parsed = reqwest::Url::parse(url).map_err(|_| anyhow::anyhow!("代理 URL 格式无效: {}", url))?;
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    let valid_schemes = ["http", "https", "socks4", "socks4a", "socks5", "socks5h"];
+    if !valid_schemes.contains(&scheme.as_str()) {
         anyhow::bail!(
-            "代理 URL scheme 无效，支持: http/https/socks4/socks5（收到: {}）",
-            url
+            "代理 URL scheme 无效，支持: http/https/socks4/socks4a/socks5/socks5h（收到: {}）",
+            parsed.scheme()
         );
     }
-    // 简单检查 host:port 存在
-    let after_scheme = valid_schemes
-        .iter()
-        .find(|s| url.starts_with(*s))
-        .map(|s| &url[s.len()..])
-        .unwrap_or(url);
-    // after_scheme 可能是 user:pass@host:port 或 host:port
-    let host_part = after_scheme.rsplit('@').next().unwrap_or(after_scheme);
-    if !host_part.contains(':') {
+    if parsed.host_str().is_none() {
+        anyhow::bail!("代理 URL 缺少主机: {}", url);
+    }
+    if parsed.port().is_none() {
         anyhow::bail!("代理 URL 缺少端口号: {}", url);
     }
     Ok(())
@@ -864,6 +861,20 @@ mod tests {
     fn sid_url_derives_generation_template() {
         let url = "socks5://user:pass@host:3010/path-sid-AbC12345-t-5";
         assert_eq!(derive_template(url), Some("socks5://user:pass@host:3010/path-sid-{sid}-t-5".to_string()));
+    }
+
+    #[test]
+    fn batch_add_accepts_authenticated_socks5_urls() {
+        let manager = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        let urls = vec![
+            "socks5://bvfr1184448-region-US-st-California-sid-yMUGLq5C-t-5:sgydhxnf@us2.cliproxy.io:3010".to_string(),
+            "socks5://bvfr1184448-region-US-st-California-sid-N7jfnSEp-t-5:sgydhxnf@us2.cliproxy.io:3010".to_string(),
+        ];
+        let (added, errors) = manager.batch_add(urls);
+        assert_eq!(added.len(), 2);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        assert_eq!(added[0].url, "socks5://bvfr1184448-region-US-st-California-sid-yMUGLq5C-t-5:sgydhxnf@us2.cliproxy.io:3010");
+        assert_eq!(added[0].source_template.as_deref(), Some("socks5://bvfr1184448-region-US-st-California-sid-{sid}-t-5:sgydhxnf@us2.cliproxy.io:3010"));
     }
 
     #[test]
