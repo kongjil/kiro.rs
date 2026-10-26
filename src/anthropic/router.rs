@@ -14,6 +14,7 @@ use crate::admin::trace_db::SharedTraceStore;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::ToolCompatibilityMode;
+use crate::model::config::SharedBillingPrices;
 
 use super::{
     cache_metering::SharedCacheMeter,
@@ -110,6 +111,32 @@ pub fn create_router_with_shared_provider_and_billing_prices(
     trace_store: Option<SharedTraceStore>,
     billing_prices: std::collections::HashMap<String, crate::model::config::BillingPrice>,
 ) -> Router {
+    create_router_with_shared_provider_and_shared_billing_prices(
+        kiro_provider,
+        extract_thinking,
+        tool_compatibility_mode,
+        client_keys,
+        usage_recorder,
+        usage_aggregator,
+        cache_meter,
+        trace_store,
+        Arc::new(parking_lot::RwLock::new(billing_prices)),
+    )
+}
+
+/// 创建共享 Provider 路由，并与 Admin 共用可热更新的模型价格表。
+#[allow(clippy::too_many_arguments)]
+pub fn create_router_with_shared_provider_and_shared_billing_prices(
+    kiro_provider: Option<Arc<KiroProvider>>,
+    extract_thinking: bool,
+    tool_compatibility_mode: ToolCompatibilityMode,
+    client_keys: Option<SharedClientKeyManager>,
+    usage_recorder: Option<SharedRecorder>,
+    usage_aggregator: Option<SharedAggregator>,
+    cache_meter: Option<SharedCacheMeter>,
+    trace_store: Option<SharedTraceStore>,
+    billing_prices: SharedBillingPrices,
+) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
         state = state.with_shared_kiro_provider(provider);
@@ -117,7 +144,7 @@ pub fn create_router_with_shared_provider_and_billing_prices(
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
-    state = state.with_billing_prices(billing_prices);
+    state = state.with_shared_billing_prices(billing_prices);
 
     // 需要认证的 /v1 路由
     // Messages 端点的响应经 `claude_wire` 整形后再发给客户端；OpenAI / Responses

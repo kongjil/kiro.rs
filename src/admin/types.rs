@@ -2,6 +2,7 @@
 
 use crate::admin::proxy_pool::{ProxyHealth, ProxyQualityStatus};
 use crate::kiro::model::credentials::CredentialMetadata;
+use crate::model::config::BillingPrice;
 use serde::{Deserialize, Serialize};
 
 // ============ 凭据状态 ============
@@ -764,6 +765,19 @@ pub struct CacheMeteringConfigResponse {
 pub struct SetCacheMeteringConfigRequest {
     #[serde(default)]
     pub enabled: Option<bool>,
+}
+
+/// Per-model prices used to calculate billed credits. Each unit price is per token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingPricesResponse {
+    pub prices: std::collections::HashMap<String, BillingPrice>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetBillingPricesRequest {
+    pub prices: std::collections::HashMap<String, BillingPrice>,
 }
 
 /// 会话粘性路由配置 + 运行时统计响应。

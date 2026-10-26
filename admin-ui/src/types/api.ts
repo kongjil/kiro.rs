@@ -591,6 +591,18 @@ export interface BillingPolicy {
   legacyMultipliers?: [number, number, number]
 }
 
+/** 后端价格按每 token 存储；设置页以每百万 token 显示。 */
+export interface BillingPrice {
+  input: number
+  cacheCreation: number
+  cacheRead: number
+  output: number
+}
+
+export interface BillingPricesResponse {
+  prices: Record<string, BillingPrice>
+}
+
 // ============ 用量统计 ============
 
 export type StatsRange = '24h' | '7d' | '30d'

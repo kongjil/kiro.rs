@@ -32,7 +32,7 @@ use crate::kiro::token_manager::{
     IdcReloginCredentials, MAX_ACCOUNT_CONCURRENCY, MAX_ACCOUNT_RPM, MultiTokenManager,
     RefreshTokenInvalidError,
 };
-use crate::model::config::Config;
+use crate::model::config::{BillingPrice, Config, SharedBillingPrices};
 
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
@@ -42,7 +42,8 @@ use super::types::{
     AddCredentialResponse, ApiDomainConfig, AssignProxyRequest, AssignRoundRobinResponse,
     AvailableModelItem,
     AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
-    CacheMeteringConfigResponse, CacheMeteringStatsResponse, CheckRateLimitRequest,
+    BillingPricesResponse, SetBillingPricesRequest, CacheMeteringConfigResponse,
+    CacheMeteringStatsResponse, CheckRateLimitRequest,
     CredentialMetadataDetail, CredentialMetadataSchemaConfig, CredentialStatusItem,
     CredentialsExportResponse, CredentialsStatusResponse, CustomModelItem,
     CustomModelsConfigResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
@@ -77,6 +78,41 @@ fn credential_billing_config(metadata: &CredentialMetadata) -> (Option<f64>, f64
         .filter(|v| v.is_finite() && *v >= 0.0)
         .unwrap_or(1.0);
     (account_cost_cny, cost_multiplier)
+}
+
+fn normalize_billing_prices(
+    input: HashMap<String, BillingPrice>,
+) -> Result<HashMap<String, BillingPrice>, AdminServiceError> {
+    if input.len() > 500 {
+        return Err(AdminServiceError::InvalidCredential(
+            "价格表最多支持 500 个模型条目".to_string(),
+        ));
+    }
+    let mut prices = HashMap::with_capacity(input.len());
+    for (model, price) in input {
+        let model = model.trim().to_ascii_lowercase();
+        if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+            return Err(AdminServiceError::InvalidCredential(
+                "模型名称必须为 1-256 个非控制字符".to_string(),
+            ));
+        }
+        if [price.input, price.cache_creation, price.cache_read, price.output]
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "模型 {} 的价格必须为非负有限数",
+                model
+            )));
+        }
+        if prices.insert(model.clone(), price).is_some() {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "模型名称忽略大小写后重复: {}",
+                model
+            )));
+        }
+    }
+    Ok(prices)
 }
 
 /// 将原始 metadata 与 schema 合并为客户端可直接消费的字段列表。
@@ -345,6 +381,7 @@ pub struct AdminService {
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
     /// prompt cache 本地计量模拟句柄（开关运行时可改）
     cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
+    billing_prices: SharedBillingPrices,
 }
 
 /// Social 登录会话状态
@@ -664,6 +701,7 @@ impl AdminService {
         let token_manager_tls_backend = token_manager.config().tls_backend;
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
+        let billing_prices = Arc::new(parking_lot::RwLock::new(token_manager.config().billing_prices.clone()));
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
         let credential_metadata_schema =
             match token_manager.config().credential_metadata_schema.clone() {
@@ -698,6 +736,7 @@ impl AdminService {
             trace_store: None,
             usage_recorder: None,
             cache_meter: None,
+            billing_prices,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -721,6 +760,33 @@ impl AdminService {
     pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
         self.kiro_provider = Some(provider);
         self
+    }
+
+    pub fn with_shared_billing_prices(mut self, prices: SharedBillingPrices) -> Self {
+        self.billing_prices = prices;
+        self
+    }
+
+    pub fn get_billing_prices(&self) -> BillingPricesResponse {
+        BillingPricesResponse {
+            prices: self.billing_prices.read().clone(),
+        }
+    }
+
+    pub fn set_billing_prices(
+        &self,
+        request: SetBillingPricesRequest,
+    ) -> Result<BillingPricesResponse, AdminServiceError> {
+        let prices = normalize_billing_prices(request.prices)?;
+
+        let persisted = prices.clone();
+        self.token_manager
+            .update_config_file(move |config| config.billing_prices = persisted)
+            .map_err(|error| {
+                AdminServiceError::InternalError(format!("保存模型价格表失败: {}", error))
+            })?;
+        *self.billing_prices.write() = prices.clone();
+        Ok(BillingPricesResponse { prices })
     }
 
     /// 暴露 TokenManager 给 handlers（分组管理需要 count / rename / remove 凭据 groups 字段）
@@ -4303,6 +4369,56 @@ fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn billing_price_table_normalizes_names_and_preserves_all_categories() {
+        let normalized = normalize_billing_prices(HashMap::from([(
+            " Claude-Opus-5-5 ".to_string(),
+            BillingPrice { input: 0.000004, cache_creation: 0.000005, cache_read: 0.0004, output: 0.00002 },
+        )])).unwrap();
+        assert_eq!(normalized.get("claude-opus-5-5").unwrap().input, 0.000004);
+        assert_eq!(normalized.get("claude-opus-5-5").unwrap().cache_creation, 0.000005);
+        assert_eq!(normalized.get("claude-opus-5-5").unwrap().cache_read, 0.0004);
+        assert_eq!(normalized.get("claude-opus-5-5").unwrap().output, 0.00002);
+    }
+
+    #[test]
+    fn billing_price_table_rejects_invalid_values_and_case_insensitive_duplicates() {
+        let duplicate = HashMap::from([
+            ("Model-X".to_string(), BillingPrice::default()),
+            (" model-x ".to_string(), BillingPrice::default()),
+        ]);
+        assert!(normalize_billing_prices(duplicate).is_err());
+
+        let invalid = HashMap::from([("model-y".to_string(), BillingPrice {
+            input: -1.0, ..BillingPrice::default()
+        })]);
+        assert!(normalize_billing_prices(invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn billing_price_updates_are_visible_to_shared_runtime_table() {
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), Vec::new(), None, None, false).unwrap(),
+        );
+        let shared = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let service = AdminService::new(manager, Vec::new()).with_shared_billing_prices(shared.clone());
+        let response = service.set_billing_prices(SetBillingPricesRequest {
+            prices: HashMap::from([(
+                "opus-5-5".to_string(),
+                BillingPrice {
+                    input: 0.000004,
+                    cache_creation: 0.000005,
+                    cache_read: 0.0000004,
+                    output: 0.00002,
+                },
+            )]),
+        }).unwrap();
+
+        assert_eq!(response.prices.len(), 1);
+        assert_eq!(shared.read().get("opus-5-5").unwrap().cache_creation, 0.000005);
+        assert_eq!(service.get_billing_prices().prices, response.prices);
+    }
 
     #[test]
     fn quota_recovery_probe_waits_for_upstream_reset_time() {

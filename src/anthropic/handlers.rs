@@ -71,7 +71,7 @@ impl UsageRecordHook {
             key_id,
             model,
             started_at: Instant::now(),
-            billing_prices: state.billing_prices.clone(),
+            billing_prices: std::sync::Arc::new(state.billing_prices.read().clone()),
             token_manager: state
                 .kiro_provider
                 .as_ref()

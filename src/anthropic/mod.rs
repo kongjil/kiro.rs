@@ -50,4 +50,6 @@ mod gateway_tests;
 pub use router::create_router_with_provider;
 #[allow(unused_imports)]
 pub use router::{create_router, create_router_with_shared_provider};
+#[allow(unused_imports)]
 pub use router::create_router_with_shared_provider_and_billing_prices;
+pub use router::create_router_with_shared_provider_and_shared_billing_prices;

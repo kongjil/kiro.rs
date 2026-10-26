@@ -344,7 +344,8 @@ async fn main() {
         });
     }
 
-    let anthropic_app = anthropic::create_router_with_shared_provider_and_billing_prices(
+    let billing_prices = std::sync::Arc::new(parking_lot::RwLock::new(config.billing_prices.clone()));
+    let anthropic_app = anthropic::create_router_with_shared_provider_and_shared_billing_prices(
         Some(kiro_provider.clone()),
         config.extract_thinking,
         config.tool_compatibility_mode,
@@ -353,7 +354,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
-        config.billing_prices.clone(),
+        billing_prices.clone(),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -372,6 +373,7 @@ async fn main() {
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
                     .with_kiro_provider(kiro_provider.clone())
+                    .with_shared_billing_prices(billing_prices.clone())
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),

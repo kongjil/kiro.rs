@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use parking_lot::RwLock;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -102,6 +104,9 @@ pub struct BillingPrice {
     #[serde(default)]
     pub output: f64,
 }
+
+/// Runtime-shared model prices. Admin updates this map atomically; each request snapshots it.
+pub type SharedBillingPrices = Arc<RwLock<HashMap<String, BillingPrice>>>;
 
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]

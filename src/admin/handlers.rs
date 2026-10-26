@@ -21,6 +21,7 @@ use super::{
     types::{
         AddCredentialRequest, AddProxyRequest, ApiDomainConfig, AssignProxyRequest,
         AssignRoundRobinRequest, BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
+        SetBillingPricesRequest,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
         CreateClientKeyResponse, ModelTestRequest,
         CredentialMetadataSchemaConfig,
@@ -682,6 +683,22 @@ pub async fn set_account_concurrency_config(
     match state.service.set_account_concurrency_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/billing-prices
+pub async fn get_billing_prices(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_billing_prices())
+}
+
+/// PUT /api/admin/config/billing-prices
+pub async fn set_billing_prices(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetBillingPricesRequest>,
+) -> impl IntoResponse {
+    match state.service.set_billing_prices(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

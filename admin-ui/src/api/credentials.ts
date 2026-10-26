@@ -41,6 +41,7 @@ import type {
   GitHubRateLimitInfo,
   UpdateAdminKeyRequest,
   CredentialMetadataSchemaConfig,
+  BillingPricesResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -670,6 +671,19 @@ export async function setCacheMeteringConfig(
   patch: Partial<CacheMeteringConfig>,
 ): Promise<CacheMeteringConfig> {
   const { data } = await api.put<CacheMeteringConfig>('/config/cache-metering', patch)
+  return data
+}
+
+// 获取模型 Token 价格表（服务端存储单位：每 token）
+export async function getBillingPrices(): Promise<BillingPricesResponse> {
+  const { data } = await api.get<BillingPricesResponse>('/config/billing-prices')
+  return data
+}
+
+export async function setBillingPrices(
+  prices: BillingPricesResponse['prices'],
+): Promise<BillingPricesResponse> {
+  const { data } = await api.put<BillingPricesResponse>('/config/billing-prices', { prices })
   return data
 }
 

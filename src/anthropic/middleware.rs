@@ -16,7 +16,7 @@ use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::BillingPrice;
+use crate::model::config::{BillingPrice, SharedBillingPrices};
 
 use super::billing::BillingPolicy;
 use super::cache_metering::SharedCacheMeter;
@@ -59,7 +59,7 @@ pub struct AppState {
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
     /// 模型 token 价格表，用于管理端修改后 token 成本统计。
-    pub billing_prices: Arc<HashMap<String, BillingPrice>>,
+    pub billing_prices: SharedBillingPrices,
 }
 
 impl AppState {
@@ -78,7 +78,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
-            billing_prices: Arc::new(HashMap::new()),
+            billing_prices: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -113,8 +113,14 @@ impl AppState {
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_billing_prices(mut self, prices: HashMap<String, BillingPrice>) -> Self {
-        self.billing_prices = Arc::new(prices);
+        self.billing_prices = Arc::new(parking_lot::RwLock::new(prices));
+        self
+    }
+
+    pub fn with_shared_billing_prices(mut self, prices: SharedBillingPrices) -> Self {
+        self.billing_prices = prices;
         self
     }
 }
