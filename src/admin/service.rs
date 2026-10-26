@@ -1014,6 +1014,15 @@ impl AdminService {
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
         // 先获取当前凭据 ID，用于判断是否需要切换
         let snapshot = self.token_manager.snapshot();
+        if !disabled
+            && snapshot.entries.iter().any(|entry| {
+                entry.id == id && entry.disabled_reason.as_deref() == Some("ProxyPrecheck")
+            })
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "该账号正在等待代理预检，完成独立 IP 分配后才可启用".to_string(),
+            ));
+        }
         let current_id = snapshot.current_id;
 
         self.token_manager
@@ -1036,6 +1045,13 @@ impl AdminService {
 
     /// 重置失败计数并重新启用
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
+        if self.token_manager.snapshot().entries.iter().any(|entry| {
+            entry.id == id && entry.disabled_reason.as_deref() == Some("ProxyPrecheck")
+        }) {
+            return Err(AdminServiceError::InvalidCredential(
+                "该账号正在等待代理预检，完成独立 IP 分配后才可启用".to_string(),
+            ));
+        }
         self.token_manager
             .reset_and_enable(id)
             .map_err(|e| self.classify_error(e, id))
