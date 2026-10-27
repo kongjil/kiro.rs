@@ -678,6 +678,10 @@ export interface CredentialDistribution {
   errors: number
   accountCost: number
   sellConsumption: number
+  /** 账号固定成本（CNY），未设置时缺省 */
+  accountCostCny?: number | null
+  /** 凭据成本倍率，未设置为 1 */
+  costMultiplier?: number
 }
 
 export interface KeyDistribution {

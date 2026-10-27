@@ -2,7 +2,7 @@ import { useCallback, useMemo, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Activity, Calendar, Coins, Cpu, KeyRound, Percent, Server } from 'lucide-react'
+import { Activity, Calendar, Coins, Cpu, HandCoins, KeyRound, Percent, Server, Wallet } from 'lucide-react'
 import { useByCredential, useByKey, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
 import { useStatsView } from '@/hooks/use-stats-view'
 import { AutoRefreshControl } from '@/components/console/auto-refresh-control'
@@ -261,6 +261,10 @@ interface RangeStats {
   outputTokens: number
   cacheCreationTokens: number
   cacheReadTokens: number
+  /** 原始 credit × 凭据成本倍率，与口径无关 */
+  accountCost: number
+  /** 计费后 credit × Key 卖出倍率，与口径无关 */
+  sellConsumption: number
 }
 
 function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
@@ -273,6 +277,8 @@ function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
       outputTokens: acc.outputTokens + p.outputTokens,
       cacheCreationTokens: acc.cacheCreationTokens + (p.cacheCreationTokens ?? 0),
       cacheReadTokens: acc.cacheReadTokens + (p.cacheReadTokens ?? 0),
+      accountCost: acc.accountCost + (p.accountCost ?? 0),
+      sellConsumption: acc.sellConsumption + (p.sellConsumption ?? 0),
     }),
     {
       calls: 0,
@@ -282,8 +288,16 @@ function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
       outputTokens: 0,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
+      accountCost: 0,
+      sellConsumption: 0,
     },
   )
+}
+
+/** 毛利 = 卖出消费 − 账号成本；formatCredits 不显示负数，这里保留符号 */
+function formatSignedCredits(value: number): string {
+  if (!Number.isFinite(value) || Math.abs(value) < 0.0005) return '0'
+  return `${value < 0 ? '−' : '+'}${formatCredits(Math.abs(value))}`
 }
 
 /** 缓存命中率 = 读取 / (input + 创建 + 读取)，与趋势图同一公式；按 token 加权 */
@@ -306,6 +320,7 @@ function StatsCards({
   view: StatsView
 }) {
   const hitRate = cacheHitRate(stats)
+  const margin = stats.sellConsumption - stats.accountCost
   const cards = [
     {
       icon: <Activity className="h-4 w-4" />,
@@ -334,11 +349,40 @@ function StatsCards({
       ),
     },
     {
+      icon: <Wallet className="h-4 w-4" />,
+      label: '账号成本',
+      value: formatCredits(stats.accountCost),
+      extra: (
+        <span className="text-[11px] text-muted-foreground" title="原始 credit × 凭据成本倍率">
+          原始 × 成本倍率
+        </span>
+      ),
+    },
+    {
+      icon: <HandCoins className="h-4 w-4" />,
+      label: '卖出消费',
+      value: formatCredits(stats.sellConsumption),
+      extra: (
+        <span
+          className={cn(
+            'text-[11px] tabular-nums',
+            margin > 0.0005
+              ? 'text-emerald-600 dark:text-emerald-400'
+              : margin < -0.0005
+                ? 'text-destructive'
+                : 'text-muted-foreground',
+          )}
+          title="计费后 credit × Key 卖出倍率；毛利 = 卖出消费 − 账号成本"
+        >
+          毛利 {formatSignedCredits(margin)}
+        </span>
+      ),
+    },
+    {
       icon: <KeyRound className="h-4 w-4" />,
       label: '启用的客户端 Key',
       meta: '当前可用入口',
       value: formatNumber(activeKeys),
-      className: 'col-span-2 max-[360px]:col-span-1 lg:col-span-1',
       extra: (
         <span className="text-[11px] text-muted-foreground">
           上游 {formatNumber(activeCredentials)}
@@ -348,7 +392,7 @@ function StatsCards({
   ]
 
   return (
-    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-6">
+    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-4">
       {cards.map((card) => (
         <StatCard key={card.label} meta={card.meta ?? timeText} {...card} />
       ))}
@@ -701,8 +745,49 @@ function CredentialPanel({ data }: { data: CredentialDistribution[] }) {
           </span>
         </div>
         <CredentialBarChart data={data} />
+        {data.length > 0 && <CredentialTable data={data} />}
       </CardContent>
     </Card>
+  )
+}
+
+function CredentialTable({ data }: { data: CredentialDistribution[] }) {
+  return (
+    <div className="mt-3 max-h-40 overflow-auto text-[12px]">
+      <table className="min-w-[560px] w-full">
+        <thead className="text-muted-foreground">
+          <tr>
+            <th className="text-left font-medium pb-1">凭据</th>
+            <th className="text-right font-medium">调用</th>
+            <th className="text-right font-medium">Credit</th>
+            <th className="text-right font-medium">成本倍率</th>
+            <th className="text-right font-medium" title="原始 credit × 凭据成本倍率">账号成本</th>
+            <th className="text-right font-medium" title="计费后 credit × Key 卖出倍率">卖出消费</th>
+            <th className="text-right font-medium" title="账号固定成本（CNY），在编辑凭据中设置">购入 ¥</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.map((c) => {
+            const label = c.email ?? `#${c.credentialId}`
+            return (
+              <tr key={c.credentialId} className="border-t border-border/40">
+                <td className="py-1 max-w-[200px] truncate" title={label}>
+                  {label}
+                </td>
+                <td className="text-right tabular-nums">{formatNumber(c.calls)}</td>
+                <td className="text-right tabular-nums">{formatCredits(c.credits)}</td>
+                <td className="text-right tabular-nums">×{c.costMultiplier ?? 1}</td>
+                <td className="text-right tabular-nums">{formatCredits(c.accountCost)}</td>
+                <td className="text-right tabular-nums">{formatCredits(c.sellConsumption)}</td>
+                <td className="text-right tabular-nums">
+                  {c.accountCostCny != null ? c.accountCostCny.toFixed(2) : '—'}
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
   )
 }
 

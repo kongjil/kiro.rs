@@ -53,6 +53,14 @@ function parseLimitInput(text: string, max: number): number | null | undefined {
   return Number.isInteger(n) && n >= 0 && n <= max ? n : undefined
 }
 
+/** 成本输入框 → 请求值：留空 = 不修改（undefined），否则须为非负有限数；非法返回 null */
+function parseCostInput(text: string): number | undefined | null {
+  const trimmed = text.trim()
+  if (trimmed === '') return undefined
+  const n = Number(trimmed)
+  return Number.isFinite(n) && n >= 0 ? n : null
+}
+
 /** 「已用/上限」读数；上限缺省表示不限 */
 function usageText(used: number | undefined, limit: number | undefined): string {
   return `${used ?? 0} / ${limit ?? '不限'}`
@@ -91,6 +99,8 @@ export function EditCredentialDialog({
   const [manualMode, setManualMode] = useState(false)
   const [maxConcurrency, setMaxConcurrency] = useState(credential.maxConcurrency?.toString() ?? '')
   const [rpmLimit, setRpmLimit] = useState(credential.rpmLimit?.toString() ?? '')
+  const [accountCostCny, setAccountCostCny] = useState(credential.accountCostCny?.toString() ?? '')
+  const [costMultiplier, setCostMultiplier] = useState(credential.costMultiplier?.toString() ?? '1')
 
   const groupOptions = useGroupOptions()
   const { data: concurrencyConfig } = useAccountConcurrencyConfig()
@@ -119,6 +129,8 @@ export function EditCredentialDialog({
       setManualMode(false)
       setMaxConcurrency(credential.maxConcurrency?.toString() ?? '')
       setRpmLimit(credential.rpmLimit?.toString() ?? '')
+      setAccountCostCny(credential.accountCostCny?.toString() ?? '')
+      setCostMultiplier(credential.costMultiplier?.toString() ?? '1')
     }
   }, [open, credential, metadataSchema])
 
@@ -139,6 +151,16 @@ export function EditCredentialDialog({
       return
     }
 
+    const nextCostCny = parseCostInput(accountCostCny)
+    const nextCostMultiplier = parseCostInput(costMultiplier)
+    if (nextCostCny === null || nextCostMultiplier === null) {
+      setActiveTab('general')
+      toast.error(
+        nextCostCny === null ? '账号成本需为大于等于 0 的数字' : '成本倍率需为大于等于 0 的数字',
+      )
+      return
+    }
+
     mutate(
       {
         id: credential.id,
@@ -150,6 +172,8 @@ export function EditCredentialDialog({
           groups: groups,
           sourceChannel: sourceChannel,
           metadata,
+          accountCostCny: nextCostCny,
+          costMultiplier: nextCostMultiplier,
           maxConcurrency: nextConcurrency,
           rpmLimit: nextRpm,
         },
@@ -260,6 +284,44 @@ export function EditCredentialDialog({
                   />
                   <p className="text-xs text-muted-foreground">
                     纯备注，标记此账号的购买来源/渠道，便于追踪。留空表示清除。
+                  </p>
+                </div>
+
+                {/* 账号成本 */}
+                <div className="space-y-2">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-2">
+                      <label htmlFor="accountCostCny" className="text-sm font-medium">
+                        账号成本（CNY）
+                      </label>
+                      <Input
+                        id="accountCostCny"
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        placeholder="例如 50"
+                        value={accountCostCny}
+                        onChange={(e) => setAccountCostCny(e.target.value)}
+                        disabled={isPending}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label htmlFor="costMultiplier" className="text-sm font-medium">
+                        成本倍率
+                      </label>
+                      <Input
+                        id="costMultiplier"
+                        type="number"
+                        min="0"
+                        step="0.05"
+                        value={costMultiplier}
+                        onChange={(e) => setCostMultiplier(e.target.value)}
+                        disabled={isPending}
+                      />
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    概览「账号成本」= 原始 credit × 成本倍率，只影响之后的新请求。留空表示不修改。
                   </p>
                 </div>
 
