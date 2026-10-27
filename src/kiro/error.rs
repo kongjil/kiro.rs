@@ -14,6 +14,24 @@ pub struct UpstreamRateLimitError {
 #[error("upstream context window exceeded")]
 pub struct UpstreamContextOverflowError;
 
+/// Kiro's overload marker, e.g.
+/// `{"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}`.
+/// It arrives as an HTTP 429/5xx body or as the payload of an in-stream exception frame.
+pub const MODEL_TEMPORARILY_UNAVAILABLE: &str = "MODEL_TEMPORARILY_UNAVAILABLE";
+
+/// Whether an upstream HTTP error body carries exactly the overload `reason`.
+pub(crate) fn is_model_overloaded_body(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("reason")
+                .and_then(|reason| reason.as_str())
+                .map(|reason| reason == MODEL_TEMPORARILY_UNAVAILABLE)
+        })
+        .unwrap_or(false)
+}
+
 /// Model capacity is temporarily unavailable, independently of account health.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("upstream model temporarily unavailable")]

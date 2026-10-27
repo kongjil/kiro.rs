@@ -42,11 +42,18 @@ depend on upstream keepalive and network conditions.
   fragmented tool arguments and final usage. A failed stream emits an error
   without a successful finish or `[DONE]` marker.
 - Streaming responses include `X-Accel-Buffering: no` for proxies that honor it.
-- Exact upstream `MODEL_TEMPORARILY_UNAVAILABLE` server errors return **503**
-  with `Retry-After`, instead of making three internal attempts and returning
-  a generic 502. A short per-model cooldown defaults to five seconds and honors
-  a valid upstream `Retry-After`. Other models remain available. This change
-  exposes upstream overload promptly; it does not repair upstream availability.
+- An upstream HTTP 429 or 5xx whose body has `reason`
+  `MODEL_TEMPORARILY_UNAVAILABLE` (an exact match) is retried at most twice
+  within the same request. A retry moves to another selectable credential when
+  one exists; otherwise it backs off briefly on the same credential. If all
+  three attempts fail, the request returns **529** `overloaded_error` with
+  `Retry-After`. The value is the upstream's when present, otherwise five
+  seconds. Claude Code and the Anthropic SDKs retry 529 on their own. No
+  cooldown is recorded, so later requests try upstream as usual. With
+  `modelApi429RetryEnabled` off, an overloaded 429 returns 529 at once. If the
+  overload arrives as an in-stream exception frame after streaming has
+  started, the client receives an SSE `overloaded_error` event. A non-streaming
+  request in that case still returns 529.
 - Connection and upstream read deadlines are separate from the existing
   720-second total request budget. Active reads reset the read deadline.
   A timeout while awaiting headers or reading an error response body returns

@@ -535,6 +535,29 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 const PROMPT_TOO_LONG_MESSAGE: &str =
     "prompt is too long: the request exceeds the model's context window";
 
+/// 上游没给 `Retry-After` 时，模型过载建议客户端等待的秒数。
+const OVERLOAD_RETRY_AFTER_SECS: &str = "5";
+
+/// 模型过载：Anthropic 官方的 529 `overloaded_error`。Claude Code、官方 SDK 与常见
+/// 中转（new-api、sub2api）都把 529 识别为可重试的过载，比 503 更不容易被当成网关故障。
+fn overloaded_response(retry_after: &str) -> Response {
+    let status = StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    let mut response = (
+        status,
+        Json(ErrorResponse::new("overloaded_error", "Overloaded")),
+    )
+        .into_response();
+    if let Ok(value) = retry_after.parse() {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// 上游事件流里的异常帧是否为模型过载（错误串内嵌上游 JSON payload）。
+fn is_overload_stream_error(error: &str) -> bool {
+    error.contains(crate::kiro::error::MODEL_TEMPORARILY_UNAVAILABLE)
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
     if err
@@ -550,15 +573,7 @@ pub(super) fn map_provider_error(err: Error) -> Response {
     if let Some(unavailable) =
         err.downcast_ref::<crate::kiro::error::UpstreamModelUnavailableError>()
     {
-        let mut response = (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::new("overloaded_error", "Overloaded")),
-        )
-            .into_response();
-        if let Ok(value) = unavailable.retry_after.parse() {
-            response.headers_mut().insert(header::RETRY_AFTER, value);
-        }
-        return response;
+        return overloaded_response(&unavailable.retry_after);
     }
     if err
         .downcast_ref::<crate::kiro::error::UpstreamContextOverflowError>()
@@ -1453,9 +1468,13 @@ impl StreamSettlement {
         bytes: u64,
     ) -> Vec<Result<Bytes, Infallible>> {
         tracing::error!(error, "Upstream response stream was interrupted");
-        events.extend(
-            ctx.generate_error_events("api_error", "Upstream response stream was interrupted"),
-        );
+        // 已回 200 无法改状态码：过载仍用 overloaded_error，客户端可按过载重试
+        let (error_type, message) = if is_overload_stream_error(error) {
+            ("overloaded_error", "Overloaded")
+        } else {
+            ("api_error", "Upstream response stream was interrupted")
+        };
+        events.extend(ctx.generate_error_events(error_type, message));
         self.update(ctx, bytes);
         self.finish(
             "error",
@@ -1636,6 +1655,9 @@ fn non_stream_read_failure(
         None,
         TraceUsage::zero(),
     );
+    if is_overload_stream_error(error) {
+        return NonStreamExecutionError::Response(overloaded_response(OVERLOAD_RETRY_AFTER_SECS));
+    }
     NonStreamExecutionError::Response(
         (
             StatusCode::BAD_GATEWAY,
@@ -2995,6 +3017,33 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().get(header::RETRY_AFTER).is_none());
+    }
+
+    #[tokio::test]
+    async fn model_overload_maps_to_529_overloaded_error() {
+        let err = crate::kiro::error::UpstreamModelUnavailableError {
+            retry_after: "7".to_string(),
+        };
+        let resp = map_provider_error(err.into());
+
+        assert_eq!(resp.status().as_u16(), 529);
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "7");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "overloaded_error");
+    }
+
+    #[test]
+    fn overload_body_detection_requires_exact_reason() {
+        use crate::kiro::error::is_model_overloaded_body;
+        assert!(is_model_overloaded_body(
+            r#"{"message":"处理请求时遇到意外的高负载，请重试。","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
+        ));
+        assert!(!is_model_overloaded_body(r#"{"message":"MODEL_TEMPORARILY_UNAVAILABLE"}"#));
+        assert!(!is_model_overloaded_body(r#"{"reason":"INSUFFICIENT_MODEL_CAPACITY"}"#));
+        assert!(!is_model_overloaded_body("MODEL_TEMPORARILY_UNAVAILABLE"));
     }
 
     #[tokio::test]

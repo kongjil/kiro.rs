@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Notify, Semaphore};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -2206,6 +2206,24 @@ impl MultiTokenManager {
         })
     }
 
+    /// 除 `avoid` 之外是否还有当前可选的账号（`need_slot` 时还要有并发位）。
+    ///
+    /// 用于本次请求内的换号：模型过载等只想「这次别再选它」的场景，不能像账号级
+    /// 限流那样写全局冷却。
+    pub(crate) fn has_selectable_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        avoid: &HashSet<u64>,
+        need_slot: bool,
+    ) -> bool {
+        let entries = self.entries.lock();
+        let now = Instant::now();
+        entries.iter().any(|entry| {
+            !avoid.contains(&entry.id) && self.entry_pickable(entry, model, group, now, need_slot)
+        })
+    }
+
     fn has_available_for_request(
         &self,
         entries: &[CredentialEntry],
@@ -2234,15 +2252,17 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
-        self.select_credential(model, group, false)
+        self.select_credential(model, group, false, None)
     }
 
-    /// 见 [`Self::select_next_credential`]；`need_slot` 为 true 时跳过并发已满的凭据。
+    /// 见 [`Self::select_next_credential`]；`need_slot` 为 true 时跳过并发已满的凭据，
+    /// `skip` 中的凭据本次不参与选号。
     fn select_credential(
         &self,
         model: Option<&str>,
         group: Option<&str>,
         need_slot: bool,
+        skip: Option<&HashSet<u64>>,
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
@@ -2250,6 +2270,7 @@ impl MultiTokenManager {
         // 过滤可用的凭据（已排除模型缓存明确不支持的凭据；需要并发位时再排除满载的）
         let available: Vec<&CredentialEntry> = entries
             .iter()
+            .filter(|e| !skip.is_some_and(|skip| skip.contains(&e.id)))
             .filter(|e| self.entry_pickable(e, model, group, now, need_slot))
             .collect();
 
@@ -2298,9 +2319,20 @@ impl MultiTokenManager {
         group: Option<&str>,
     ) -> anyhow::Result<CallContext> {
         // MCP 等短请求：计 RPM，不占并发位
-        self.acquire_context_impl(model, group, None, true, false)
+        self.acquire_context_impl(model, group, None, true, false, None)
             .await
             .map(|(context, _, _)| context)
+    }
+
+    #[cfg(test)]
+    pub async fn acquire_context_routed(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        session: Option<&str>,
+    ) -> anyhow::Result<(CallContext, RouteDecision)> {
+        self.acquire_context_routed_avoiding(model, group, session, &HashSet::new())
+            .await
     }
 
     /// 带会话粘性的上下文获取：`session` 有绑定且绑定凭据可用时直接沿用，
@@ -2308,14 +2340,19 @@ impl MultiTokenManager {
     ///
     /// 本方法只读绑定表；调用方在上游请求**成功**后调用 [`Self::bind_session`]，
     /// 避免把失败的凭据钉给会话。
-    pub async fn acquire_context_routed(
+    ///
+    /// `avoid`：本次尽量不选的凭据（如本请求内刚报模型过载的）。只是偏好：除它们外
+    /// 已无可选账号时照常选号（可能选回其中的账号），不会因此报凭据耗尽；不写任何
+    /// 冷却状态，只影响这一次选号。
+    pub async fn acquire_context_routed_avoiding(
         &self,
         model: Option<&str>,
         group: Option<&str>,
         session: Option<&str>,
+        avoid: &HashSet<u64>,
     ) -> anyhow::Result<(CallContext, RouteDecision)> {
         // 模型对话请求：计 RPM 并占一个并发位
-        self.acquire_context_impl(model, group, session, true, true)
+        self.acquire_context_impl(model, group, session, true, true, Some(avoid))
             .await
             .map(|(context, _, route)| (context, route))
     }
@@ -2344,6 +2381,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
         need_slot: bool,
+        skip: Option<&HashSet<u64>>,
     ) -> (Option<(u64, KiroCredentials)>, RouteDecision, Option<u64>) {
         let Some(session) = session else {
             return (None, RouteDecision::none(), None);
@@ -2363,9 +2401,11 @@ impl MultiTokenManager {
         };
         let entries = self.entries.lock();
         let now = Instant::now();
+        // 本次要避开的绑定账号按不可用处理（回落普通选号，previous 仍报绑定账号）
         let available = entries
             .iter()
             .find(|e| e.id == bound_id)
+            .filter(|e| !skip.is_some_and(|skip| skip.contains(&e.id)))
             .filter(|e| self.entry_available_for_request(e, model, group, now));
         let pick = available
             .filter(|e| !need_slot || !self.concurrency_full(e))
@@ -2401,6 +2441,7 @@ impl MultiTokenManager {
         session: Option<&str>,
         update_current: bool,
         take_slot: bool,
+        avoid: Option<&HashSet<u64>>,
     ) -> anyhow::Result<(CallContext, bool, RouteDecision)> {
         let take_slot = take_slot && update_current;
         let total = self.total_count_in_group(group);
@@ -2422,11 +2463,18 @@ impl MultiTokenManager {
             let (id, credentials, is_balanced, route) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
+                // 本次要避开的账号（如刚报模型过载）：只有还有别的账号可选时才避开，
+                // 否则照常选号，不因避开而等待或报耗尽。每轮重算，账号状态可能已变。
+                let skip = avoid.filter(|avoid| {
+                    !avoid.is_empty()
+                        && self.has_selectable_excluding(model, group, avoid, take_slot)
+                });
+
                 // 会话粘性优先：绑定凭据仍可用就沿用，保住上游按账号隔离的 prompt cache。
                 // 粘性未命中时两种模式都按当前请求重新选择。priority 模式不能复用 current_id，
                 // 否则高优先级凭据从 RPM/冷却恢复后无法在下一次请求立即回切。
                 let (sticky_pick, route, busy_bound) =
-                    self.sticky_candidate(session, model, group, take_slot);
+                    self.sticky_candidate(session, model, group, take_slot, skip);
 
                 // 绑定账号只是并发满：先等它空出，尽量不换号（换号后上游 prompt cache 作废）。
                 if sticky_pick.is_none() && take_slot && !sticky_waited {
@@ -2456,8 +2504,12 @@ impl MultiTokenManager {
                     }
                 }
 
-                let mut best =
-                    sticky_pick.or_else(|| self.select_credential(model, group, take_slot));
+                let mut best = sticky_pick
+                    .or_else(|| self.select_credential(model, group, take_slot, skip))
+                    // 判断「有别的可选」与选号之间别的账号可能刚被占满，回落不避开
+                    .or_else(|| {
+                        skip.and_then(|_| self.select_credential(model, group, take_slot, None))
+                    });
 
                 // 有账号可用、只是并发都满：排队等空位，不当作全灭去自愈。
                 let all_busy = best.is_none() && take_slot && self.has_busy_candidate(model, group);
@@ -2465,7 +2517,7 @@ impl MultiTokenManager {
                 // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
                 // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
                 if best.is_none() && !all_busy && self.try_self_heal(model, group) {
-                    best = self.select_credential(model, group, take_slot);
+                    best = self.select_credential(model, group, take_slot, None);
                 }
 
                 // 并发都满：排队等空位，超时回 429。
@@ -4142,7 +4194,9 @@ impl MultiTokenManager {
     pub async fn get_available_models_for_current(
         &self,
     ) -> anyhow::Result<(u64, ListAvailableModelsResponse, bool)> {
-        let (context, is_balanced, _) = self.acquire_context_impl(None, None, None, false, false).await?;
+        let (context, is_balanced, _) = self
+            .acquire_context_impl(None, None, None, false, false, None)
+            .await?;
         let id = context.id;
         let response = self.refresh_model_cache_for(id, true).await?;
         Ok((id, response, is_balanced))
@@ -6782,7 +6836,7 @@ mod tests {
         let mut picked_other = false;
         for _ in 0..64 {
             let (context, is_balanced, _) = manager
-                .acquire_context_impl(None, None, None, false, false)
+                .acquire_context_impl(None, None, None, false, false, None)
                 .await
                 .unwrap();
             assert!(is_balanced);
@@ -8432,6 +8486,52 @@ mod tests {
         assert_eq!(ctx.id, 2);
         assert_eq!(route.sticky_outcome, StickyOutcome::MissUnavailable);
         assert_eq!(route.previous_credential_id, Some(1));
+    }
+
+    /// 过载换号的避开名单只是偏好：有别的可选就避开，没有就照常选，不写任何冷却。
+    #[tokio::test]
+    async fn test_avoid_set_prefers_other_account_without_cooldown() {
+        let manager = concurrency_manager(1, 10, 0, two_priority_creds());
+        let avoid_first = HashSet::from([1]);
+
+        let (ctx, _) = manager
+            .acquire_context_routed_avoiding(None, None, None, &avoid_first)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2, "#1 被避开，落到 #2");
+        drop(ctx);
+
+        let avoid_all = HashSet::from([1, 2]);
+        let (ctx, _) = manager
+            .acquire_context_routed_avoiding(None, None, None, &avoid_all)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1, "全被避开时按普通顺序选");
+        drop(ctx);
+
+        // #2 满载：唯一的替代不可选，不能为了避开 #1 而排队或报错。
+        let (busy_second, _) = manager
+            .acquire_context_routed_avoiding(None, None, None, &avoid_first)
+            .await
+            .unwrap();
+        assert_eq!(busy_second.id, 2);
+        let (ctx, _) = manager
+            .acquire_context_routed_avoiding(None, None, None, &avoid_first)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1, "#2 满载时回到 #1");
+        drop((ctx, busy_second));
+
+        // 粘性会话：绑定账号被避开时换到别的账号，且不等绑定账号的并发位。
+        manager.bind_session("s", 1);
+        let (ctx, route) = manager
+            .acquire_context_routed_avoiding(None, None, Some("s"), &avoid_first)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(route.sticky_outcome, StickyOutcome::MissUnavailable);
+        assert_eq!(route.previous_credential_id, Some(1));
+        assert!(!entry_snapshot(&manager, 1).disabled);
     }
 
     /// MCP 等短请求不占并发位，也不被满载账号挡住。

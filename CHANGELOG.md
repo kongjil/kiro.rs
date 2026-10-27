@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 🔁 模型过载自动重试并返回 529
+
+- 上游返回 `reason` 精确为 `MODEL_TEMPORARILY_UNAVAILABLE` 的 429 / 5xx 时，在同一请求内最多再试两次。有其他可选账号就立即换号，否则短暂退避后重试当前账号。不写入任何冷却，后续请求照常尝试上游。
+- 三次都过载时返回 529 `overloaded_error` 与 `Retry-After`（取上游值，缺省为 5 秒），原为 503。Claude Code、Anthropic SDK 与 new-api 等下游会把 529 识别为过载并自动重试。
+- 关闭 `modelApi429RetryEnabled` 后，过载类 429 不再重试，直接返回 529（原为 429）。
+- 已开始输出后，上游以流内异常帧报过载时，流式请求以 SSE `overloaded_error` 事件结束（原为 `api_error`），非流式请求返回 529。
+- 注意：经 sub2api 等网关转发时，529 可能让该上游账号进入过载冷却（sub2api 普通账号默认 10 分钟）。
+
+### 🪪 身份问答
+
+- 系统提示在 Claude 身份声明之后固定追加一条规则：用户询问是否为 Kiro，或与 Kiro、Amazon Q、CodeWhisperer、AWS 相关的身份时，统一回答「我是 Claude，一个由 Anthropic 推出的 AI 开发环境助手。」。非中文对话使用该句的对应译文，规则优先于客户端自带的身份设定。
+
 ## [0.9.3] - 2026-10-26
 
 主题：**全局代理热更新、模型过载隔离与 Sonnet 5.5 上下文计量修复**。本版汇总 `v0.9.2` 之后合并的 3 个 PR；没有新增配置项，现有配置、凭据与请求日志无需手动迁移。

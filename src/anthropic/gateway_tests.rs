@@ -43,7 +43,14 @@ use std::{
 enum Mode {
     Normal(Duration),
     Interrupted,
+    /// 每次都返回 500 + `MODEL_TEMPORARILY_UNAVAILABLE`。
     Overloaded,
+    /// 首次过载，之后正常返回。
+    OverloadedOnce,
+    /// 每次都返回 429 + `MODEL_TEMPORARILY_UNAVAILABLE`。
+    Overloaded429,
+    /// 已开始输出后，流内异常帧报 `MODEL_TEMPORARILY_UNAVAILABLE`。
+    OverloadedInStream,
     Large,
     Truncated,
     InvalidFrame,
@@ -73,6 +80,8 @@ enum Mode {
 struct Fixture {
     state: AppState,
     calls: Arc<AtomicUsize>,
+    /// 每次上游调用所用凭据的 token（按调用顺序）
+    tokens: Arc<Mutex<Vec<String>>>,
     connections: Arc<Mutex<HashSet<SocketAddr>>>,
     close_headers: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
@@ -97,9 +106,9 @@ impl KiroEndpoint for LocalEndpoint {
     fn decorate_api(
         &self,
         req: reqwest::RequestBuilder,
-        _: &RequestContext<'_>,
+        ctx: &RequestContext<'_>,
     ) -> reqwest::RequestBuilder {
-        req
+        req.header("x-fixture-token", ctx.token)
     }
     fn decorate_mcp(
         &self,
@@ -114,8 +123,20 @@ impl KiroEndpoint for LocalEndpoint {
 }
 
 fn frame(event: &str, payload: serde_json::Value) -> Bytes {
+    frame_with_headers(&[(":message-type", "event"), (":event-type", event)], payload)
+}
+
+/// 流内异常帧（`:message-type = exception`），payload 与 HTTP 错误体同形。
+fn exception_frame(exception_type: &str, payload: serde_json::Value) -> Bytes {
+    frame_with_headers(
+        &[(":message-type", "exception"), (":exception-type", exception_type)],
+        payload,
+    )
+}
+
+fn frame_with_headers(pairs: &[(&str, &str)], payload: serde_json::Value) -> Bytes {
     let mut headers = Vec::new();
-    for (name, value) in [(":message-type", "event"), (":event-type", event)] {
+    for &(name, value) in pairs {
         headers.push(name.len() as u8);
         headers.extend_from_slice(name.as_bytes());
         headers.push(7);
@@ -138,15 +159,24 @@ async fn fixture(mode: Mode) -> Fixture {
 }
 
 async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
+    fixture_with_credentials(mode, config, 1).await
+}
+
+/// `credential_count` 个 API Key 凭据：id 为 1..=n，token 为 `fixture-{id}`，优先级相同。
+async fn fixture_with_credentials(mode: Mode, config: Config, credential_count: u64) -> Fixture {
     let calls = Arc::new(AtomicUsize::new(0));
+    let tokens = Arc::new(Mutex::new(Vec::new()));
     let connections = Arc::new(Mutex::new(HashSet::new()));
     let close_headers = Arc::new(AtomicUsize::new(0));
-    let (seen_calls, seen_connections, seen_close) =
-        (calls.clone(), connections.clone(), close_headers.clone());
+    let (seen_calls, seen_tokens, seen_connections, seen_close) =
+        (calls.clone(), tokens.clone(), connections.clone(), close_headers.clone());
     let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: String| {
-        let (calls, connections, close) = (seen_calls.clone(), seen_connections.clone(), seen_close.clone());
+        let (calls, tokens, connections, close) = (seen_calls.clone(), seen_tokens.clone(), seen_connections.clone(), seen_close.clone());
         async move {
             calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(token) = headers.get("x-fixture-token").and_then(|v| v.to_str().ok()) {
+                tokens.lock().push(token.to_owned());
+            }
             connections.lock().insert(peer);
             if headers.get("connection").is_some_and(|v| v == "close") { close.fetch_add(1, Ordering::Relaxed); }
             if matches!(mode, Mode::TruncatedToolThenComplete | Mode::AlwaysTruncatedTool) {
@@ -167,8 +197,19 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 };
                 return Response::new(Body::from(parts.concat()));
             }
-            if matches!(mode, Mode::Overloaded) {
+            let call = calls.load(Ordering::Relaxed);
+            if matches!(mode, Mode::Overloaded) || (matches!(mode, Mode::OverloadedOnce) && call == 1) {
                 return Response::builder().status(500).body(Body::from(r#"{"message":"high load","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#)).unwrap();
+            }
+            if matches!(mode, Mode::Overloaded429) {
+                return Response::builder().status(429).body(Body::from(r#"{"message":"high load","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#)).unwrap();
+            }
+            if matches!(mode, Mode::OverloadedInStream) {
+                let parts = [
+                    frame("assistantResponseEvent", json!({"content": "partial"})),
+                    exception_frame("ThrottlingException", json!({"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"})),
+                ];
+                return Response::new(Body::from(parts.concat()));
             }
             if matches!(mode, Mode::SlowHeaders) { tokio::time::sleep(Duration::from_secs(4)).await; }
             if matches!(mode, Mode::SlowErrorBody) {
@@ -258,8 +299,10 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
         .await
         .unwrap();
     });
-    let creds: KiroCredentials = serde_json::from_value(json!({"id": 1, "kiroApiKey": "fixture-only", "machineId": "0000000000000000000000000000000000000000000000000000000000000000"})).unwrap();
-    let manager = Arc::new(MultiTokenManager::new(config, vec![creds], None, None, false).unwrap());
+    let creds: Vec<KiroCredentials> = (1..=credential_count)
+        .map(|id| serde_json::from_value(json!({"id": id, "kiroApiKey": format!("fixture-{id}"), "machineId": "0000000000000000000000000000000000000000000000000000000000000000"})).unwrap())
+        .collect();
+    let manager = Arc::new(MultiTokenManager::new(config, creds, None, None, false).unwrap());
     let endpoints = HashMap::from([(
         "fixture".to_owned(),
         Arc::new(LocalEndpoint(url)) as Arc<dyn KiroEndpoint>,
@@ -270,6 +313,7 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
     Fixture {
         state,
         calls,
+        tokens,
         connections,
         close_headers,
         task,
@@ -387,23 +431,74 @@ async fn gateway_reuses_upstream_connection() {
     assert_eq!(f.connections.lock().len(), 1);
 }
 
+fn overloaded_status() -> StatusCode {
+    StatusCode::from_u16(529).unwrap()
+}
+
 #[tokio::test]
-async fn gateway_model_overload_does_not_retry_three_times() {
+async fn gateway_model_overload_retries_twice_then_returns_529() {
     let f = fixture(Mode::Overloaded).await;
     let response = request(f.state.clone(), "cc", true).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(response.headers().contains_key("retry-after"));
+    assert_eq!(response.status(), overloaded_status());
+    assert_eq!(response.headers().get("retry-after").unwrap(), "5");
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert!(String::from_utf8_lossy(&bytes).contains("overloaded_error"));
-    assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+    // 首次 + 最多两次重试，不会把 4 次总预算全耗在过载上。
+    assert_eq!(f.calls.load(Ordering::Relaxed), 3);
     // 不做模型级冷却：一次过载只影响本次请求，下一个请求照常发往上游。
     let second = request(f.state.clone(), "cc", true).await;
-    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(second.status(), overloaded_status());
     assert_eq!(
         f.calls.load(Ordering::Relaxed),
-        2,
+        6,
         "model overload must not block later requests without trying upstream"
     );
+}
+
+#[tokio::test]
+async fn gateway_model_overload_recovers_on_retry() {
+    let f = fixture(Mode::OverloadedOnce).await;
+    let response = request(f.state.clone(), "messages", false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("early content"));
+    assert_eq!(f.calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn gateway_model_overload_switches_to_another_credential() {
+    let f = fixture_with_credentials(Mode::OverloadedOnce, Config::default(), 2).await;
+    let response = request(f.state.clone(), "messages", false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let tokens = f.tokens.lock().clone();
+    assert_eq!(tokens.len(), 2);
+    assert_ne!(tokens[0], tokens[1], "retry stayed on the overloaded credential");
+}
+
+#[tokio::test]
+async fn gateway_model_overload_429_returns_529() {
+    let f = fixture(Mode::Overloaded429).await;
+    let response = request(f.state.clone(), "messages", false).await;
+    assert_eq!(response.status(), overloaded_status());
+    assert_eq!(response.headers().get("retry-after").unwrap(), "5");
+    assert_eq!(f.calls.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn gateway_model_overload_in_stream_is_overloaded_error() {
+    let f = fixture(Mode::OverloadedInStream).await;
+    for endpoint in ["cc", "messages"] {
+        let response = request(f.state.clone(), endpoint, true).await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("overloaded_error"), "{endpoint}: {text}");
+        assert!(!text.contains("event: message_stop"), "{endpoint}: {text}");
+    }
+    let response = request(f.state.clone(), "messages", false).await;
+    assert_eq!(response.status(), overloaded_status());
+    assert_eq!(response.headers().get("retry-after").unwrap(), "5");
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("overloaded_error"));
 }
 
 #[tokio::test]
@@ -455,7 +550,7 @@ async fn gateway_chat_disconnect_has_no_success_finish_or_done() {
 async fn gateway_chat_preserves_overload_retry_after() {
     let f = fixture(Mode::Overloaded).await;
     let response = request(f.state.clone(), "chat", true).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), overloaded_status());
     assert_eq!(response.headers().get("retry-after").unwrap(), "5");
 }
 
@@ -463,7 +558,7 @@ async fn gateway_chat_preserves_overload_retry_after() {
 async fn gateway_responses_preserves_overload_retry_after() {
     let f = fixture(Mode::Overloaded).await;
     let response = request(f.state.clone(), "responses", true).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), overloaded_status());
     assert_eq!(response.headers().get("retry-after").unwrap(), "5");
 }
 

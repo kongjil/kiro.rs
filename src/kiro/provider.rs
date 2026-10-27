@@ -16,7 +16,7 @@ use crate::http_client::{ProxyConfig, build_client_with_timeouts};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::{
     UpstreamContextOverflowError, UpstreamModelUnavailableError, UpstreamRateLimitError,
-    UpstreamTimeoutError,
+    UpstreamTimeoutError, is_model_overloaded_body,
 };
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -36,6 +36,12 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。故上限取较小值，
 /// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
 const MAX_TOTAL_RETRIES: usize = 4;
+
+/// 模型过载（`MODEL_TEMPORARILY_UNAVAILABLE`）在单次请求内的额外重试次数上限。
+///
+/// 过载多是瞬时的，换个账号或稍等通常即可成功；但过载期间连续重试会放大上游压力、
+/// 拉长客户端等待，因此只多试两次，仍失败就返回 529 交给客户端按 `Retry-After` 重试。
+const MAX_OVERLOAD_RETRIES: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelApi429Action {
@@ -761,6 +767,9 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        // 本次请求内报过模型过载的账号：重试时优先换别的账号，不写全局冷却
+        let mut overloaded: HashSet<u64> = HashSet::new();
+        let mut overload_retries = 0;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型与会话标识
@@ -771,7 +780,12 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）；同一会话优先沿用上一轮凭据
             let mut ctx = match self
                 .token_manager
-                .acquire_context_routed(model.as_deref(), group, session_id.as_deref())
+                .acquire_context_routed_avoiding(
+                    model.as_deref(),
+                    group,
+                    session_id.as_deref(),
+                    &overloaded,
+                )
                 .await
             {
                 Ok((c, route)) => {
@@ -947,17 +961,12 @@ impl KiroProvider {
                 }
             };
 
-            if status.is_server_error()
-                && serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("reason")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_owned)
-                    })
-                    .as_deref()
-                    == Some("MODEL_TEMPORARILY_UNAVAILABLE")
+            // 模型过载（429 / 5xx + MODEL_TEMPORARILY_UNAVAILABLE）：本次请求内换号重试
+            // 至多 MAX_OVERLOAD_RETRIES 次，仍失败再返回 529 overloaded_error。
+            // 不做模型级全局冷却：过载通常只落在个别账号/节点上，全局冷却会把一次过载
+            // 放大成冷却期内该模型的所有请求都直接失败。
+            if (status.as_u16() == 429 || status.is_server_error())
+                && is_model_overloaded_body(&body)
             {
                 Self::emit_attempt(
                     sink,
@@ -969,10 +978,45 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
-                // 只让本次请求失败，不做模型级全局冷却：过载通常只落在个别账号/节点上，
-                // 全局冷却会把一次过载放大成冷却期内该模型的所有请求都直接 503。
                 let delay = retry_after.retry_after().unwrap_or("5").to_string();
-                return Err(UpstreamModelUnavailableError { retry_after: delay }.into());
+                overloaded.insert(ctx.id);
+                overload_retries += 1;
+                // 容量类 429 自动重试关闭时首次即返回，与该开关的既有语义一致
+                let retry_disabled = status.as_u16() == 429
+                    && !self.token_manager.get_model_api_429_retry_enabled();
+                if retry_disabled
+                    || overload_retries > MAX_OVERLOAD_RETRIES
+                    || attempt + 1 >= max_retries
+                {
+                    tracing::warn!(
+                        "API 请求失败（模型过载，已重试 {} 次，返回 529）: {} {}",
+                        overload_retries - 1,
+                        status,
+                        body
+                    );
+                    return Err(UpstreamModelUnavailableError { retry_after: delay }.into());
+                }
+                let can_switch = self.token_manager.has_selectable_excluding(
+                    model.as_deref(),
+                    group,
+                    &overloaded,
+                    true,
+                );
+                tracing::warn!(
+                    "API 请求失败（模型过载，凭据 #{}，{}，尝试 {}/{}）: {} {}",
+                    ctx.id,
+                    if can_switch { "换号重试" } else { "退避后重试" },
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                last_error = Some(UpstreamModelUnavailableError { retry_after: delay }.into());
+                // 有别的账号可换就立即换；只剩过载过的账号时短暂退避再试
+                if !can_switch {
+                    sleep(Self::retry_delay(overload_retries)).await;
+                }
+                continue;
             }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
