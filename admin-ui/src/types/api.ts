@@ -357,6 +357,7 @@ export interface ProxyQualityRunResponse {
   disabled: number
   generated: number
   assigned: number
+  removed: number
   availableClean: number
   requiredCredentials: number
 }

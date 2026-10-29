@@ -215,6 +215,8 @@ pub struct ProxyPoolManager {
     templates_path: Option<PathBuf>,
     quality_config: Mutex<ProxyQualityConfig>,
     quality_config_path: Option<PathBuf>,
+    /// 串行化纯净度调度：一轮结束会删除旧链接，与另一轮并发会误删对方刚检出的链接。
+    quality_run_lock: tokio::sync::Mutex<()>,
 }
 
 /// 校验代理 URL 的 scheme 是否合法
@@ -305,6 +307,7 @@ impl ProxyPoolManager {
             templates_path,
             quality_config: Mutex::new(quality_config),
             quality_config_path,
+            quality_run_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -803,6 +806,36 @@ impl ProxyPoolManager {
             .filter(|entry| entry.enabled && entry.health != ProxyHealth::Unhealthy && entry.quality_status == ProxyQualityStatus::Clean)
             .cloned().collect()
     }
+
+    pub async fn lock_quality_run(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.quality_run_lock.lock().await
+    }
+
+    /// 删除被新 IP 替换下来的旧链接：不在 `keep` 中、已做过纯净度检查、且能从 sid
+    /// 模板重新生成的条目。从未检查过的新导入链接和无 sid 的静态代理一律保留。
+    /// 删除前先把模板落盘，保证删光某个模板的全部条目后仍能继续生成。
+    pub fn prune_replaced(&self, keep: &std::collections::HashSet<String>) -> usize {
+        let mut entries = self.entries.lock();
+        let mut removable = std::collections::HashSet::new();
+        {
+            let mut templates = self.templates.lock();
+            for entry in entries.iter() {
+                if keep.contains(&entry.url) || entry.last_quality_checked_at.is_none() { continue; }
+                let Some(template) = entry.source_template.clone().or_else(|| derive_template(&entry.url)) else { continue };
+                if !templates.iter().any(|existing| existing == &template) { templates.push(template); }
+                removable.insert(entry.id);
+            }
+        }
+        if removable.is_empty() { return 0; }
+        if let Err(error) = self.persist_templates() {
+            tracing::warn!("保存代理生成模板失败，跳过删除旧代理: {}", error);
+            return 0;
+        }
+        entries.retain(|entry| !removable.contains(&entry.id));
+        drop(entries);
+        if let Err(error) = self.persist() { tracing::warn!("删除旧代理后保存代理池失败: {}", error); }
+        removable.len()
+    }
 }
 
 fn parse_score(value: &Value) -> Option<u8> {
@@ -875,6 +908,32 @@ mod tests {
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
         assert_eq!(added[0].url, "socks5://bvfr1184448-region-US-st-California-sid-yMUGLq5C-t-5:sgydhxnf@us2.cliproxy.io:3010");
         assert_eq!(added[0].source_template.as_deref(), Some("socks5://bvfr1184448-region-US-st-California-sid-{sid}-t-5:sgydhxnf@us2.cliproxy.io:3010"));
+    }
+
+    #[test]
+    fn prune_replaced_removes_only_checked_regenerable_links_outside_keep() {
+        let manager = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        let sid = |value: &str| format!("socks5://user-sid-{}-t-5:pass@host.example:3010", value);
+        let in_use = manager.add(sid("InUse001"), None).unwrap();
+        let replaced = manager.add(sid("Dirty001"), None).unwrap();
+        let unchecked = manager.add(sid("Fresh001"), None).unwrap();
+        let fixed = manager.add("socks5://user:pass@static.example:1080".to_string(), None).unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            for entry in entries.iter_mut().filter(|entry| entry.id != unchecked.id) {
+                entry.last_quality_checked_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            let dirty = entries.iter_mut().find(|entry| entry.id == replaced.id).unwrap();
+            dirty.quality_status = ProxyQualityStatus::Dirty;
+            dirty.enabled = false;
+        }
+
+        let keep = std::collections::HashSet::from([in_use.url.clone()]);
+        assert_eq!(manager.prune_replaced(&keep), 1);
+        let urls: Vec<String> = manager.list().into_iter().map(|entry| entry.url).collect();
+        assert_eq!(urls, vec![in_use.url, unchecked.url, fixed.url]);
+        // 删掉旧链接后模板仍在，可继续生成替代链接。
+        assert_eq!(manager.generate_candidates(1), 1);
     }
 
     #[test]

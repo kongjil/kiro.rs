@@ -1508,9 +1508,9 @@ impl AdminService {
                 if config.enabled {
                     let result = svc.run_proxy_quality_check().await;
                     tracing::info!(
-                        "代理 IP 纯净度检查完成：检查 {}，干净 {}，脏 {}，错误 {}，自动禁用 {}，生成 {}，重新分配 {}",
+                        "代理 IP 纯净度检查完成：检查 {}，干净 {}，脏 {}，错误 {}，自动禁用 {}，生成 {}，重新分配 {}，删除旧链接 {}",
                         result.checked, result.clean, result.dirty, result.errors,
-                        result.disabled, result.generated, result.assigned
+                        result.disabled, result.generated, result.assigned, result.removed
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(config.interval_secs)).await;
                 } else {
@@ -3453,7 +3453,9 @@ impl AdminService {
 
     /// 检查正在使用的代理；若账号数大于健康且出口 IP 唯一的代理数，
     /// 从 sid 模板生成候选链接并继续检查，直到满足账号数或模板耗尽。
+    /// 重新分配后删除被替换下来的旧链接，池中只留在用和本轮检出的干净链接。
     pub async fn run_proxy_quality_check(&self) -> ProxyQualityRunResponse {
+        let _run_guard = self.proxy_pool.lock_quality_run().await;
         let snapshot = self.token_manager.snapshot();
         // 正常账号 + 等待代理预检的新账号都需要占用一个独立出口；手动禁用或
         // 因额度/鉴权失败禁用的账号不参与本轮预检。
@@ -3553,6 +3555,15 @@ impl AdminService {
                 }
             }
         }
+        // 本轮一个干净 IP 都没有时多半是检测服务异常，不删除，留给下一轮重查。
+        let removed = if clean.is_empty() {
+            0
+        } else {
+            let mut keep: HashSet<String> = self.token_manager.snapshot().entries.into_iter()
+                .filter_map(|entry| entry.proxy_url).collect();
+            keep.extend(clean.iter().map(|entry| entry.url.clone()));
+            self.proxy_pool.prune_replaced(&keep)
+        };
         ProxyQualityRunResponse {
             checked: summary.checked,
             clean: summary.clean,
@@ -3561,6 +3572,7 @@ impl AdminService {
             disabled: summary.disabled,
             generated: summary.generated,
             assigned,
+            removed,
             available_clean: clean.len(),
             required_credentials,
         }

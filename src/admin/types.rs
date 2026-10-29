@@ -928,6 +928,8 @@ pub struct ProxyQualityRunResponse {
     pub disabled: usize,
     pub generated: usize,
     pub assigned: usize,
+    /// 本轮删除的旧代理链接数。
+    pub removed: usize,
     pub available_clean: usize,
     pub required_credentials: usize,
 }

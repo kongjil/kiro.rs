@@ -104,7 +104,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const qualityRunMutation = useMutation({
     mutationFn: runProxyQualityCheck,
     onSuccess: (res) => {
-      toast.success(`纯净度检查完成：干净 ${res.clean}，脏 ${res.dirty}，生成 ${res.generated}，分配 ${res.assigned}`)
+      toast.success(`纯净度检查完成：干净 ${res.clean}，脏 ${res.dirty}，生成 ${res.generated}，分配 ${res.assigned}，删除旧链接 ${res.removed}`)
       queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

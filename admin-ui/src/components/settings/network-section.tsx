@@ -65,7 +65,7 @@ export function NetworkSection() {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       queryClient.invalidateQueries({ queryKey: ['proxy-quality-config'] })
       toast.success(
-        `预检完成：已检查 ${result.checked} 条，干净 ${result.clean} 条，新增 ${result.generated} 条；账号 ${result.requiredCredentials} 个，干净 IP ${result.availableClean} 条，分配/更新 ${result.assigned} 个。`
+        `预检完成：已检查 ${result.checked} 条，干净 ${result.clean} 条，新增 ${result.generated} 条；账号 ${result.requiredCredentials} 个，干净 IP ${result.availableClean} 条，分配/更新 ${result.assigned} 个，删除旧链接 ${result.removed} 条。`
       )
     },
     onError: (error) => toast.error(`预检失败：${extractErrorMessage(error)}`),
