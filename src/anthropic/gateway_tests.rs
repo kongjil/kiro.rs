@@ -41,6 +41,9 @@ use std::{
 
 #[derive(Clone, Copy)]
 enum Mode {
+    ReviewSuspended,
+    ReviewRepetition,
+    ReviewEndTurn,
     Normal(Duration),
     Interrupted,
     /// 每次都返回 500 + `MODEL_TEMPORARILY_UNAVAILABLE`。
@@ -56,6 +59,7 @@ enum Mode {
     InvalidFrame,
     Empty,
     Tools,
+    Filtered,
     Stalled,
     SlowHeaders,
     SlowErrorBody,
@@ -75,6 +79,19 @@ enum Mode {
     AlwaysTruncatedTool,
     /// 正文 + 完整工具调用，带 meteringEvent。
     Metered,
+    /// 上游按给定片段依次返回 assistantResponseEvent，随后 metadataEvent（用量 13/17）。
+    Reply(&'static [&'static str]),
+    /// 同 `Reply`，但先返回一段原生 reasoning。
+    ReplyWithReasoning(&'static [&'static str]),
+    /// 正文以字面 `<thinking>` 开头（L7：extractThinking=false 时流式不能拆出思考块）。
+    ThinkingText,
+    /// 正文之后上游下发 ThrottlingException 异常帧（M3）。
+    Throttled,
+    /// web_search 循环里工具参数是半截 JSON（L10）。
+    SearchInvalidToolJson,
+    /// 只有正文、没有 metadataEvent.tokenUsage：线上 Kiro 对 claude-opus/sonnet-5.5 的实际形态
+    /// （traces.db 里 usage_source 全是 none），缓存用量只能来自本地 CacheMeter。
+    NoProviderUsage,
 }
 
 struct Fixture {
@@ -84,7 +101,100 @@ struct Fixture {
     tokens: Arc<Mutex<Vec<String>>>,
     connections: Arc<Mutex<HashSet<SocketAddr>>>,
     close_headers: Arc<AtomicUsize>,
+    /// 上游收到的 Kiro 请求体（JSON）。
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+#[tokio::test]
+async fn integration_repeat_guard_records_error() {
+    let mut fixture = fixture(Mode::ReviewRepetition).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    fixture.state = fixture.state.clone().with_trace_store(Some(store.clone()));
+    let response = request(fixture.state.clone(), "messages", true).await;
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("repeated-token loop"));
+    let mut records = Vec::new();
+    for _ in 0..50 {
+        records = store.query_paged(&TraceQuery { limit: 10, ..Default::default() }).0;
+        if !records.is_empty() { break; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].final_status, "error");
+}
+
+#[tokio::test]
+async fn integration_native_end_turn_matches_streaming_and_non_streaming() {
+    let fixture = fixture(Mode::ReviewEndTurn).await;
+    for streaming in [true, false] {
+        let response = request(fixture.state.clone(), "messages", streaming).await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("\"stop_reason\":\"end_turn\""), "streaming={streaming}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn integration_cc_websearch_receives_custom_headers() {
+    use crate::model::custom_headers::{CustomHeaderRule, CustomHeadersManager};
+    let fixture = fixture(Mode::Normal(Duration::ZERO)).await;
+    let state = fixture.state.clone().with_custom_headers(Some(CustomHeadersManager::new(vec![
+        CustomHeaderRule { key: "X-Review-Trace".to_string(), value: "{trace_id}".to_string(), enabled: true },
+    ])));
+    for streaming in [true, false] {
+        let payload = json!({"model":"gpt-5.6-sol","max_tokens":64,"stream":streaming,
+            "messages":[{"role":"user","content":"search example"}],
+            "tools":[{"type":"web_search_20250305","name":"web_search"}]});
+        let response = post_messages_cc(axum::extract::State(state.clone()), Extension(key()), Json(serde_json::from_value(payload).unwrap())).await;
+        assert!(response.headers().get("x-review-trace").is_some());
+    }
+}
+
+#[tokio::test]
+async fn integration_cached_model_alias_is_not_rejected_by_preflight() {
+    let fixture = fixture(Mode::Normal(Duration::ZERO)).await;
+    let manager = fixture.state.kiro_provider.as_ref().unwrap().token_manager();
+    manager.set_test_models_fetcher(Arc::new(|_| Box::pin(async {
+        Ok(serde_json::from_value(json!({"models": [{"modelId": "claude-sonnet-4.6"}]})).unwrap())
+    })));
+    manager.get_available_models_for(1).await.unwrap();
+    let payload = json!({"model":"claude-sonnet-4-6-thinking", "max_tokens":64,
+        "messages":[{"role":"user","content":"hello"}]});
+    let response = post_messages(axum::extract::State(fixture.state.clone()), Extension(key()), Json(serde_json::from_value(payload).unwrap())).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fixture.calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn integration_no_credentials_after_upstream_failure_does_not_create_trace() {
+    for streaming in [true, false] {
+        let mut fixture = fixture(Mode::ReviewSuspended).await;
+        let store = Arc::new(TraceStore::open_in_memory().unwrap());
+        fixture.state = fixture.state.clone().with_trace_store(Some(store.clone()));
+        let response = request(fixture.state.clone(), "messages", streaming).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let (_, total) = store.query_paged(&TraceQuery { limit: 10, ..Default::default() });
+        assert_eq!(total, 0);
+    }
+}
+
+#[tokio::test]
+async fn integration_mixed_websearch_no_credentials_does_not_create_trace() {
+    for streaming in [true, false] {
+        let mut fixture = fixture(Mode::ReviewSuspended).await;
+        let store = Arc::new(TraceStore::open_in_memory().unwrap());
+        fixture.state = fixture.state.clone().with_trace_store(Some(store.clone()));
+        let payload = json!({"model":"gpt-5.6-sol","max_tokens":64,"stream":streaming,
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[{"type":"web_search_20250305","name":"web_search"},
+                {"name":"run","description":"run","input_schema":{"type":"object"}}]});
+        let response = post_messages(axum::extract::State(fixture.state.clone()), Extension(key()), Json(serde_json::from_value(payload).unwrap())).await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("No available credentials"));
+        let (_, total) = store.query_paged(&TraceQuery { limit: 10, ..Default::default() });
+        assert_eq!(total, 0);
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -168,15 +278,20 @@ async fn fixture_with_credentials(mode: Mode, config: Config, credential_count: 
     let tokens = Arc::new(Mutex::new(Vec::new()));
     let connections = Arc::new(Mutex::new(HashSet::new()));
     let close_headers = Arc::new(AtomicUsize::new(0));
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let seen_bodies = bodies.clone();
     let (seen_calls, seen_tokens, seen_connections, seen_close) =
         (calls.clone(), tokens.clone(), connections.clone(), close_headers.clone());
-    let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: String| {
+    let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: Bytes| {
         let (calls, tokens, connections, close) = (seen_calls.clone(), seen_tokens.clone(), seen_connections.clone(), seen_close.clone());
+        let seen_bodies = seen_bodies.clone();
         async move {
             calls.fetch_add(1, Ordering::Relaxed);
             if let Some(token) = headers.get("x-fixture-token").and_then(|v| v.to_str().ok()) {
                 tokens.lock().push(token.to_owned());
             }
+            if let Ok(value) = serde_json::from_slice(&body) { seen_bodies.lock().push(value); }
+            let body = String::from_utf8_lossy(&body).into_owned();
             connections.lock().insert(peer);
             if headers.get("connection").is_some_and(|v| v == "close") { close.fetch_add(1, Ordering::Relaxed); }
             if matches!(mode, Mode::TruncatedToolThenComplete | Mode::AlwaysTruncatedTool) {
@@ -211,11 +326,32 @@ async fn fixture_with_credentials(mode: Mode, config: Config, credential_count: 
                 ];
                 return Response::new(Body::from(parts.concat()));
             }
+            if matches!(mode, Mode::ReviewSuspended) {
+                return Response::builder().status(403).body(Body::from(r#"{"reason":"TEMPORARILY_SUSPENDED"}"#)).unwrap();
+            }
             if matches!(mode, Mode::SlowHeaders) { tokio::time::sleep(Duration::from_secs(4)).await; }
             if matches!(mode, Mode::SlowErrorBody) {
                 return Response::builder().status(500).body(Body::from_stream(stream::pending::<Result<Bytes, Infallible>>())).unwrap();
             }
             if matches!(mode, Mode::Empty) { return Response::new(Body::empty()); }
+            if let Mode::Reply(pieces) | Mode::ReplyWithReasoning(pieces) = mode {
+                let mut bytes = Vec::new();
+                if matches!(mode, Mode::ReplyWithReasoning(_)) {
+                    bytes.extend_from_slice(&frame("reasoningContentEvent", json!({"text":"Let me think about the goal."})));
+                }
+                for piece in pieces { bytes.extend_from_slice(&frame("assistantResponseEvent", json!({"content": piece}))); }
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})));
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::Filtered) {
+                let mut bytes = Vec::new();
+                for part in [
+                    frame("reasoningContentEvent", json!({"text":"I should summarize the result."})),
+                    frame("metadataEvent", json!({"stopReason":"CONTENT_FILTERED","stopDetails":{"detail":"private provider detail"},"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})),
+                ] { bytes.extend_from_slice(&part); }
+                let chunks: Vec<_> = bytes.chunks(7).map(Bytes::copy_from_slice).collect();
+                return Response::new(Body::from_stream(stream::iter(chunks.into_iter().map(Ok::<_, Infallible>))));
+            }
             if matches!(mode, Mode::Large) {
                 let frames = (0..18000).map(|_| frame("assistantResponseEvent", json!({"content": "x".repeat(1024)})));
                 return Response::new(Body::from_stream(stream::iter(frames.map(Ok::<_, Infallible>))));
@@ -224,6 +360,29 @@ async fn fixture_with_credentials(mode: Mode, config: Config, credential_count: 
                 let mut bytes = frame("assistantResponseEvent", json!({"content": "damaged"})).to_vec();
                 if matches!(mode, Mode::Truncated) { bytes.truncate(bytes.len() - 4); }
                 else { let last = bytes.len() - 1; bytes[last] ^= 1; }
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::Throttled) {
+                let mut bytes = frame("assistantResponseEvent", json!({"content": "partial answer"})).to_vec();
+                bytes.extend_from_slice(&exception_frame("ThrottlingException", json!({"message":"Rate exceeded for account 123456789012"})));
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::SearchInvalidToolJson) {
+                let bytes = frame("toolUseEvent", json!({"name":"run","toolUseId":"run_1","input":"{\"command\":\"ls","stop":true})).to_vec();
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::ThinkingText) {
+                let mut bytes = frame("assistantResponseEvent", json!({"content": "<thinking>先想想</thinking>\n\n答案"})).to_vec();
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":5,"outputTokens":3,"cacheReadInputTokens":0,"cacheWriteInputTokens":0}})));
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::ReviewRepetition | Mode::ReviewEndTurn) {
+                let content = if matches!(mode, Mode::ReviewRepetition) { "count\n".repeat(40) } else { "complete".to_string() };
+                let mut bytes = frame("assistantResponseEvent", json!({"content": content})).to_vec();
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"stopReason": "END_TURN"})));
+                if matches!(mode, Mode::ReviewEndTurn) {
+                    bytes.extend_from_slice(&frame("contextUsageEvent", json!({"contextUsagePercentage": 100.0})));
+                }
                 return Response::new(Body::from(bytes));
             }
             if matches!(mode, Mode::Tools) {
@@ -243,6 +402,9 @@ async fn fixture_with_credentials(mode: Mode, config: Config, credential_count: 
                     frame("meteringEvent", json!({"unit":"credit","unitPlural":"credits","usage":0.42})),
                 ];
                 return Response::new(Body::from(parts.concat()));
+            }
+            if matches!(mode, Mode::NoProviderUsage) {
+                return Response::new(Body::from(frame("assistantResponseEvent", json!({"content": "ok"}))));
             }
             if matches!(mode, Mode::Refused | Mode::RefusedWithSearch | Mode::RefusedWithPartialTool | Mode::RefusedWithInvalidTool | Mode::RefusedWithEmptyTool | Mode::RefusedBare) {
                 let mut bytes = Vec::new();
@@ -316,6 +478,7 @@ async fn fixture_with_credentials(mode: Mode, config: Config, credential_count: 
         tokens,
         connections,
         close_headers,
+        bodies,
         task,
     }
 }
@@ -532,6 +695,29 @@ async fn gateway_damaged_frames_are_errors_not_success() {
         }
         let response = request(f.state.clone(), "messages", false).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+}
+
+#[tokio::test]
+async fn gateway_content_filter_is_reported_instead_of_output_limit_or_success() {
+    // 只有 reasoning + CONTENT_FILTERED（带 tokenUsage、无 refusal 详情）：
+    // 必须报告为拒答，不得伪造 max_tokens / 成功结束，也不泄露上游私有字段。
+    let f = fixture(Mode::Filtered).await;
+    for (endpoint, streaming, expected) in [
+        ("messages", false, r#""stop_reason":"refusal""#),
+        ("messages", true, r#""stop_reason":"refusal""#),
+        ("cc", true, r#""stop_reason":"refusal""#),
+        ("chat", true, r#""finish_reason":"content_filter""#),
+        ("responses", true, r#""reason":"content_filter""#),
+    ] {
+        let response = request(f.state.clone(), endpoint, streaming).await;
+        assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains(expected), "{endpoint}: {body}");
+        assert!(!body.contains("max_tokens"), "{endpoint}: {body}");
+        assert!(!body.contains("model_context_window_exceeded"), "{endpoint}: {body}");
+        assert!(!body.contains("private provider detail"), "{endpoint}: {body}");
     }
 }
 
@@ -1104,6 +1290,56 @@ async fn gateway_first_token_trace_ignores_metadata() {
 }
 
 #[tokio::test]
+async fn gateway_local_rpm_limit_is_traced_apart_from_upstream_429() {
+    // 2026-10-30 线上：单账号 RPM 打满后网关自己回的 429 记成 transient / "upstream rate limited"、
+    // 凭据 0，看起来像上游限流（8 小时 1101 次，同期上游真正的 429 只有 38 次）。
+    let config: Config =
+        serde_json::from_value(json!({"accountRpmLimitEnabled": true, "accountRpmLimit": 1}))
+            .unwrap();
+    let mut f = fixture_with_config(Mode::Normal(Duration::ZERO), config).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    f.state = f.state.clone().with_trace_store(Some(store.clone()));
+
+    let first = request(f.state.clone(), "messages", false).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    to_bytes(first.into_body(), 1024 * 1024).await.unwrap();
+
+    let second = request(f.state.clone(), "messages", false).await;
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(second.headers().get("retry-after").is_some());
+    let body = to_bytes(second.into_body(), 1024 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("Gateway per-account rate limit"));
+    assert_eq!(f.calls.load(Ordering::Relaxed), 1, "被本地限流的请求不应发到上游");
+
+    let mut rejected = Vec::new();
+    for _ in 0..50 {
+        let (records, _) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        rejected = records
+            .into_iter()
+            .filter(|r| r.final_status != "success")
+            .collect();
+        if !rejected.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].error_type.as_deref(), Some("local_rate_limited"));
+    assert!(
+        rejected[0]
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("local per-account RPM limit"),
+        "{:?}",
+        rejected[0].error_message
+    );
+}
+
+#[tokio::test]
 async fn gateway_active_stream_can_exceed_idle_deadline() {
     let config: Config = serde_json::from_value(json!({"upstreamReadTimeoutSecs":1})).unwrap();
     let f = fixture_with_config(Mode::Active, config).await;
@@ -1147,4 +1383,732 @@ async fn gateway_latency_measurement() {
             f.calls.load(Ordering::Relaxed)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// output_config.format = json_schema（Claude Code goal check 形态）
+// ---------------------------------------------------------------------------
+
+const OPENING_CONDITION: &[&str] = &[
+    "The condition is not met yet. ",
+    "{\"ok\":false,",
+    "\"reason\":\"file missing\"}",
+];
+const OPENING_CHECKING: &[&str] = &[
+    "I'm checking the repository state.\n\n",
+    "{\"ok\":true,\"reason\":\"all tests pass\",\"impossible\":false}",
+];
+const OPENING_CORE: &[&str] = &[
+    "The core con",
+    "dition holds.\n```json\n{\"ok\":true,",
+    "\"reason\":\"done\"}\n```\nDone.",
+];
+const PURE_JSON: &[&str] = &["{\"ok\":true,", "\"reason\":\"fine\"}"];
+const NO_JSON: &[&str] = &["I'm checking the files, ", "nothing to report {yet}."];
+const NONCONFORMING_THEN_OK: &[&str] = &[
+    "First attempt: {\"ok\":\"yes\",\"reason\":1} then ",
+    "{\"ok\":false,\"reason\":\"second\"} and {\"ok\":true,\"reason\":\"third\"}",
+];
+
+fn goal_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "ok": {"type": "boolean"},
+            "reason": {"type": "string"},
+            "impossible": {"type": "boolean"}
+        },
+        "required": ["ok", "reason"],
+        "additionalProperties": false
+    })
+}
+
+fn goal_output_config() -> serde_json::Value {
+    json!({"format": {"type": "json_schema", "schema": goal_schema()}})
+}
+
+async fn goal_request(
+    state: AppState,
+    endpoint: &str,
+    streaming: bool,
+    thinking: bool,
+    output_config: Option<serde_json::Value>,
+) -> Response {
+    goal_request_for_model(state, "claude-haiku-5-5", endpoint, streaming, thinking, output_config)
+        .await
+}
+
+async fn goal_request_for_model(
+    state: AppState,
+    model: &str,
+    endpoint: &str,
+    streaming: bool,
+    thinking: bool,
+    output_config: Option<serde_json::Value>,
+) -> Response {
+    let mut req = json!({
+        "model": model,
+        "max_tokens": 256,
+        "stream": streaming,
+        "system": "You judge whether a goal condition is met.",
+        "messages": [{"role": "user", "content": "Is the goal done?"}],
+    });
+    if let Some(output_config) = output_config {
+        req["output_config"] = output_config;
+    }
+    if thinking {
+        req["thinking"] = json!({"type": "enabled", "budget_tokens": 2000});
+    }
+    let payload = Json(serde_json::from_value(req).unwrap());
+    if endpoint == "cc" {
+        post_messages_cc(axum::extract::State(state), Extension(key()), payload).await
+    } else {
+        post_messages(axum::extract::State(state), Extension(key()), payload).await
+    }
+}
+
+async fn body_string(response: Response) -> String {
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn parse_sse(body: &str) -> Vec<(String, serde_json::Value)> {
+    body.split("\n\n")
+        .filter(|block| !block.trim().is_empty())
+        .map(|block| {
+            let event = block
+                .lines()
+                .find_map(|line| line.strip_prefix("event: "))
+                .unwrap()
+                .to_owned();
+            let data = block
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            (event, serde_json::from_str(data).unwrap())
+        })
+        .filter(|(event, _)| event != "ping")
+        .collect()
+}
+
+/// 非 ping 事件的 (event, index) 序列；用于断言块结构。
+fn sse_shape(events: &[(String, serde_json::Value)]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|(event, _)| event != "ping")
+        .map(|(event, data)| match data.get("index") {
+            Some(index) => format!("{event}#{index}"),
+            None => event.clone(),
+        })
+        .collect()
+}
+
+fn sse_text(events: &[(String, serde_json::Value)]) -> String {
+    events
+        .iter()
+        .filter(|(event, data)| event == "content_block_delta" && data["delta"]["type"] == "text_delta")
+        .map(|(_, data)| data["delta"]["text"].as_str().unwrap())
+        .collect()
+}
+
+fn assert_goal_json(text: &str, expected: serde_json::Value) {
+    assert!(text.starts_with('{') && text.ends_with('}'), "not a bare JSON value: {text}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap(), expected);
+}
+
+fn goal_cases() -> Vec<(&'static [&'static str], serde_json::Value)> {
+    vec![
+        (OPENING_CONDITION, json!({"ok": false, "reason": "file missing"})),
+        (OPENING_CHECKING, json!({"ok": true, "reason": "all tests pass", "impossible": false})),
+        (OPENING_CORE, json!({"ok": true, "reason": "done"})),
+        (PURE_JSON, json!({"ok": true, "reason": "fine"})),
+        // 多个合规值时取最后一个（结论通常在理由之后）
+        (NONCONFORMING_THEN_OK, json!({"ok": true, "reason": "third"})),
+    ]
+}
+
+#[tokio::test]
+async fn structured_output_non_stream_extracts_json_from_prose() {
+    for endpoint in ["messages", "cc"] {
+        for (reply, expected) in goal_cases() {
+            let f = fixture(Mode::Reply(reply)).await;
+            let response = goal_request(f.state.clone(), endpoint, false, false, Some(goal_output_config())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+            let content = body["content"].as_array().unwrap();
+            assert_eq!(content.len(), 1, "{endpoint}: {body}");
+            assert_eq!(content[0]["type"], "text");
+            assert_goal_json(content[0]["text"].as_str().unwrap(), expected);
+            assert_eq!(body["type"], "message");
+            assert!(body["id"].as_str().unwrap().starts_with("msg_"));
+            assert_eq!(body["model"], "claude-haiku-5-5");
+            assert_eq!(body["stop_reason"], "end_turn");
+            assert_eq!(body["usage"]["output_tokens"], 17);
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_stream_respects_extract_thinking_disabled() {
+    // L7：fixture 的 AppState 是 extract_thinking=false。流式与非流式必须一致：不拆出 thinking 块。
+    let f = fixture(Mode::ThinkingText).await;
+    let req = json!({"model": "gpt-5.6-sol", "max_tokens": 2048, "stream": true,
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "messages": [{"role": "user", "content": "hello"}]});
+    for endpoint in ["messages", "cc"] {
+        let response = if endpoint == "cc" {
+            post_messages_cc(axum::extract::State(f.state.clone()), Extension(key()), Json(serde_json::from_value(req.clone()).unwrap())).await
+        } else {
+            post_messages(axum::extract::State(f.state.clone()), Extension(key()), Json(serde_json::from_value(req.clone()).unwrap())).await
+        };
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let sse = String::from_utf8_lossy(&bytes);
+        assert!(!sse.contains(r#""type":"thinking""#), "{endpoint}: {sse}");
+        assert!(sse.contains("先想想</thinking>"), "{endpoint}: {sse}");
+    }
+}
+
+#[tokio::test]
+async fn structured_output_stream_emits_one_compliant_json_text_block() {
+    for endpoint in ["messages", "cc"] {
+        for (reply, expected) in goal_cases() {
+            let f = fixture(Mode::Reply(reply)).await;
+            let response = goal_request(f.state.clone(), endpoint, true, false, Some(goal_output_config())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let events = parse_sse(&body_string(response).await);
+            assert_eq!(
+                sse_shape(&events),
+                [
+                    "message_start",
+                    "content_block_start#0",
+                    "content_block_delta#0",
+                    "content_block_stop#0",
+                    "message_delta",
+                    "message_stop"
+                ],
+                "{endpoint}: {events:?}"
+            );
+            assert_eq!(events[0].1["message"]["model"], "claude-haiku-5-5");
+            assert!(events[0].1["message"]["id"].as_str().unwrap().starts_with("msg_"));
+            assert_eq!(events[1].1["content_block"]["type"], "text");
+            assert_goal_json(&sse_text(&events), expected);
+            let delta = &events.iter().find(|(event, _)| event == "message_delta").unwrap().1;
+            assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+            assert_eq!(delta["usage"]["output_tokens"], 17);
+        }
+    }
+}
+
+#[tokio::test]
+async fn structured_output_without_conforming_json_is_returned_unchanged() {
+    let original: String = NO_JSON.concat();
+    let f = fixture(Mode::Reply(NO_JSON)).await;
+    let response = goal_request(f.state.clone(), "messages", false, false, Some(goal_output_config())).await;
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["content"], json!([{"type": "text", "text": original}]));
+    assert_eq!(body["stop_reason"], "end_turn");
+
+    let response = goal_request(f.state.clone(), "messages", true, false, Some(goal_output_config())).await;
+    let events = parse_sse(&body_string(response).await);
+    assert_eq!(sse_text(&events), original);
+    let shape = sse_shape(&events);
+    assert_eq!(shape.first().map(String::as_str), Some("message_start"));
+    assert_eq!(shape.last().map(String::as_str), Some("message_stop"));
+    assert!(shape.contains(&"message_delta".to_owned()));
+
+    // 只有不符合 schema 的 JSON 同样原样返回。
+    let f = fixture(Mode::Reply(&["{\"ok\":\"yes\"} and {\"reason\":2}"])).await;
+    let response = goal_request(f.state.clone(), "messages", false, false, Some(goal_output_config())).await;
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["content"][0]["text"], "{\"ok\":\"yes\"} and {\"reason\":2}");
+}
+
+#[tokio::test]
+async fn structured_output_keeps_thinking_blocks_before_json_text() {
+    let f = fixture(Mode::ReplyWithReasoning(OPENING_CONDITION)).await;
+    // 非流式默认不返回 thinking 块；开启 extract_thinking 后才有。
+    let mut state = f.state.clone();
+    state.extract_thinking = true;
+    let response = goal_request(state, "messages", false, true, Some(goal_output_config())).await;
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    let content = body["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2, "{body}");
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "Let me think about the goal.");
+    assert_eq!(content[1]["type"], "text");
+    assert_goal_json(content[1]["text"].as_str().unwrap(), json!({"ok": false, "reason": "file missing"}));
+
+    let response = goal_request(f.state.clone(), "messages", true, true, Some(goal_output_config())).await;
+    let events = parse_sse(&body_string(response).await);
+    assert_eq!(
+        sse_shape(&events),
+        [
+            "message_start",
+            "content_block_start#0",
+            "content_block_delta#0",
+            "content_block_delta#0",
+            "content_block_delta#0",
+            "content_block_stop#0",
+            "content_block_start#1",
+            "content_block_delta#1",
+            "content_block_stop#1",
+            "message_delta",
+            "message_stop"
+        ],
+        "{events:?}"
+    );
+    assert_eq!(events[1].1["content_block"]["type"], "thinking");
+    assert_eq!(events[6].1["content_block"]["type"], "text");
+    assert_goal_json(&sse_text(&events), json!({"ok": false, "reason": "file missing"}));
+}
+
+#[tokio::test]
+async fn structured_output_cc_preserves_thinking_with_format_only() {
+    let fixture = fixture(Mode::ReplyWithReasoning(OPENING_CONDITION)).await;
+    let response = goal_request(fixture.state.clone(), "cc", false, true, Some(goal_output_config())).await;
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["content"][0]["type"], "thinking");
+    let response = goal_request(fixture.state.clone(), "cc", true, true, Some(goal_output_config())).await;
+    let events = parse_sse(&body_string(response).await);
+    assert!(events.iter().any(|(_, data)| data["content_block"]["type"] == "thinking"));
+}
+
+/// 去掉注入的指令、忽略空行与随机会话 id 后，便于比较“除注入外完全一致”。
+fn strip_instruction(value: &mut serde_json::Value, instruction: &str) {
+    match value {
+        serde_json::Value::String(text) => {
+            let stripped = text.replace(instruction, "");
+            *text = stripped.split('\n').filter(|line| !line.is_empty()).collect::<Vec<_>>().join("\n");
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|v| strip_instruction(v, instruction)),
+        serde_json::Value::Object(map) => {
+            // 每次请求都会随机生成的会话 id。
+            for key in ["conversationId", "agentContinuationId"] {
+                if let Some(id) = map.get_mut(key) { *id = json!("<id>"); }
+            }
+            map.values_mut().for_each(|v| strip_instruction(v, instruction));
+        }
+        _ => {}
+    }
+}
+
+#[tokio::test]
+async fn structured_output_injects_system_prompt_only_when_format_is_set_and_never_forwards_it() {
+    let marker = super::structured_output::system_instruction(&goal_schema());
+    let marker_line = marker.lines().next().unwrap().to_owned();
+    let cases = [
+        ("none", None),
+        ("effort_only", Some(json!({"effort": "low"}))),
+        ("format_only", Some(goal_output_config())),
+        ("empty_object", Some(json!({}))),
+        ("effort_and_format", Some(json!({"effort": "low", "format": goal_output_config()["format"].clone()}))),
+        ("non_json_schema_format", Some(json!({"format": {"type": "text"}}))),
+    ];
+    let mut sent = HashMap::new();
+    for (name, output_config) in cases {
+        let f = fixture(Mode::Reply(PURE_JSON)).await;
+        let response = goal_request(f.state.clone(), "messages", false, false, output_config).await;
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        let _ = body_string(response).await;
+        let bodies = f.bodies.lock();
+        assert_eq!(bodies.len(), 1, "{name}");
+        sent.insert(name, bodies[0].clone());
+    }
+
+    for (name, body) in &sent {
+        // format / schema 不能出现在 Kiro 的额外字段里。
+        let extra = body.get("additionalModelRequestFields").map(|v| v.to_string()).unwrap_or_default();
+        assert!(!extra.contains("format") && !extra.contains("schema") && !extra.contains("json_schema"), "{name}: {extra}");
+    }
+    assert!(!sent["none"].to_string().contains(&marker_line));
+    assert!(!sent["effort_only"].to_string().contains(&marker_line));
+    assert!(!sent["non_json_schema_format"].to_string().contains(&marker_line));
+    assert!(sent["format_only"].to_string().contains(&marker_line));
+    assert!(sent["effort_and_format"].to_string().contains(&marker_line));
+
+    // 除注入的指令外，只带 format 的请求与空 `output_config`（缺省 effort=high）逐字段一致。
+    // 默认模型 haiku-5.5 支持原生 reasoning（#128），带 output_config 即下发 effort。
+    let mut with_format = sent["format_only"].clone();
+    strip_instruction(&mut with_format, &marker);
+    let mut without = sent["empty_object"].clone();
+    strip_instruction(&mut without, &marker);
+    assert_eq!(with_format, without, "format-only must not change anything but the system prompt");
+    let mut effort_and_format = sent["effort_and_format"].clone();
+    strip_instruction(&mut effort_and_format, &marker);
+    let mut effort_only = sent["effort_only"].clone();
+    strip_instruction(&mut effort_only, &marker);
+    assert_eq!(effort_and_format, effort_only, "effort must keep working next to format");
+}
+
+/// #128 x 结构化输出：claude-haiku-5.5 原生 reasoning 下，
+/// - 只带 format：与 `{}` / `{effort:"high"}` 一致，缺省 effort=high 下发，format 绝不下发；
+/// - format + effort：显式 effort（含 xhigh / max）原样透传；
+/// - 不带 format / output_config：不下发 additionalModelRequestFields，回复不被改写。
+#[tokio::test]
+async fn structured_output_on_haiku_5_5_keeps_native_reasoning_effort() {
+    let marker = super::structured_output::system_instruction(&goal_schema());
+    let schema_format = goal_output_config()["format"].clone();
+    let mut sent = HashMap::new();
+    for (name, output_config) in [
+        ("none", None),
+        ("empty_object", Some(json!({}))),
+        ("format_only", Some(goal_output_config())),
+        ("effort_only_max", Some(json!({"effort": "max"}))),
+        ("format_low", Some(json!({"effort": "low", "format": schema_format.clone()}))),
+        ("format_medium", Some(json!({"effort": "medium", "format": schema_format.clone()}))),
+        ("format_xhigh", Some(json!({"effort": "xhigh", "format": schema_format.clone()}))),
+        ("format_max", Some(json!({"effort": "max", "format": schema_format.clone()}))),
+    ] {
+        let f = fixture(Mode::Reply(PURE_JSON)).await;
+        let response = goal_request_for_model(
+            f.state.clone(),
+            "claude-haiku-5.5",
+            "messages",
+            false,
+            false,
+            output_config,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        let _ = body_string(response).await;
+        let bodies = f.bodies.lock();
+        assert_eq!(bodies.len(), 1, "{name}");
+        sent.insert(name, bodies[0].clone());
+    }
+    let extra = |name: &str| {
+        sent[name]
+            .get("additionalModelRequestFields")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let high = json!({"output_config": {"effort": "high"}});
+    assert_eq!(extra("none"), serde_json::Value::Null);
+    assert_eq!(extra("empty_object"), high);
+    assert_eq!(extra("format_only"), high);
+    for (name, effort) in [
+        ("effort_only_max", "max"),
+        ("format_low", "low"),
+        ("format_medium", "medium"),
+        ("format_xhigh", "xhigh"),
+        ("format_max", "max"),
+    ] {
+        assert_eq!(extra(name), json!({"output_config": {"effort": effort}}), "{name}");
+    }
+    // format / json_schema 绝不出现在上游请求的任何字段里（注入的 system 指令除外）。
+    for (name, body) in &sent {
+        let mut stripped = body.clone();
+        strip_instruction(&mut stripped, &marker);
+        let text = stripped.to_string().to_lowercase();
+        assert!(!text.contains("json_schema") && !text.contains("\"format\""), "{name}: {text}");
+    }
+    // 只带 format 与空 output_config 除注入指令外完全一致。
+    let mut a = sent["format_only"].clone();
+    strip_instruction(&mut a, &marker);
+    let mut b = sent["empty_object"].clone();
+    strip_instruction(&mut b, &marker);
+    assert_eq!(a, b);
+    // 注入仅发生在带 json_schema format 的请求上。
+    let marker_line = marker.lines().next().unwrap();
+    for name in ["none", "empty_object", "effort_only_max"] {
+        assert!(!sent[name].to_string().contains(marker_line), "{name}");
+    }
+    for name in ["format_only", "format_low", "format_medium", "format_xhigh", "format_max"] {
+        assert!(sent[name].to_string().contains(marker_line), "{name}");
+    }
+}
+
+/// master 语义：只要请求带了 `output_config`（哪怕只有 `format`），effort 默认为 `"high"`
+/// 且非流式会提取 thinking 块。结构化输出改造不能改变这一点。
+#[tokio::test]
+async fn structured_output_format_only_keeps_master_effort_default() {
+    // 选一个 master 会下发 additionalModelRequestFields 的模型：claude-sonnet-4.6
+    // （model_supports_native_reasoning 命中，且非 opus 4.6 的 adaptive-only 限制）。
+    for thinking in [false, true] {
+        let mut sent = HashMap::new();
+        for (name, output_config) in [
+            ("format_only", Some(goal_output_config())),
+            ("no_output_config", None),
+            ("empty_object", Some(json!({}))),
+            ("explicit_high", Some(json!({"effort": "high"}))),
+            ("explicit_low", Some(json!({"effort": "low"}))),
+        ] {
+            let f = fixture(Mode::Reply(PURE_JSON)).await;
+            let response = goal_request_for_model(
+                f.state.clone(),
+                "claude-sonnet-4.6",
+                "messages",
+                false,
+                thinking,
+                output_config,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{name}/{thinking}");
+            let _ = body_string(response).await;
+            let bodies = f.bodies.lock();
+            assert_eq!(bodies.len(), 1, "{name}/{thinking}");
+            sent.insert(name, bodies[0].clone());
+        }
+
+        let extra = |name: &str| {
+            sent[name]
+                .get("additionalModelRequestFields")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        };
+        // format-only 与 master 的「空的 / 显式 high 的 output_config」完全一致。
+        assert_eq!(extra("format_only"), json!({"output_config": {"effort": "high"}}), "thinking={thinking}");
+        assert_eq!(extra("format_only"), extra("empty_object"), "thinking={thinking}");
+        assert_eq!(extra("format_only"), extra("explicit_high"), "thinking={thinking}");
+        // 不带 output_config 时不带 reasoning 字段（master 同；thinking 启用时由 budget 推导）。
+        if !thinking {
+            assert_eq!(extra("no_output_config"), serde_json::Value::Null);
+        }
+        // 显式 effort 仍然照旧优先。
+        assert_eq!(extra("explicit_low"), json!({"output_config": {"effort": "low"}}), "thinking={thinking}");
+
+        // format 绝不下发；注入的 system 指令是唯一差别。
+        let format_only = sent["format_only"].to_string();
+        assert!(!format_only.to_lowercase().contains("format"), "{format_only}");
+        assert!(!format_only.to_lowercase().contains("json_schema"), "{format_only}");
+        let marker = super::structured_output::system_instruction(&goal_schema());
+        let mut with_format = sent["format_only"].clone();
+        strip_instruction(&mut with_format, &marker);
+        let mut without = sent["explicit_high"].clone();
+        strip_instruction(&mut without, &marker);
+        assert_eq!(with_format, without, "thinking={thinking}");
+    }
+}
+
+/// 非流式 + state.extract_thinking=false + thinking enabled + 只有 format 的 output_config：
+/// 与 master 下 `output_config:{effort:"high"}` 的表现一致——因 payload 带 output_config，
+/// thinking 仍作为独立内容块返回，其后的 JSON 文本块再被提取改写。
+#[tokio::test]
+async fn structured_output_format_only_extracts_thinking_like_master() {
+    let f = fixture(Mode::ReplyWithReasoning(OPENING_CONDITION)).await;
+    let mut state = f.state.clone();
+    state.extract_thinking = false;
+
+    let mut thinking = HashMap::new();
+    for (name, output_config, bare_json) in [
+        ("format_only", Some(goal_output_config()), true),
+        ("explicit_high", Some(json!({"effort": "high"})), false),
+    ] {
+        let response = goal_request(state.clone(), "messages", false, true, output_config).await;
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        let content = body["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "{name}: {body}");
+        assert_eq!(content[0]["type"], "thinking", "{name}: {body}");
+        assert_eq!(content[0]["thinking"], "Let me think about the goal.", "{name}");
+        assert_eq!(content[1]["type"], "text", "{name}: {body}");
+        if bare_json {
+            // format 存在：text 块被改写为纯 JSON。
+            assert_goal_json(
+                content[1]["text"].as_str().unwrap(),
+                json!({"ok": false, "reason": "file missing"}),
+            );
+        } else {
+            assert_eq!(
+                content[1]["text"],
+                OPENING_CONDITION.concat(),
+                "没有 format 时不改写回复"
+            );
+        }
+        thinking.insert(name, content[0].clone());
+    }
+    // 两种 output_config 的 thinking 块完全相同：format 不影响 reasoning 行为。
+    // signature 每块随机生成（ids::thinking_signature），只比较其余字段。
+    let strip_signature = |mut block: serde_json::Value| {
+        assert!(block["signature"].as_str().is_some_and(|s| !s.is_empty()));
+        block.as_object_mut().unwrap().remove("signature");
+        block
+    };
+    assert_eq!(
+        strip_signature(thinking["format_only"].clone()),
+        strip_signature(thinking["explicit_high"].clone())
+    );
+
+    // 对照组：extract_thinking=false 且无 output_config 时不拆 thinking 块（master 同）。
+    let f = fixture(Mode::ReplyWithReasoning(OPENING_CONDITION)).await;
+    let mut state = f.state.clone();
+    state.extract_thinking = false;
+    let response = goal_request(state, "messages", false, true, None).await;
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["content"], json!([{"type": "text", "text": OPENING_CONDITION.concat()}]));
+}
+
+#[tokio::test]
+async fn structured_output_is_inert_without_format() {
+    // 没有 output_config / 只有 effort / 非 json_schema 的 format：响应和流都不被改写，
+    // 即使回复里恰好含有符合某个 schema 的 JSON。
+    let original: String = OPENING_CHECKING.concat();
+    for output_config in [
+        None,
+        Some(json!({"effort": "low"})),
+        Some(json!({"format": {"type": "text"}})),
+        Some(json!({"format": {"type": "json_schema"}})),
+    ] {
+        let f = fixture(Mode::Reply(OPENING_CHECKING)).await;
+        let response = goal_request(f.state.clone(), "messages", false, false, output_config.clone()).await;
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["content"], json!([{"type": "text", "text": original}]), "{output_config:?}");
+
+        let response = goal_request(f.state.clone(), "messages", true, false, output_config.clone()).await;
+        let events = parse_sse(&body_string(response).await);
+        assert_eq!(sse_text(&events), original, "{output_config:?}");
+        // 实时转发：文本按上游片段逐段下发，而不是合并成一个 delta。
+        let deltas = events
+            .iter()
+            .filter(|(event, data)| event == "content_block_delta" && data["delta"]["type"] == "text_delta")
+            .count();
+        assert!(deltas >= 2, "{output_config:?}: text was not streamed live: {events:?}");
+    }
+}
+
+#[tokio::test]
+async fn structured_output_stream_failure_keeps_buffered_events_in_order() {
+    let f = fixture(Mode::Interrupted).await;
+    let response = goal_request(f.state.clone(), "messages", true, false, Some(goal_output_config())).await;
+    let events = parse_sse(&body_string(response).await);
+    let shape = sse_shape(&events);
+    assert_eq!(shape.first().map(String::as_str), Some("message_start"));
+    assert!(shape.contains(&"content_block_delta#0".to_owned()), "{shape:?}");
+    assert_eq!(shape.last().map(String::as_str), Some("error"), "{shape:?}");
+    assert!(!shape.contains(&"message_stop".to_owned()));
+}
+
+/// 结构化流式会缓冲到流末才发出内容：trace 首字时间应记在真正发出时，
+/// 而不是上游内容到达时；不带 format 的请求照旧按到达时间记。
+#[tokio::test]
+async fn structured_output_stream_first_token_trace_is_emit_time() {
+    let mut first_token = HashMap::new();
+    for (name, output_config) in [("structured", Some(goal_output_config())), ("plain", None)] {
+        let mut f = fixture(Mode::Normal(Duration::from_millis(300))).await;
+        let store = Arc::new(TraceStore::open_in_memory().unwrap());
+        f.state = f.state.clone().with_trace_store(Some(store.clone()));
+        let response = goal_request(f.state.clone(), "messages", true, false, output_config).await;
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        let _ = body_string(response).await;
+        let (records, count) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(count, 1, "{name}");
+        first_token.insert(name, records[0].first_token_ms.unwrap());
+    }
+    assert!(first_token["structured"] >= 300, "{first_token:?}");
+    assert!(first_token["plain"] < 300, "{first_token:?}");
+}
+
+#[tokio::test]
+async fn gateway_upstream_exception_keeps_classified_reason() {
+    // M3：流中途的 ThrottlingException 必须以 rate_limit_error 告诉客户端，且不带上游原文。
+    let f = fixture(Mode::Throttled).await;
+    let sse = {
+        let response = request(f.state.clone(), "messages", true).await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    assert!(sse.contains("rate_limit_error"), "{sse}");
+    assert!(!sse.contains("message_stop"), "{sse}");
+    assert!(!sse.contains("123456789012"), "{sse}");
+    let response = request(f.state.clone(), "messages", false).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn gateway_search_loop_rejects_truncated_tool_json() {
+    // L10：web_search 循环里半截工具参数不能以 {} 交给客户端执行。
+    let mut failures = Vec::new();
+    for streaming in [false, true] {
+        let f = fixture(Mode::SearchInvalidToolJson).await;
+        let payload = json!({
+            "model":"gpt-5.6-sol","max_tokens":64,"stream":streaming,
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[
+                {"type":"web_search_20250305","name":"web_search"},
+                {"name":"run","description":"test command","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}
+            ]
+        });
+        let response = post_messages(
+            axum::extract::State(f.state.clone()),
+            Extension(key()),
+            Json(serde_json::from_value(payload).unwrap()),
+        )
+        .await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let failed_visibly = status != StatusCode::OK || body.contains("event: error");
+        if !failed_visibly || body.contains(r#""stop_reason":"tool_use""#) {
+            failures.push(format!("stream={streaming}, status={status}, body={body}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// 读流式响应里最后一份 usage（message_start 先给占位，message_delta 给最终值）。
+async fn streamed_cache_usage(response: Response) -> (u64, u64) {
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    let (mut read, mut create) = (0, 0);
+    for line in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let usage = event.get("usage").or_else(|| event.pointer("/message/usage"));
+        if let Some(u) = usage {
+            if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) { read = v; }
+            if let Some(v) = u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()) { create = v; }
+        }
+    }
+    (read, create)
+}
+
+#[tokio::test]
+async fn gateway_dsh_master_key_reports_cache_hits_without_session_header() {
+    // 回归：DSH（pi-ai）用主 Key、不带 metadata.user_id，也发不出会话请求头。
+    // 以前 isolation_seed 返回 None → 每个请求都是 miss_no_seed，DSH 永远显示缓存命中 0%。
+    // 请求体是 pi-ai 1.4.0 真实生成的三轮（见 fixtures/dsh-pi-ai-1.4.0/README.md），不手造。
+    let turns: Vec<serde_json::Value> = [
+        include_str!("fixtures/dsh-pi-ai-1.4.0/turn1.json"),
+        include_str!("fixtures/dsh-pi-ai-1.4.0/turn2.json"),
+        include_str!("fixtures/dsh-pi-ai-1.4.0/turn3.json"),
+    ]
+    .iter()
+    .map(|s| serde_json::from_str(s).unwrap())
+    .collect();
+    let f = fixture(Mode::NoProviderUsage).await;
+    let state = f
+        .state
+        .clone()
+        .with_cache_meter(Some(Arc::new(crate::anthropic::cache_metering::CacheMeter::new(None))));
+    let send = |body: serde_json::Value| {
+        let state = state.clone();
+        async move {
+            let response = post_messages(
+                axum::extract::State(state),
+                Extension(key()),
+                Json(serde_json::from_value(body).unwrap()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            streamed_cache_usage(response).await
+        }
+    };
+
+    let (read1, create1) = send(turns[0].clone()).await;
+    assert_eq!(read1, 0, "首轮没有可读的缓存");
+    assert!(create1 > 0, "首轮应写入缓存，实际 create={create1}");
+
+    let (read2, _) = send(turns[1].clone()).await;
+    assert!(read2 > 0, "同一会话第二轮应读到缓存（DSH 0% 的 bug），实际 read={read2}");
+
+    let (read3, _) = send(turns[2].clone()).await;
+    assert!(read3 > read2, "第三轮应读到第二轮写入的更长前缀：read2={read2} read3={read3}");
+
+    // 另一个会话：第一条 user 消息不同 → 不应读到上一个会话的缓存
+    let mut other = turns[1].clone();
+    other["messages"][0]["content"] = json!("另一个会话的第一条消息。");
+    let (read_other, create_other) = send(other).await;
+    assert_eq!(read_other, 0, "不同会话不应命中");
+    assert!(create_other > 0);
 }

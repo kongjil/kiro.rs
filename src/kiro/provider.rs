@@ -15,12 +15,12 @@ use crate::admin::trace_db::{TraceAttempt, TraceRoute, TraceSink, outcome, trunc
 use crate::http_client::{ProxyConfig, build_client_with_timeouts};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::{
-    UpstreamContextOverflowError, UpstreamModelUnavailableError, UpstreamRateLimitError,
-    UpstreamTimeoutError, is_model_overloaded_body,
+    NoAvailableCredentialsError, UpstreamContextOverflowError, UpstreamModelUnavailableError,
+    UpstreamRateLimitError, UpstreamTimeoutError, is_model_overloaded_body,
 };
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{InFlightGuard, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -119,11 +119,14 @@ pub struct KiroCallResult {
     /// 本次请求占用的账号并发位。调用方必须一直持有到响应体读完（流式请求即整条流
     /// 结束），读完后尽早释放，否则该账号的并发计数会偏高或偏低。
     pub permit: Option<crate::kiro::concurrency::SharedPermit>,
+    /// 在途请求守卫，随响应流一起存活，流结束后自动递减并发计数
+    pub _in_flight: Option<Arc<InFlightGuard>>,
 }
 
 /// A successful MCP HTTP response whose trace attempt is finalized after body validation.
 struct McpCallResult {
     response: reqwest::Response,
+    in_flight: Option<Arc<InFlightGuard>>,
     credential_id: u64,
     endpoint: &'static str,
     attempt: usize,
@@ -322,11 +325,17 @@ impl KiroProvider {
         &self,
         request_body: &str,
         group: Option<&str>,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<KiroCallResult> {
         let result = self.call_mcp_with_retry(request_body, None, group).await?;
         self.token_manager
             .report_success_for_request(result.credential_id, None);
-        Ok(result.response)
+        Ok(KiroCallResult {
+            response: result.response,
+            credential_id: result.credential_id,
+            // MCP 请求的并发位在重试循环结束时就已归还
+            permit: None,
+            _in_flight: result.in_flight,
+        })
     }
 
     /// 发送 MCP API 请求，并在响应正文通过调用方校验后提交最终 trace attempt。
@@ -341,6 +350,7 @@ impl KiroProvider {
         let result = self
             .call_mcp_with_retry(request_body, Some(sink), group)
             .await?;
+        let _in_flight = result.in_flight;
         let status = result.response.status().as_u16();
         let body = match result.response.text().await {
             Ok(body) => body,
@@ -413,16 +423,24 @@ impl KiroProvider {
                 Ok(c) => c,
                 Err(e) => {
                     if is_rate_limit_error(&e) {
+                        let kind = if is_local_rate_limit(&e) {
+                            outcome::LOCAL_RATE_LIMITED
+                        } else {
+                            outcome::TRANSIENT
+                        };
                         Self::emit_attempt(
                             sink,
                             attempt,
                             0,
                             "",
                             None,
-                            outcome::TRANSIENT,
+                            kind,
                             Some(&e.to_string()),
                             attempt_start,
                         );
+                        return Err(e);
+                    }
+                    if e.is::<NoAvailableCredentialsError>() {
                         return Err(e);
                     }
                     // Preserve the prior upstream 429 as the terminal trace attempt. A
@@ -565,6 +583,7 @@ impl KiroProvider {
             if status.is_success() {
                 return Ok(McpCallResult {
                     response,
+                    in_flight: ctx._in_flight.clone(),
                     credential_id: ctx.id,
                     endpoint: endpoint_name,
                     attempt,
@@ -591,7 +610,11 @@ impl KiroProvider {
                     .token_manager
                     .report_quota_exhausted_for_request(ctx.id, None, group);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    return Err(NoAvailableCredentialsError::new(format!(
+                        "MCP 请求失败（所有凭据已用尽）: {} {}",
+                        status, body
+                    ))
+                    .into());
                 }
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 continue;
@@ -612,33 +635,35 @@ impl KiroProvider {
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
+            // 账号封禁检测（不限状态码，优先于 401/403/429 分支）
+            // 内置检测：JSON reason=TEMPORARILY_SUSPENDED / 文案交叉匹配
+            // 自定义检测：suspended_ban_keywords 中任一关键词命中
+            if self.token_manager.get_suspended_detection_enabled()
+                && (endpoint.is_account_suspended(&body)
+                    || self.token_manager.matches_suspended_ban_keywords(&body))
+            {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::ACCOUNT_SUSPENDED,
+                    Some(&body),
+                    attempt_start,
+                );
+                let has_available = self
+                    .token_manager
+                    .report_suspended_for_request(ctx.id, None, group);
+                if !has_available {
+                    return Err(NoAvailableCredentialsError::new(format!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body)).into());
+                }
+                last_error = Some(anyhow::anyhow!("MCP 请求失败（账号封禁）: {} {}", status, body));
+                continue;
+            }
+
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
-                // 403 + 明确封禁文案：账号被封禁，立即禁用且不参与自愈（受配置开关控制）
-                if status.as_u16() == 403
-                    && self.token_manager.get_suspended_detection_enabled()
-                    && endpoint.is_account_suspended(&body)
-                {
-                    Self::emit_attempt(
-                        sink,
-                        attempt,
-                        ctx.id,
-                        endpoint_name,
-                        Some(status.as_u16()),
-                        outcome::ACCOUNT_SUSPENDED,
-                        Some(&body),
-                        attempt_start,
-                    );
-                    let has_available = self
-                        .token_manager
-                        .report_suspended_for_request(ctx.id, None, group);
-                    if !has_available {
-                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
-                    }
-                    last_error = Some(anyhow::anyhow!("MCP 请求失败（账号封禁）: {} {}", status, body));
-                    continue;
-                }
-
                 Self::emit_attempt(
                     sink,
                     attempt,
@@ -667,9 +692,51 @@ impl KiroProvider {
                     .token_manager
                     .report_failure_for_request(ctx.id, None, group);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    return Err(NoAvailableCredentialsError::new(format!(
+                        "MCP 请求失败（所有凭据已用尽）: {} {}",
+                        status, body
+                    ))
+                    .into());
                 }
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                continue;
+            }
+
+            // 429 账号级限流：冷却当前凭据并故障转移到其它可用账号。
+            // 与模型 API 路径一致，仅处理账号级限流；容量类 429 走下方瞬态重试。
+            if status.as_u16() == 429
+                && self.token_manager.get_account_throttle_failover()
+                && endpoint.is_account_rate_limited(&body)
+            {
+                let cooldown_secs = self
+                    .token_manager
+                    .get_account_throttle_cooldown_secs()
+                    .max(1);
+                let cooldown = std::time::Duration::from_secs(cooldown_secs);
+                tracing::warn!(
+                    "MCP 请求失败（账号级限流，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
+                    ctx.id,
+                    cooldown_secs,
+                    attempt + 1,
+                    max_retries,
+                    body
+                );
+                let remaining = self.token_manager.report_account_throttled_for_request(
+                    ctx.id,
+                    cooldown,
+                    None,
+                    group,
+                );
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(429),
+                    outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
+                );
+                let rate_limit_error =
+                    account_rate_limit_with_fallback(rate_limit_error, cooldown_secs);
+                if remaining == 0 {
+                    return Err(rate_limit_error.into());
+                }
+                last_error = Some(rate_limit_error.into());
                 continue;
             }
 
@@ -805,10 +872,20 @@ impl KiroProvider {
                 }
                 Err(e) => {
                     if is_rate_limit_error(&e) {
+                        // 选号阶段的限流：本地 RPM 打满时没有请求发到上游，单独归类；
+                        // 其余（如 Token 刷新被上游 429）仍按瞬态错误记。
+                        let kind = if is_local_rate_limit(&e) {
+                            outcome::LOCAL_RATE_LIMITED
+                        } else {
+                            outcome::TRANSIENT
+                        };
                         Self::emit_attempt(
-                            sink, attempt, 0, "", None, outcome::TRANSIENT,
+                            sink, attempt, 0, "", None, kind,
                             Some(&e.to_string()), attempt_start,
                         );
+                        return Err(e);
+                    }
+                    if e.is::<NoAvailableCredentialsError>() {
                         return Err(e);
                     }
                     if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
@@ -942,6 +1019,7 @@ impl KiroProvider {
                     response,
                     credential_id: ctx.id,
                     permit: ctx.permit.take(),
+                    _in_flight: ctx._in_flight.clone(),
                 });
             }
 
@@ -1039,12 +1117,11 @@ impl KiroProvider {
                     group,
                 );
                 if !has_available {
-                    anyhow::bail!(
+                    return Err(NoAvailableCredentialsError::new(format!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                        api_type, status, body
+                    ))
+                    .into());
                 }
 
                 last_error = Some(anyhow::anyhow!(
@@ -1068,48 +1145,45 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
+            // 账号封禁检测（不限状态码，优先于 401/403/429 分支）
+            if self.token_manager.get_suspended_detection_enabled()
+                && (endpoint.is_account_suspended(&body)
+                    || self.token_manager.matches_suspended_ban_keywords(&body))
+            {
+                tracing::error!(
+                    "API 请求失败（账号被封禁，禁用凭据 #{} 并切换，尝试 {}/{}）: {} {}",
+                    ctx.id,
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    outcome::ACCOUNT_SUSPENDED, Some(&body), attempt_start,
+                );
+
+                let has_available = self.token_manager.report_suspended_for_request(
+                    ctx.id,
+                    model.as_deref(),
+                    group,
+                );
+                if !has_available {
+                    return Err(NoAvailableCredentialsError::new(format!(
+                        "{} API 请求失败（所有凭据已用尽）: {} {}", api_type, status, body
+                    )).into());
+                }
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（账号封禁）: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
+            }
+
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
-                // 403 + 明确封禁文案：账号被封禁，立即禁用且不参与自愈（受配置开关控制）
-                if status.as_u16() == 403
-                    && self.token_manager.get_suspended_detection_enabled()
-                    && endpoint.is_account_suspended(&body)
-                {
-                    tracing::error!(
-                        "API 请求失败（账号被封禁，禁用凭据 #{} 并切换，尝试 {}/{}）: {} {}",
-                        ctx.id,
-                        attempt + 1,
-                        max_retries,
-                        status,
-                        body
-                    );
-                    Self::emit_attempt(
-                        sink, attempt, ctx.id, endpoint_name, Some(403),
-                        outcome::ACCOUNT_SUSPENDED, Some(&body), attempt_start,
-                    );
-
-                    let has_available = self.token_manager.report_suspended_for_request(
-                        ctx.id,
-                        model.as_deref(),
-                        group,
-                    );
-                    if !has_available {
-                        anyhow::bail!(
-                            "{} API 请求失败（所有凭据已用尽）: {} {}",
-                            api_type,
-                            status,
-                            body
-                        );
-                    }
-                    last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败（账号封禁）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    ));
-                    continue;
-                }
-
                 tracing::warn!(
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -1139,12 +1213,11 @@ impl KiroProvider {
                     self.token_manager
                         .report_failure_for_request(ctx.id, model.as_deref(), group);
                 if !has_available {
-                    anyhow::bail!(
+                    return Err(NoAvailableCredentialsError::new(format!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                        api_type, status, body
+                    ))
+                    .into());
                 }
 
                 last_error = Some(anyhow::anyhow!(
@@ -1439,6 +1512,12 @@ impl KiroProvider {
 
 fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UpstreamRateLimitError>().is_some()
+}
+
+fn is_local_rate_limit(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UpstreamRateLimitError>()
+        .is_some_and(UpstreamRateLimitError::is_local)
 }
 
 fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyhow::Error> {

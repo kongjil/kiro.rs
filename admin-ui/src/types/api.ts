@@ -1,12 +1,45 @@
+// 凭据状态统计（后端全量统计，不受分页/筛选影响）
+export interface CredentialStateCounts {
+  healthy: number
+  throttled: number
+  quota: number
+  dead: number
+  suspended?: number
+  total: number
+}
+
 // 凭据状态响应
 export interface CredentialsStatusResponse {
   total: number
+  /** 搜索/分组/状态筛选后的条目总数；仅在带筛选或分页参数时返回 */
+  filteredTotal?: number
   available: number
+  /** 当前页码（1-based）；未分页时不返回 */
+  page?: number
+  /** 每页数量；未分页时不返回 */
+  pageSize?: number
   /** 优先级模式下的当前优先凭据 ID；均衡模式为 0 */
   currentId: number
+  /** 各状态凭据全量统计 */
+  stateCounts?: CredentialStateCounts
   /** 描述 metadata 字段、值类型和选项的 JSON Schema */
   metadataSchema: CredentialMetadataSchema
   credentials: CredentialStatusItem[]
+}
+
+/** 排序方向 */
+export type SortDir = 'asc' | 'desc'
+
+// 凭据查询参数（服务端分页、搜索、过滤、排序）
+export interface CredentialQueryParams {
+  page?: number
+  pageSize?: number
+  search?: string
+  group?: string
+  status?: string
+  tier?: string
+  sortField?: string
+  sortDir?: SortDir
 }
 
 export type CredentialType = 'normal' | 'boom'
@@ -67,6 +100,8 @@ export interface CredentialMetadataSchemaConfig {
 export interface CredentialStatusItem {
   id: number
   priority: number
+  /** 负载因子（均衡模式下的调度权重，数值越大调度频次越高，默认为 10） */
+  loadFactor: number
   disabled: boolean
   failureCount: number
   /** 累计失败次数（所有失败类型，只增不减，仅手动重置归零） */
@@ -88,6 +123,7 @@ export interface CredentialStatusItem {
   successCount: number
   lastUsedAt: string | null
   hasProxy: boolean
+  proxyTemporaryDirect?: boolean
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
@@ -188,6 +224,10 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+export interface SetLoadFactorRequest {
+  loadFactor: number
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
@@ -206,6 +246,8 @@ export interface AddCredentialRequest {
   /** 企业 SSO 授予的 scopes（空格分隔，可选） */
   scopes?: string
   priority?: number
+  /** 负载因子（均衡模式下的调度权重，数值越大调度频次越高，默认为 10） */
+  loadFactor?: number
   authRegion?: string
   apiRegion?: string
   machineId?: string
@@ -240,6 +282,8 @@ export interface UpdateCredentialRequest {
   groups?: string[]
   /** 账号来源渠道（undefined 表示不修改，空串表示清除） */
   sourceChannel?: string
+  /** 负载因子（均衡模式下的调度权重，>= 1，undefined 表示不修改） */
+  loadFactor?: number
   /** 整体更新 metadata；调用方应保留不认识的扩展字段 */
   metadata?: CredentialMetadata
   accountCostCny?: number
@@ -278,6 +322,8 @@ export interface ProxyPoolEntry {
   qualityStatus: ProxyQualityStatus
   qualityReason?: string
   lastQualityCheckedAt?: string
+  /** 由自动检测登记（凭据或全局配置在用、但此前未登记到池内） */
+  autoDetected: boolean
 }
 
 // 代理池列表响应
@@ -320,11 +366,43 @@ export interface ProxyCheckResponse {
   autoDisabled: boolean
 }
 
+// 凭据代理自动轮换结果
+export interface ProxyRotationResponse {
+  /** 从不可用代理轮换到其它可用代理的凭据数 */
+  rotated: number
+  /** 因无可用代理而回退直连的凭据数 */
+  switchedToDirect: number
+  /** 已恢复可用代理、从直连改回代理的凭据数 */
+  restoredToProxy: number
+  /** 代理不可用但无处可换、保持原配置的凭据数 */
+  unresolved: number
+}
+
 // 全量健康检查响应
 export interface ProxyCheckAllResponse {
   healthy: number
   unhealthy: number
   autoDisabled: number
+  /** 从自动禁用状态恢复启用的代理数 */
+  autoRecovered: number
+  /** 本轮自动检测新登记进池的代理数 */
+  detected: number
+  /** 本轮代理自动轮换结果 */
+  rotation: ProxyRotationResponse
+}
+
+// 代理故障转移配置
+export interface ProxyFailoverConfig {
+  /** 是否启用凭据代理的自动检测与轮换 */
+  autoRotateEnabled: boolean
+  /** 无可用代理时是否允许凭据回退直连 */
+  directFallbackEnabled: boolean
+}
+
+// 代理故障转移配置更新请求
+export interface ProxyFailoverConfigPatch {
+  autoRotateEnabled?: boolean
+  directFallbackEnabled?: boolean
 }
 
 export interface ProxyQualityConfigResponse {
@@ -534,7 +612,20 @@ export interface ClientKeyItem {
 
 export interface ClientKeysResponse {
   total: number
+  filteredTotal?: number
+  page?: number
+  pageSize?: number
   keys: ClientKeyItem[]
+}
+
+export interface ClientKeyQueryParams {
+  page?: number
+  pageSize?: number
+  search?: string
+  status?: string
+  group?: string
+  sortBy?: string
+  sortDir?: SortDir
 }
 
 export interface CreateClientKeyRequest {
@@ -709,7 +800,7 @@ export interface TraceAttempt {
   endpoint: string
   /** 上游 HTTP 状态码；null = 网络层失败 */
   httpStatus: number | null
-  /** success / quota_exhausted / account_throttled / auth_failed / transient / network_error / bad_request / unknown */
+  /** success / quota_exhausted / account_throttled / local_rate_limited / auth_failed / transient / network_error / bad_request / unknown */
   outcome: string
   /** 上游错误体片段（已截断） */
   errorSnippet: string | null
@@ -831,6 +922,23 @@ export interface CustomModelItem {
   ownedBy?: string
 }
 
+// ============ 自定义响应头 ============
+
+/** 单条自定义响应头规则（与 config.json customHeaders 数组一一对应） */
+export interface CustomHeaderItem {
+  key: string
+  value: string
+  enabled: boolean
+}
+
+export interface CustomHeadersConfigResponse {
+  headers: CustomHeaderItem[]
+}
+
+export interface SetCustomHeadersRequest {
+  headers: CustomHeaderItem[]
+}
+
 // ============ 账号分组（独立实体）============
 
 export interface GroupItem {
@@ -841,16 +949,36 @@ export interface GroupItem {
   credentialCount: number
   /** 引用计数：有多少把客户端 Key 绑定这个分组 */
   clientKeyCount: number
+  /** 分组级负载均衡模式（null/undefined 表示继承全局） */
+  loadBalancingMode?: LoadBalancingMode | null
+  /** 分组级优先级反转（null/undefined 表示继承全局） */
+  invertPriority?: boolean | null
 }
+
+/** 负载均衡模式：priority = 按优先级顺序耗尽，balanced = 加权平滑轮询 */
+export type LoadBalancingMode = 'priority' | 'balanced'
 
 export interface GroupsResponse {
   total: number
+  filteredTotal?: number
+  page?: number
+  pageSize?: number
   groups: GroupItem[]
+}
+
+export interface GroupQueryParams {
+  page?: number
+  pageSize?: number
+  search?: string
 }
 
 export interface CreateGroupRequest {
   name: string
   description?: string
+  /** 分组级负载均衡模式（undefined 表示继承全局） */
+  loadBalancingMode?: LoadBalancingMode
+  /** 分组级优先级反转（undefined 表示继承全局） */
+  invertPriority?: boolean
 }
 
 export interface UpdateGroupRequest {
@@ -858,4 +986,12 @@ export interface UpdateGroupRequest {
   newName?: string
   /** 新备注；空字符串清除；undefined 保留原值 */
   description?: string
+  /** 分组级负载均衡模式 */
+  loadBalancingMode?: LoadBalancingMode
+  /** 重置负载均衡模式为继承全局 */
+  resetLoadBalancingMode?: boolean
+  /** 分组级优先级反转 */
+  invertPriority?: boolean
+  /** 重置优先级反转为继承全局 */
+  resetInvertPriority?: boolean
 }

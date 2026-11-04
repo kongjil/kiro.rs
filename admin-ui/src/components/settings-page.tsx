@@ -7,6 +7,7 @@ import {
   ShieldCheck,
   Tags,
   Coins,
+  Bell,
 } from 'lucide-react'
 import { PageHeader } from '@/components/console/page-header'
 import { Badge } from '@/components/ui/badge'
@@ -21,6 +22,7 @@ import { SecuritySection } from '@/components/settings/security-section'
 import { MetadataSection } from '@/components/settings/metadata-section'
 import { ModelsSection } from '@/components/settings/models-section'
 import { BillingPricesSection } from '@/components/settings/billing-prices-section'
+import { QuotaAlertsSection } from '@/components/settings/quota-alerts-section'
 
 /**
  * 设置页 —— 把此前散在三处的 7 个配置端点收拢到一处。
@@ -33,7 +35,16 @@ import { BillingPricesSection } from '@/components/settings/billing-prices-secti
  * 一次点击就该切换完；但参数（冷却时长、连续上限、保留天数这些）全部移到这里 ——
  * 下拉菜单里塞数字输入框本来就不是它该干的事。
  */
-type SectionKey = 'dispatch' | 'metadata' | 'network' | 'log' | 'models' | 'billing' | 'system' | 'security'
+type SectionKey =
+  | 'dispatch'
+  | 'metadata'
+  | 'network'
+  | 'log'
+  | 'models'
+  | 'billing'
+  | 'system'
+  | 'security'
+  | 'alerts'
 
 const SECTIONS: {
   key: SectionKey
@@ -44,6 +55,11 @@ const SECTIONS: {
     key: 'dispatch',
     label: '调度',
     icon: <Gauge className="h-4 w-4" />,
+  },
+  {
+    key: 'alerts',
+    label: '额度告警',
+    icon: <Bell className="h-4 w-4" />,
   },
   {
     key: 'metadata',
@@ -100,7 +116,7 @@ export function SettingsPage() {
         ]}
         icon={activeMeta.icon}
         title={`设置 · ${activeMeta.label}`}
-        description="所有改动即时生效并直接落盘写入 config.json，无需重启服务进程。"
+        description={active === 'alerts' ? '阈值与发送状态持久化到 quota_alerts.db；敏感渠道输入仅在当前进程内生效。' : '所有改动即时生效并直接落盘写入 config.json，无需重启服务进程。'}
         badge={
           <Badge variant="outline" className="font-mono text-xs">
             热重载就绪
@@ -138,6 +154,7 @@ export function SettingsPage() {
         <Card className="min-w-0 flex-1">
           <CardContent className="p-4 sm:p-5">
             {active === 'dispatch' && <DispatchSection />}
+            {active === 'alerts' && <QuotaAlertsSection />}
             {active === 'metadata' && <MetadataSection />}
             {active === 'models' && <ModelsSection />}
             {active === 'billing' && <BillingPricesSection />}

@@ -1,16 +1,21 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
+import type { QuotaAlertsResponse, UpdateQuotaAlertsRequest } from '@/types/quota-alerts'
 import type {
   CredentialsStatusResponse,
+  CredentialQueryParams,
   BalanceResponse,
   AvailableModelsResponse,
   ModelTestResponse,
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  SetLoadFactorRequest,
   AddCredentialRequest,
   AddCredentialResponse,
   CustomModelItem,
+  CustomHeadersConfigResponse,
+  SetCustomHeadersRequest,
   UpdateCredentialRequest,
   UpdateRefreshTokenRequest,
   ProxyPoolEntry,
@@ -24,6 +29,9 @@ import type {
   ProxyQualityRunResponse,
   SetProxyQualityConfigRequest,
   ProxyCheckAllResponse,
+  ProxyRotationResponse,
+  ProxyFailoverConfig,
+  ProxyFailoverConfigPatch,
   AssignRoundRobinResponse,
   StartIdcLoginRequest,
   StartIdcLoginResponse,
@@ -62,9 +70,13 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-// 获取所有凭据状态
-export async function getCredentials(): Promise<CredentialsStatusResponse> {
-  const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+// 获取凭据状态列表（支持分页、搜索、过滤、排序）
+export async function getCredentials(
+  params?: CredentialQueryParams,
+): Promise<CredentialsStatusResponse> {
+  const { data } = await api.get<CredentialsStatusResponse>('/credentials', {
+    params,
+  })
   return data
 }
 
@@ -142,6 +154,18 @@ export async function setCredentialPriority(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/${id}/priority`,
     { priority } as SetPriorityRequest
+  )
+  return data
+}
+
+// 设置凭据负载因子（均衡模式下的调度权重）
+export async function setCredentialLoadFactor(
+  id: number,
+  loadFactor: number
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/load-factor`,
+    { loadFactor } as SetLoadFactorRequest
   )
   return data
 }
@@ -341,6 +365,27 @@ export async function disableQuotaExceeded(): Promise<QuotaExceededResult> {
   return data
 }
 
+// 历史日志封号排查
+export interface AuditSuspendedRequest {
+  onlyDisabled?: boolean
+  credentialIds?: number[]
+}
+
+export interface AuditSuspendedResult {
+  scannedCount: number
+  bannedCount: number
+  updatedCount: number
+  updatedIds: number[]
+  bannedIds?: number[]
+}
+
+export async function auditSuspendedCredentials(
+  req?: AuditSuspendedRequest
+): Promise<AuditSuspendedResult> {
+  const { data } = await api.post<AuditSuspendedResult>('/credentials/audit-suspended', req || {})
+  return data
+}
+
 // 设置单个凭据的超额开关
 export async function setCredentialOverage(id: number, enabled: boolean): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/overage`, { enabled })
@@ -424,7 +469,7 @@ export async function checkProxy(id: number): Promise<ProxyCheckResponse> {
   return data
 }
 
-// 触发全部代理健康检查
+// 触发一轮完整巡检：自动检测在用代理 → 健康探测 → 凭据代理自动轮换
 export async function checkAllProxies(): Promise<ProxyCheckAllResponse> {
   const { data } = await api.post<ProxyCheckAllResponse>('/proxy-pool/check-all')
   return data
@@ -445,6 +490,26 @@ export async function runProxyQualityCheck(): Promise<ProxyQualityRunResponse> {
   return data
 }
 
+// 按当前代理池状态立即执行一次凭据代理轮换（不重新探测）
+export async function rotateCredentialProxies(): Promise<ProxyRotationResponse> {
+  const { data } = await api.post<ProxyRotationResponse>('/proxy-pool/rotate')
+  return data
+}
+
+// 读取代理故障转移配置
+export async function getProxyFailoverConfig(): Promise<ProxyFailoverConfig> {
+  const { data } = await api.get<ProxyFailoverConfig>('/config/proxy-failover')
+  return data
+}
+
+// 更新代理故障转移配置
+export async function setProxyFailoverConfig(
+  patch: ProxyFailoverConfigPatch
+): Promise<ProxyFailoverConfig> {
+  const { data } = await api.put<ProxyFailoverConfig>('/config/proxy-failover', patch)
+  return data
+}
+
 // 轮询批量分配可用代理给凭据
 export async function assignProxiesRoundRobin(
   credentialIds?: number[] | null
@@ -455,15 +520,28 @@ export async function assignProxiesRoundRobin(
   return data
 }
 
-// 获取负载均衡模式
-export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.get<{ mode: 'priority' | 'balanced' }>('/config/load-balancing')
+export interface LoadBalancingConfig {
+  mode: 'priority' | 'balanced'
+  invertPriority: boolean
+}
+
+export interface SetLoadBalancingPayload {
+  mode?: 'priority' | 'balanced'
+  invertPriority?: boolean
+}
+
+// 获取负载均衡模式与优先级反转
+export async function getLoadBalancingMode(): Promise<LoadBalancingConfig> {
+  const { data } = await api.get<LoadBalancingConfig>('/config/load-balancing')
   return data
 }
 
-// 设置负载均衡模式
-export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+// 设置负载均衡模式与优先级反转
+export async function setLoadBalancingMode(
+  payload: 'priority' | 'balanced' | SetLoadBalancingPayload
+): Promise<LoadBalancingConfig> {
+  const body = typeof payload === 'string' ? { mode: payload } : payload
+  const { data } = await api.put<LoadBalancingConfig>('/config/load-balancing', body)
   return data
 }
 
@@ -584,6 +662,7 @@ export async function setQuotaResetRecoveryConfig(
 // 可写；consecutiveRounds 为凭据最大连续轮数，totalCount 为累计恢复凭据次数。
 export interface SelfHealConfig {
   suspendedDetectionEnabled: boolean
+  suspendedBanKeywords: string[]
   enabled: boolean
   minIntervalSecs: number
   maxConsecutiveRounds: number
@@ -595,7 +674,11 @@ export interface SelfHealConfig {
 export type SelfHealConfigPatch = Partial<
   Pick<
     SelfHealConfig,
-    'suspendedDetectionEnabled' | 'enabled' | 'minIntervalSecs' | 'maxConsecutiveRounds'
+    | 'suspendedDetectionEnabled'
+    | 'suspendedBanKeywords'
+    | 'enabled'
+    | 'minIntervalSecs'
+    | 'maxConsecutiveRounds'
   >
 >
 
@@ -611,6 +694,20 @@ export async function setSelfHealConfig(
 ): Promise<SelfHealConfig> {
   const { data } = await api.put<SelfHealConfig>('/config/self-heal', patch)
   return data
+}
+
+export async function getQuotaAlerts(): Promise<QuotaAlertsResponse> {
+  const { data } = await api.get<QuotaAlertsResponse>('/config/quota-alerts')
+  return data
+}
+
+export async function setQuotaAlerts(request: UpdateQuotaAlertsRequest): Promise<QuotaAlertsResponse> {
+  const { data } = await api.put<QuotaAlertsResponse>('/config/quota-alerts', request)
+  return data
+}
+
+export async function testQuotaAlerts(): Promise<void> {
+  await api.post('/config/quota-alerts/test')
 }
 
 export interface LogGovernanceConfig {
@@ -725,6 +822,23 @@ export async function setCustomModels(
 ): Promise<{ models: CustomModelItem[] }> {
   const { data } = await api.put<{ models: CustomModelItem[] }>(
     '/config/custom-models',
+    req,
+  )
+  return data
+}
+
+// 获取自定义响应头配置
+export async function getCustomHeaders(): Promise<CustomHeadersConfigResponse> {
+  const { data } = await api.get<CustomHeadersConfigResponse>('/config/custom-headers')
+  return data
+}
+
+// 批量替换自定义响应头配置
+export async function setCustomHeaders(
+  req: SetCustomHeadersRequest,
+): Promise<CustomHeadersConfigResponse> {
+  const { data } = await api.put<CustomHeadersConfigResponse>(
+    '/config/custom-headers',
     req,
   )
   return data

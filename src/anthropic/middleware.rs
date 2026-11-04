@@ -60,6 +60,8 @@ pub struct AppState {
     pub trace_store: Option<SharedTraceStore>,
     /// 模型 token 价格表，用于管理端修改后 token 成本统计。
     pub billing_prices: SharedBillingPrices,
+    /// 自定义响应头管理器（热重载）
+    pub custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 }
 
 impl AppState {
@@ -79,6 +81,7 @@ impl AppState {
             cache_meter: None,
             trace_store: None,
             billing_prices: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            custom_headers: None,
         }
     }
 
@@ -121,6 +124,15 @@ impl AppState {
 
     pub fn with_shared_billing_prices(mut self, prices: SharedBillingPrices) -> Self {
         self.billing_prices = prices;
+        self
+    }
+
+    /// 注入自定义响应头管理器
+    pub fn with_custom_headers(
+        mut self,
+        custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    ) -> Self {
+        self.custom_headers = custom_headers;
         self
     }
 }

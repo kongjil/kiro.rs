@@ -19,7 +19,7 @@ use crate::model::config::SharedBillingPrices;
 use super::{
     cache_metering::SharedCacheMeter,
     claude_wire::into_claude_wire,
-    handlers::{count_tokens, get_models, post_messages, post_messages_cc},
+    handlers::{count_tokens, get_models, post_messages_cc_route, post_messages_route},
     middleware::{AppState, auth_middleware, cors_layer},
     openai::post_chat_completions,
     responses::post_responses,
@@ -46,6 +46,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -60,6 +61,7 @@ pub fn create_router(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 ) -> Router {
     create_router_with_shared_provider(
         kiro_provider.map(Arc::new),
@@ -70,6 +72,7 @@ pub fn create_router(
         usage_aggregator,
         cache_meter,
         trace_store,
+        custom_headers,
     )
 }
 
@@ -84,6 +87,7 @@ pub fn create_router_with_shared_provider(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 ) -> Router {
     create_router_with_shared_provider_and_billing_prices(
         kiro_provider,
@@ -95,6 +99,7 @@ pub fn create_router_with_shared_provider(
         cache_meter,
         trace_store,
         std::collections::HashMap::new(),
+        custom_headers,
     )
 }
 
@@ -110,6 +115,7 @@ pub fn create_router_with_shared_provider_and_billing_prices(
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
     billing_prices: std::collections::HashMap<String, crate::model::config::BillingPrice>,
+    custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 ) -> Router {
     create_router_with_shared_provider_and_shared_billing_prices(
         kiro_provider,
@@ -121,6 +127,7 @@ pub fn create_router_with_shared_provider_and_billing_prices(
         cache_meter,
         trace_store,
         Arc::new(parking_lot::RwLock::new(billing_prices)),
+        custom_headers,
     )
 }
 
@@ -136,6 +143,7 @@ pub fn create_router_with_shared_provider_and_shared_billing_prices(
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
     billing_prices: SharedBillingPrices,
+    custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
@@ -145,6 +153,7 @@ pub fn create_router_with_shared_provider_and_shared_billing_prices(
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
     state = state.with_shared_billing_prices(billing_prices);
+    state = state.with_custom_headers(custom_headers);
 
     // 需要认证的 /v1 路由
     // Messages 端点的响应经 `claude_wire` 整形后再发给客户端；OpenAI / Responses
@@ -153,7 +162,7 @@ pub fn create_router_with_shared_provider_and_shared_billing_prices(
         .route("/models", get(get_models))
         .route(
             "/messages",
-            post(post_messages).layer(middleware::map_response(into_claude_wire)),
+            post(post_messages_route).layer(middleware::map_response(into_claude_wire)),
         )
         .route("/messages/count_tokens", post(count_tokens))
         .route("/chat/completions", post(post_chat_completions))
@@ -168,7 +177,7 @@ pub fn create_router_with_shared_provider_and_shared_billing_prices(
     let cc_v1_routes = Router::new()
         .route(
             "/messages",
-            post(post_messages_cc).layer(middleware::map_response(into_claude_wire)),
+            post(post_messages_cc_route).layer(middleware::map_response(into_claude_wire)),
         )
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(

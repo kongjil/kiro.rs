@@ -159,8 +159,9 @@ pub struct Config {
 
     /// Deadline for a whole upstream API request, body included. An active
     /// stream cannot reset it, so it also caps how long an answer may be.
-    /// Defaults to the previously hardcoded 720s; set 0 to disable it and
-    /// leave stalled upstreams to `upstream_read_timeout_secs`.
+    /// Defaults to 0 (disabled): a stream that is still delivering tokens is
+    /// never cut mid-answer, and stalled upstreams are cut by
+    /// `upstream_read_timeout_secs`. Set a positive value to cap request time.
     #[serde(default = "default_upstream_total_timeout_secs")]
     pub upstream_total_timeout_secs: u64,
 
@@ -193,6 +194,11 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 后台余额刷新完成后的等待秒数；0 表示不启动后台刷新。
+    /// 优先级：配置文件 > KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS > 300。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_refresh_interval_secs: Option<u64>,
+
     /// 上一次成功更新前正在运行的版本号，用于在前端展示「回退到 vX.Y.Z」按钮。
     /// 实际回退动作通过 `<exe>.backup` 文件完成，无需访问网络。
     #[serde(default)]
@@ -221,6 +227,10 @@ pub struct Config {
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
+
+    /// 优先级反转开关（默认 false：数字小的优先；true：数字大的优先）
+    #[serde(default = "default_invert_priority")]
+    pub invert_priority: bool,
 
     /// 会话粘性路由开关（默认 true）。
     ///
@@ -289,16 +299,25 @@ pub struct Config {
     #[serde(default = "default_account_concurrency_queue_wait_secs")]
     pub account_concurrency_queue_wait_secs: u64,
 
-    /// 是否识别 403 账号封禁文案并立即禁用凭据（默认 true）。
+    /// 是否识别账号封禁响应并立即禁用凭据（默认 true）。
     ///
-    /// 开启后：某凭据收到 403 且响应体命中明确封禁文案（同时含 "suspended" 与
-    /// "locked your account"）时，立即标记为 `Suspended` 并禁用。这类凭据**不参与
-    /// 自愈**，需人工联系客服核实后手动重置，从根上打断持续 403 死循环（issue #51）。
+    /// 开启后：某凭据收到的响应体命中内置封禁检测（JSON `reason` 为
+    /// `TEMPORARILY_SUSPENDED`，或同时含 "suspended" 与 "locked" 等文案）
+    /// 或命中 `suspended_ban_keywords` 中任一自定义关键词时，立即标记为
+    /// `Suspended` 并禁用。**不限 HTTP 状态码**（403、429 等均可触发）。
+    /// 被封禁的凭据**不参与自愈**，需人工核实后手动重置。
     ///
-    /// 只匹配这两个高特异短语同时出现的情形，不影响普通 403（权限/WAF/区域抖动），
-    /// 后者仍按既有 `report_failure` 累计路径处理。关闭后：完全回退旧行为。
+    /// 关闭后：完全回退旧行为，封禁响应按普通错误处理。
     #[serde(default = "default_suspended_detection_enabled")]
     pub suspended_detection_enabled: bool,
+
+    /// 自定义封禁文案关键词列表（默认空）。
+    ///
+    /// 响应体中包含列表中任一关键词（大小写不敏感）时，视为账号被封禁，
+    /// 立即禁用凭据。与内置检测（`TEMPORARILY_SUSPENDED` reason 等）叠加生效。
+    /// 例如 `["temporarily suspended", "account has been locked"]`。
+    #[serde(default)]
+    pub suspended_ban_keywords: Vec<String>,
 
     /// 是否启用凭据自愈（默认 true）。
     ///
@@ -329,6 +348,22 @@ pub struct Config {
     /// 需管理员手动恢复。
     #[serde(default)]
     pub quota_reset_recovery_enabled: bool,
+
+    /// 是否启用凭据代理的自动检测与轮换（默认 true）。
+    ///
+    /// 开启后，代理池健康检查会把凭据实际在用的代理（含全局代理、凭据级代理中
+    /// 未登记到池内的地址）纳入探测范围；探测判定不可用的代理会被标记，使用该
+    /// 代理的凭据自动轮换到池内其它可用代理。
+    #[serde(default = "default_proxy_auto_rotate_enabled")]
+    pub proxy_auto_rotate_enabled: bool,
+
+    /// 无可用代理时是否允许凭据回退直连（默认 false）。
+    ///
+    /// 关闭时，代理全部不可用的凭据保持原代理配置不变，请求继续失败直至代理恢复，
+    /// 避免真实出口 IP 意外暴露；开启时这些凭据临时改为 `direct`，并在池内重新出现
+    /// 可用代理后自动改回代理。
+    #[serde(default)]
+    pub proxy_direct_fallback_enabled: bool,
 
     /// 按凭据缓存上游可用模型列表的 TTL（秒，默认 3600）。
     #[serde(default = "default_model_cache_ttl_secs")]
@@ -431,6 +466,13 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_metadata_schema: Option<serde_json::Value>,
 
+    /// 自定义响应头规则列表。
+    ///
+    /// 允许用户在 UI / config.json 配置下发给客户端的自定义响应头。
+    /// 键（header name）完全自定义；值（header value）支持变量插值（如 `{trace_id}`, `{model}` 等）。
+    #[serde(default = "crate::model::custom_headers::default_custom_headers")]
+    pub custom_headers: Vec<crate::model::custom_headers::CustomHeaderRule>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -475,11 +517,16 @@ fn default_upstream_read_timeout_secs() -> u64 {
     120
 }
 fn default_upstream_total_timeout_secs() -> u64 {
-    720
+    // M6：不设整请求截止时间，静默由 read timeout（默认 120 秒）负责。
+    0
 }
 
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
+}
+
+fn default_invert_priority() -> bool {
+    false
 }
 
 fn default_session_affinity_enabled() -> bool {
@@ -542,6 +589,10 @@ fn default_self_heal_max_consecutive_rounds() -> u32 {
     5
 }
 
+fn default_proxy_auto_rotate_enabled() -> bool {
+    true
+}
+
 fn default_model_cache_ttl_secs() -> u64 {
     60 * 60
 }
@@ -598,12 +649,14 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            balance_refresh_interval_secs: None,
             update_previous_version: None,
             github_token: None,
             update_last_applied_at: None,
             update_auto_apply: false,
             update_auto_apply_time: default_update_auto_apply_time(),
             load_balancing_mode: default_load_balancing_mode(),
+            invert_priority: default_invert_priority(),
             session_affinity_enabled: default_session_affinity_enabled(),
             session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             account_throttle_failover: default_account_throttle_failover(),
@@ -616,10 +669,13 @@ impl Default for Config {
             account_concurrency_sticky_wait_secs: default_account_concurrency_sticky_wait_secs(),
             account_concurrency_queue_wait_secs: default_account_concurrency_queue_wait_secs(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
+            suspended_ban_keywords: Vec::new(),
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
             self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
             quota_reset_recovery_enabled: false,
+            proxy_auto_rotate_enabled: default_proxy_auto_rotate_enabled(),
+            proxy_direct_fallback_enabled: false,
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
@@ -637,12 +693,35 @@ impl Default for Config {
             custom_models: Vec::new(),
             billing_prices: HashMap::new(),
             credential_metadata_schema: None,
+            custom_headers: crate::model::custom_headers::default_custom_headers(),
             config_path: None,
         }
     }
 }
 
 impl Config {
+    pub fn resolve_balance_refresh_interval(
+        &self,
+        env_value: Result<String, std::env::VarError>,
+    ) -> anyhow::Result<std::time::Duration> {
+        let seconds = if let Some(seconds) = self.balance_refresh_interval_secs {
+            seconds
+        } else {
+            match env_value {
+                Ok(value) => value.trim().parse::<u64>().context(
+                    "KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS 必须是非负整数（秒，0 表示关闭）",
+                )?,
+                Err(std::env::VarError::NotPresent) => 300,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    anyhow::bail!(
+                        "KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS 必须是有效的 Unicode 字符串"
+                    )
+                }
+            }
+        };
+        Ok(std::time::Duration::from_secs(seconds))
+    }
+
     /// 获取默认配置文件路径
     pub fn default_config_path() -> &'static str {
         "config.json"
@@ -708,6 +787,116 @@ mod tests {
     use super::Config;
 
     #[test]
+    fn balance_refresh_interval_defaults_for_existing_configs() {
+        for config in [Config::default(), serde_json::from_str("{}").unwrap()] {
+            assert_eq!(config.balance_refresh_interval_secs, None);
+            let interval = config
+                .resolve_balance_refresh_interval(Err(std::env::VarError::NotPresent))
+                .unwrap();
+            assert_eq!(interval.as_secs(), 300);
+            let serialized = serde_json::to_value(&config).unwrap();
+            assert!(serialized.get("balanceRefreshIntervalSecs").is_none());
+        }
+    }
+
+    #[test]
+    fn balance_refresh_interval_accepts_explicit_values_and_round_trips() {
+        for seconds in [0, 1, 300, 1800, 3600] {
+            let value = serde_json::json!({"balanceRefreshIntervalSecs": seconds});
+            let config: Config = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(config.balance_refresh_interval_secs, Some(seconds));
+            assert_eq!(
+                config
+                    .resolve_balance_refresh_interval(Err(std::env::VarError::NotPresent))
+                    .unwrap()
+                    .as_secs(),
+                seconds
+            );
+            let serialized = serde_json::to_value(&config).unwrap();
+            assert_eq!(
+                serialized["balanceRefreshIntervalSecs"],
+                value["balanceRefreshIntervalSecs"]
+            );
+        }
+    }
+
+    #[test]
+    fn balance_refresh_interval_uses_environment_when_unconfigured() {
+        let config = Config::default();
+        for (value, seconds) in [("0", 0), ("1800", 1800), (" 3600 ", 3600)] {
+            assert_eq!(
+                config
+                    .resolve_balance_refresh_interval(Ok(value.to_string()))
+                    .unwrap()
+                    .as_secs(),
+                seconds
+            );
+        }
+        assert!(
+            serde_json::to_value(&config)
+                .unwrap()
+                .get("balanceRefreshIntervalSecs")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn balance_refresh_interval_config_takes_precedence_over_environment() {
+        for seconds in [0, 1800] {
+            let mut config = Config::default();
+            config.balance_refresh_interval_secs = Some(seconds);
+            for value in ["0", "3600", "invalid"] {
+                assert_eq!(
+                    config
+                        .resolve_balance_refresh_interval(Ok(value.to_string()))
+                        .unwrap()
+                        .as_secs(),
+                    seconds
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn balance_refresh_interval_rejects_invalid_environment_values() {
+        let config = Config::default();
+        for value in ["", " ", "-1", "1.5", "invalid", "18446744073709551616"] {
+            let error = config
+                .resolve_balance_refresh_interval(Ok(value.to_string()))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS")
+            );
+        }
+        assert!(
+            config
+                .resolve_balance_refresh_interval(Err(std::env::VarError::NotUnicode(
+                    std::ffi::OsString::new()
+                )))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn balance_refresh_interval_rejects_invalid_config_values() {
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("1800"),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                serde_json::from_value::<Config>(serde_json::json!({
+                    "balanceRefreshIntervalSecs": value
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn upstream_deadlines_default_for_existing_configs() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.upstream_connect_timeout_secs, 15);
@@ -716,13 +905,12 @@ mod tests {
         assert_eq!(Config::default().upstream_read_timeout_secs, 120);
     }
 
-    /// The default keeps the previously hardcoded deadline, so existing
-    /// deployments behave exactly as before this became configurable.
+    /// M6：默认不设整请求截止时间，仍在输出的长回复不会被切断。
     #[test]
-    fn upstream_total_timeout_defaults_to_previous_hardcoded_value() {
+    fn upstream_total_timeout_defaults_to_disabled() {
         let config: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(config.upstream_total_timeout_secs, 720);
-        assert_eq!(Config::default().upstream_total_timeout_secs, 720);
+        assert_eq!(config.upstream_total_timeout_secs, 0);
+        assert_eq!(Config::default().upstream_total_timeout_secs, 0);
     }
 
     #[test]
@@ -861,5 +1049,18 @@ mod tests {
         .unwrap();
         assert!(config.account_rpm_limit_enabled);
         assert_eq!(config.account_rpm_limit, 120);
+    }
+
+    #[test]
+    fn invert_priority_defaults_and_explicit_values() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.invert_priority);
+
+        let default = Config::default();
+        assert!(!default.invert_priority);
+
+        let explicit: Config =
+            serde_json::from_str(r#"{"invertPriority": true}"#).unwrap();
+        assert!(explicit.invert_priority);
     }
 }

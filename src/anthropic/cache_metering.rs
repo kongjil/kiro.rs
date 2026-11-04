@@ -1249,8 +1249,13 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
     }
 
     // 3. messages (按顺序遍历)
-    let total_messages = req.messages.len();
-    for (m_idx, msg) in req.messages.iter().enumerate() {
+    // 与 converter 对齐：末尾连续 assistant 是被丢弃的 prefill，不参与前缀签名和 token 估算。
+    let total_messages = req
+        .messages
+        .iter()
+        .rposition(|message| message.role != "assistant")
+        .map_or(0, |index| index + 1);
+    for (m_idx, msg) in req.messages[..total_messages].iter().enumerate() {
         let is_tool_result = match &msg.content {
             serde_json::Value::Array(arr) => arr
                 .iter()
@@ -1261,7 +1266,10 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
             (m_idx + 1 == total_messages) && msg.role == "user" && !is_tool_result;
         match &msg.content {
             serde_json::Value::String(s) => {
-                let content = serde_json::Value::String(s.clone());
+                // 纯字符串与「一个 text 块」是同一段提示（Anthropic 也这么渲染），签名必须一致：
+                // pi-ai 第一轮把首条 user 发成带 cache_control 的块数组，之后几轮发成字符串，
+                // 签名不一致会让后续每轮的消息断点都算不中。
+                let content = serde_json::json!({"type": "text", "text": s});
                 blocks.push(PromptBlock {
                     signature: prompt_block_signature("message", Some(&msg.role), &content),
                     tokens: estimate_tokens(s).max(0) as u32,
@@ -1302,6 +1310,49 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
             _ => {}
         }
     }
+
+    if total_messages == req.messages.len() {
+        return blocks;
+    }
+
+    let mut explicit_count = blocks
+        .iter()
+        .filter(|block| block.cache_control.is_some())
+        .count();
+    let mut seen_5m = blocks
+        .iter()
+        .filter_map(|block| block.cache_control.as_ref().and_then(validated_ttl))
+        .any(|ttl| ttl == DEFAULT_TTL_SECS);
+    let Some(last_block) = blocks.last_mut() else {
+        return blocks;
+    };
+
+    // 将 prefill 的断点迁到保留前缀末尾，不覆盖已有断点，也不因合并而掩盖非法配置。
+    for message in &req.messages[total_messages..] {
+        let Some(content) = message.content.as_array() else {
+            continue;
+        };
+        for value in content {
+            let Some(raw) = value.get("cache_control") else {
+                continue;
+            };
+            explicit_count += 1;
+            let Ok(cache_control) = serde_json::from_value::<CacheControl>(raw.clone()) else {
+                last_block.invalid_cache_control = true;
+                continue;
+            };
+            match validated_ttl(&cache_control) {
+                Some(ttl) => {
+                    last_block.invalid_cache_control |= seen_5m && ttl > DEFAULT_TTL_SECS;
+                    seen_5m |= ttl == DEFAULT_TTL_SECS;
+                }
+                None => last_block.invalid_cache_control = true,
+            }
+            last_block.invalid_cache_control |= !block_is_cacheable(value);
+            last_block.cache_control.get_or_insert(cache_control);
+        }
+    }
+    last_block.invalid_cache_control |= explicit_count > MAX_BREAKPOINTS;
 
     blocks
 }
@@ -1673,7 +1724,12 @@ fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
         };
     }
     if key_id == 0 {
-        return None;
+        // 主 Key 被多个客户端共用，不能按 key 隔离（会把别人的前缀记成命中）。
+        // pi-ai 系客户端（如 DeepSeek Harness）既不发 metadata.user_id，也发不出会话请求头，
+        // 这里退回到与粘性路由同一个按内容派生的会话 id（系统提示 + 第一条 user 消息）：
+        // 同一会话每轮得到同一个种子，不同会话互不命中。
+        let derived = super::converter::derive_conversation_id(req);
+        return Some(format!("derived:{derived}"));
     }
     Some(format!("key:{key_id}"))
 }
@@ -2015,6 +2071,222 @@ mod tests {
         assert_eq!(u2.cache_covered_est, 0);
         assert_eq!(u2.cache_read, 0);
         assert_eq!(cache.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn prefill_breakpoint_reuses_previous_turn_prefix() {
+        use super::super::types::Message;
+
+        let async_cache = CacheMeter::new(None);
+        let sync_cache = CacheMeter::new(None);
+        let mut req = build_request_with_system_breakpoint();
+        let mut previous_covered = 0;
+
+        for turn in 0..4 {
+            req.messages.push(Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([{
+                    "type": "text",
+                    "text": format!("Unfinished prefill {turn}"),
+                    "cache_control": {"type": "ephemeral"}
+                }]),
+            });
+            let original_messages = serde_json::to_value(&req.messages).unwrap();
+            let async_usage = compute_cache_usage(&async_cache, &req, 0).await;
+            let sync_usage = compute_cache_usage_sync(&sync_cache, &req, 0);
+
+            assert_eq!(async_usage.cache_read, previous_covered);
+            assert_eq!(sync_usage.cache_read, previous_covered);
+            assert_eq!(async_usage.cache_covered_est, sync_usage.cache_covered_est);
+            assert_eq!(async_usage.prompt_total_est, sync_usage.prompt_total_est);
+            assert_eq!(
+                serde_json::to_value(&req.messages).unwrap(),
+                original_messages
+            );
+
+            req.messages.pop();
+            let prefix_tokens: u32 = extract_blocks(&req).iter().map(|block| block.tokens).sum();
+            assert_eq!(async_usage.prompt_total_est, prefix_tokens as i32);
+            assert_eq!(async_usage.cache_covered_est, prefix_tokens as i32);
+            assert!(async_usage.cache_covered_est > previous_covered);
+            let (input, creation, read) = async_usage.split_against_total(prefix_tokens as i32);
+            assert_eq!(input, 0);
+            assert_eq!(read, previous_covered);
+            assert_eq!(creation, prefix_tokens as i32 - previous_covered);
+            previous_covered = async_usage.cache_covered_est;
+
+            req.messages.extend([
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!(format!("Completed response {turn}")),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!(format!("Next question {turn}")),
+                },
+            ]);
+        }
+    }
+
+    #[test]
+    fn prefill_is_excluded_without_changing_auto_cache_target() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": "First question"},
+                {"role": "assistant", "content": "Completed response"},
+                {"role": "user", "content": "Current question"},
+                {"role": "assistant", "content": "Unfinished string"},
+                {"role": "assistant", "content": [{"type": "text", "text": "Unfinished block"}]}
+            ]
+        }))
+        .unwrap();
+        let blocks = extract_blocks(&req);
+        assert_eq!(blocks.len(), 3);
+        assert!(!blocks[1].is_current_turn_input);
+        assert!(blocks[2].is_current_turn_input);
+        assert!(blocks.iter().all(|block| block.cache_control.is_none()));
+        let breakpoints = resolve_breakpoints(&blocks, req.cache_control.as_ref());
+        assert_eq!(breakpoints.len(), 1);
+        assert_eq!(breakpoints[0].block_idx, 1);
+    }
+
+    #[test]
+    fn prefill_breakpoint_moves_to_prefix_without_exceeding_limit() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "First", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                    {"type": "text", "text": "Second", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                    {"type": "text", "text": "Third", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                    {"type": "text", "text": "Last user block"}
+                ]},
+                {"role": "assistant", "content": "Unmarked prefill"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Unmarked prefill block"},
+                    {"type": "text", "text": "Marked prefill", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let blocks = extract_blocks(&req);
+        assert_eq!(blocks.len(), 4);
+        let breakpoints = resolve_breakpoints(&blocks, None);
+        assert_eq!(breakpoints.len(), MAX_BREAKPOINTS);
+        assert_eq!(breakpoints.last().unwrap().block_idx, 3);
+        assert_eq!(breakpoints.last().unwrap().ttl_secs, MAX_TTL_SECS);
+    }
+
+    #[test]
+    fn prefill_does_not_overwrite_existing_prefix_breakpoint() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "messages": [
+                {"role": "user", "content": [{
+                    "type": "text", "text": "Question",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }]},
+                {"role": "assistant", "content": [{
+                    "type": "text", "text": "Prefill",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                }]}
+            ]
+        }))
+        .unwrap();
+        let blocks = extract_blocks(&req);
+        let breakpoints = resolve_breakpoints(&blocks, None);
+        assert_eq!(breakpoints.len(), 1);
+        assert_eq!(breakpoints[0].block_idx, 0);
+        assert_eq!(breakpoints[0].ttl_secs, MAX_TTL_SECS);
+    }
+
+    #[test]
+    fn prefill_invalid_cache_controls_still_disable_metering() {
+        for cache_control in [
+            serde_json::json!(null),
+            serde_json::json!({"ttl": "5m"}),
+            serde_json::json!({"type": "persistent"}),
+            serde_json::json!({"type": "ephemeral", "ttl": "2h"}),
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "claude-sonnet-4.5",
+                "messages": [
+                    {"role": "user", "content": [{
+                        "type": "text", "text": "Question",
+                        "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                    }]},
+                    {"role": "assistant", "content": [
+                        {"type": "text", "text": "Valid prefill", "cache_control": {"type": "ephemeral"}},
+                        {"type": "text", "text": "Invalid prefill", "cache_control": cache_control}
+                    ]}
+                ]
+            }))
+            .unwrap();
+            let cache = CacheMeter::new(None);
+            let usage = compute_cache_usage_sync(&cache, &req, 1);
+            assert_eq!(usage.cache_covered_est, 0);
+            assert_eq!(cache.len(), 0);
+        }
+    }
+
+    #[test]
+    fn prefill_only_messages_do_not_produce_prompt_blocks() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "messages": [{"role": "assistant", "content": [{
+                "type": "text", "text": "Prefill", "cache_control": {"type": "ephemeral"}
+            }]}]
+        }))
+        .unwrap();
+        assert!(extract_blocks(&req).is_empty());
+    }
+
+    #[test]
+    fn prefill_breakpoint_merge_does_not_hide_excess_breakpoints() {
+        use super::super::types::Message;
+
+        let mut req = build_request_with_system_breakpoint();
+        req.messages.push(Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::Array(vec![
+                serde_json::json!({
+                    "type": "text", "text": "Prefill",
+                    "cache_control": {"type": "ephemeral"}
+                });
+                MAX_BREAKPOINTS
+            ]),
+        });
+        let cache = CacheMeter::new(None);
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert_eq!(usage.cache_covered_est, 0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn prefill_trimming_preserves_assistant_before_system_message() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "messages": [
+                {"role": "user", "content": "Question"},
+                {"role": "assistant", "content": "Completed response"},
+                {"role": "system", "content": "Client reminder"},
+                {"role": "assistant", "content": "Unfinished prefill"}
+            ]
+        }))
+        .unwrap();
+        let blocks = extract_blocks(&req);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(
+            blocks[1].signature,
+            prompt_block_signature(
+                "message",
+                Some("assistant"),
+                &serde_json::json!({"type": "text", "text": "Completed response"})
+            )
+        );
     }
 
     #[test]
@@ -2714,6 +2986,7 @@ mod tests {
             }),
             output_config: effort.map(|effort| OutputConfig {
                 effort: effort.to_string(),
+                format: None,
             }),
             metadata: None,
             cache_control: Some(CacheControl {
@@ -2783,15 +3056,21 @@ mod tests {
         let make = || MessagesRequest {
             model: "model-a".to_string(),
             max_tokens: 32,
-            messages: vec![Message {
-                role: "assistant".to_string(),
-                content: serde_json::json!([
-                    {"type":"text","text":"stable visible content"},
-                    {"type":"thinking","thinking":"not a direct breakpoint"},
-                    {"type":"redacted_thinking","data":"redacted"},
-                    {"type":"text","text":""}
-                ]),
-            }],
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type":"text","text":"stable visible content"},
+                        {"type":"thinking","thinking":"not a direct breakpoint"},
+                        {"type":"redacted_thinking","data":"redacted"},
+                        {"type":"text","text":""}
+                    ]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Next question"),
+                },
+            ],
             stream: false,
             system: None,
             tools: None,
@@ -2820,14 +3099,20 @@ mod tests {
         let all_ineligible = MessagesRequest {
             model: "model-a".to_string(),
             max_tokens: 32,
-            messages: vec![Message {
-                role: "assistant".to_string(),
-                content: serde_json::json!([
-                    {"type":"thinking","thinking":"cannot cache"},
-                    {"type":"redacted_thinking","data":"redacted"},
-                    {"type":"text","text":"   "}
-                ]),
-            }],
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type":"thinking","thinking":"cannot cache"},
+                        {"type":"redacted_thinking","data":"redacted"},
+                        {"type":"text","text":"   "}
+                    ]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!(""),
+                },
+            ],
             stream: false,
             system: None,
             tools: None,
@@ -3317,17 +3602,17 @@ mod tests {
     }
 
     #[test]
-    fn master_key_without_session_does_not_simulate_cross_user_cache_hit() {
+    fn master_key_without_session_scopes_cache_by_derived_conversation() {
         use super::super::types::{CacheControl, Message, MessagesRequest};
         let cache = CacheMeter::new(None);
         let body = "shared master-key prompt without any session ".repeat(20);
-        let make_req = || MessagesRequest {
+        let make_req = |first: &str| MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 32,
             messages: vec![
                 Message {
                     role: "user".to_string(),
-                    content: serde_json::Value::String(body.clone()),
+                    content: serde_json::Value::String(format!("{first} {body}")),
                 },
                 Message {
                     role: "assistant".to_string(),
@@ -3351,13 +3636,17 @@ mod tests {
             }),
         };
 
-        let a = compute_cache_usage_sync(&cache, &make_req(), 0);
-        assert_eq!(a.cache_read, 0);
-        assert_eq!(a.cache_covered_est, 0, "主 Key 无 session 不应产生缓存覆盖");
+        // 同一会话：首轮写入，次轮命中
+        let a1 = compute_cache_usage_sync(&cache, &make_req("conversation-a"), 0);
+        assert_eq!(a1.cache_read, 0);
+        assert!(a1.cache_covered_est > 0, "主 Key 无 session 时应按派生会话 id 模拟缓存");
+        let a2 = compute_cache_usage_sync(&cache, &make_req("conversation-a"), 0);
+        assert!(a2.cache_read > 0, "同一派生会话的第二个请求应命中");
 
-        let b = compute_cache_usage_sync(&cache, &make_req(), 0);
-        assert_eq!(b.cache_read, 0);
-        assert_eq!(b.cache_covered_est, 0);
+        // 不同会话（第一条 user 消息不同）：互不命中
+        let b1 = compute_cache_usage_sync(&cache, &make_req("conversation-b"), 0);
+        assert_eq!(b1.cache_read, 0, "不同派生会话不应命中");
+        assert_eq!(cache.stats_total().miss_no_seed, 0);
     }
 
     #[test]
@@ -4272,16 +4561,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compute_cache_usage_counts_miss_no_seed() {
-        // 有断点但 key_id == 0 且没有 metadata.user_id → isolation_seed 返回 None
+    async fn string_and_single_text_block_message_share_cache_prefix() {
+        use super::super::types::{Message, MessagesRequest};
+        let cache = CacheMeter::new(None);
+        let first = "first user message that stays the same in every round ".repeat(20);
+        let make = |messages: Vec<Message>| MessagesRequest {
+            model: "claude-opus-5.5".to_string(),
+            max_tokens: 32,
+            messages,
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        };
+        // 第一轮：首条消息是带断点的块数组
+        let round1 = make(vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{"type": "text", "text": first, "cache_control": {"type": "ephemeral"}}]),
+        }]);
+        assert_eq!(compute_cache_usage(&cache, &round1, 0).await.cache_read, 0);
+        // 第二轮：同一条消息变成纯字符串，断点挪到新的最后一条 user
+        let round2 = make(vec![
+            Message { role: "user".to_string(), content: serde_json::Value::String(first.clone()) },
+            Message { role: "assistant".to_string(), content: serde_json::Value::String("ok".to_string()) },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!([{"type": "text", "text": "next", "cache_control": {"type": "ephemeral"}}]),
+            },
+        ]);
+        assert!(compute_cache_usage(&cache, &round2, 0).await.cache_read > 0, "字符串写法应命中块数组写入的前缀");
+    }
+
+    #[tokio::test]
+    async fn compute_cache_usage_master_key_without_session_uses_derived_seed() {
+        // 有断点、key_id == 0、没有 metadata.user_id → 退回派生会话 id，不再记 no_seed
         let cache = CacheMeter::new(None);
         let req = build_request_with_system_breakpoint();
-        let usage = compute_cache_usage(&cache, &req, 0).await;
-        assert_eq!(usage.cache_read, 0);
+        let first = compute_cache_usage(&cache, &req, 0).await;
+        assert_eq!(first.cache_read, 0);
+        assert!(first.cache_covered_est > 0);
+        let second = compute_cache_usage(&cache, &req, 0).await;
+        assert!(second.cache_read > 0);
         let stats = cache.stats_total();
-        assert_eq!(stats.miss_no_seed, 1);
+        assert_eq!(stats.miss_no_seed, 0);
         assert_eq!(stats.miss_no_breakpoint, 0);
-        assert_eq!(stats.misses, 1);
     }
 
     /// Review Focus 3：远端命中走 remote 路径，必须记成 hit，不能记成 miss。

@@ -209,6 +209,8 @@ pub mod outcome {
     pub const ACCOUNT_SUSPENDED: &str = "account_suspended";
     pub const AUTH_FAILED: &str = "auth_failed";
     pub const TRANSIENT: &str = "transient";
+    /// 网关自己的单账号 RPM 限流打满：请求没有发到上游，客户端照样收到 429 + Retry-After
+    pub const LOCAL_RATE_LIMITED: &str = "local_rate_limited";
     pub const NETWORK_ERROR: &str = "network_error";
     pub const BAD_REQUEST: &str = "bad_request";
     pub const UNKNOWN: &str = "unknown";
@@ -706,6 +708,28 @@ impl TraceStore {
         Ok((records, total as usize))
     }
 
+    /// 查询各凭据在历史请求日志中的失败信息：(credential_id, outcome, error_snippet/message)
+    /// 供后台封禁治理排查使用
+    pub fn query_credential_error_logs(&self) -> rusqlite::Result<Vec<(u64, String, Option<String>)>> {
+        let conn = self.conn.lock();
+        let sql = "
+            SELECT credential_id, outcome, error_snippet FROM trace_attempts
+            WHERE credential_id != 0 AND (error_snippet IS NOT NULL OR outcome = 'account_suspended')
+            UNION
+            SELECT final_credential_id AS credential_id, COALESCE(error_type, '') AS outcome, error_message AS error_snippet FROM traces
+            WHERE final_credential_id != 0 AND (error_message IS NOT NULL OR error_type = 'account_suspended')
+        ";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
     /// 删除超过保留期的记录（traces + 关联 attempts）。仅 warn 失败。
     pub fn cleanup(&self) {
         let cutoff =
@@ -888,6 +912,13 @@ CREATE INDEX IF NOT EXISTS idx_attempts_trace ON trace_attempts(trace_id);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_error_log_query_reports_database_failure() {
+        let store = TraceStore::open_in_memory().unwrap();
+        store.conn.lock().execute_batch("DROP TABLE trace_attempts;").unwrap();
+        assert!(store.query_credential_error_logs().is_err());
+    }
 
     struct TraceSample<'a> {
         trace_id: &'a str,

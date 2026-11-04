@@ -11,16 +11,107 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialsStatusResponse {
-    /// 凭据总数
+    /// 凭据总数（无筛选时的全量总数）
     pub total: usize,
+    /// 经过搜索/分组/状态筛选后的条目总数（用于前端分页计算）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filtered_total: Option<usize>,
     /// 可用凭据数量（未禁用）
     pub available: usize,
+    /// 当前页码（1-based）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<usize>,
+    /// 每页数量（0 或未传表示不分页）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<usize>,
     /// 优先级模式下的当前优先凭据 ID；均衡模式固定为 0
     pub current_id: u64,
+    /// 各状态凭据统计（全量）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_counts: Option<CredentialStateCounts>,
     /// 凭据 metadata 的 JSON Schema
     pub metadata_schema: serde_json::Value,
-    /// 各凭据状态列表
+    /// 各凭据状态列表（当前页数据）
     pub credentials: Vec<CredentialStatusItem>,
+}
+
+/// 凭据状态统计
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialStateCounts {
+    pub healthy: usize,
+    pub throttled: usize,
+    pub quota: usize,
+    pub dead: usize,
+    pub suspended: usize,
+    pub total: usize,
+}
+
+/// 凭据列表查询参数（支持分页、搜索、分组、状态、排序）
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsQuery {
+    pub page: Option<usize>,
+    #[serde(alias = "page_size", alias = "limit")]
+    pub page_size: Option<usize>,
+    #[serde(alias = "q")]
+    pub search: Option<String>,
+    pub group: Option<String>,
+    pub status: Option<String>,
+    pub tier: Option<String>,
+    #[serde(alias = "sort_field", alias = "sort_by", alias = "sortBy")]
+    pub sort_field: Option<String>,
+    #[serde(alias = "sort_dir", alias = "sort_order", alias = "sortOrder")]
+    pub sort_dir: Option<String>,
+}
+
+impl CredentialsQuery {
+    pub fn effective_page(&self) -> usize {
+        self.page.unwrap_or(1).max(1)
+    }
+
+    pub fn effective_page_size(&self) -> usize {
+        self.page_size.unwrap_or(0)
+    }
+
+    pub fn effective_search(&self) -> Option<&str> {
+        self.search
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_group(&self) -> Option<&str> {
+        self.group
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_status(&self) -> Option<&str> {
+        self.status
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_tier(&self) -> Option<&str> {
+        self.tier
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_sort_field(&self) -> Option<&str> {
+        self.sort_field
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_sort_dir(&self) -> &str {
+        self.sort_dir.as_deref().unwrap_or("desc")
+    }
 }
 
 /// 单个凭据的状态信息
@@ -31,6 +122,8 @@ pub struct CredentialStatusItem {
     pub id: u64,
     /// 优先级（数字越小优先级越高）
     pub priority: u32,
+    /// 负载因子（均衡模式下的调度权重，数值越大调度频次越高，默认为 10）
+    pub load_factor: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -69,6 +162,7 @@ pub struct CredentialStatusItem {
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
+    pub proxy_temporary_direct: bool,
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
@@ -77,6 +171,9 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 账号级限流冷却剩余秒数；冷却中且 `> 0` 时返回
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throttled_remaining_secs: Option<u64>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
     /// 账号所属分组（可属于多个分组）
@@ -154,6 +251,15 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 修改负载因子请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetLoadFactorRequest {
+    /// 新负载因子值（>= 1）
+    #[serde(alias = "weight")]
+    pub load_factor: u32,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -206,6 +312,11 @@ pub struct AddCredentialRequest {
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
+
+    /// 负载因子（均衡模式下的调度权重，可选，默认 10）
+    #[serde(default = "default_load_factor")]
+    #[serde(alias = "weight")]
+    pub load_factor: u32,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
@@ -263,6 +374,10 @@ fn default_auth_method() -> String {
     "social".to_string()
 }
 
+fn default_load_factor() -> u32 {
+    10
+}
+
 /// 更新 refreshToken 请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -308,6 +423,10 @@ pub struct UpdateCredentialRequest {
     /// 本账号 RPM 上限：省略 = 不修改，null = 跟随全局，0 = 不限
     #[serde(default, deserialize_with = "deserialize_present")]
     pub rpm_limit: Option<Option<u32>>,
+    /// 负载因子（均衡模式下的调度权重，>= 1，None 表示不修改）
+    #[serde(default)]
+    #[serde(alias = "weight")]
+    pub load_factor: Option<u32>,
 }
 
 /// 区分「字段省略」与「显式 null」：配合 `#[serde(default)]`，省略得到外层 `None`，
@@ -526,22 +645,60 @@ pub struct EnableOverageAllResult {
     pub failure_messages: Vec<String>,
 }
 
+// ============ 封号治理排查 ============
+
+/// 历史日志封号排查请求
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditSuspendedRequest {
+    /// 是否仅排查已禁用的凭据（默认为 true，若为 false 则排查全量凭据）
+    #[serde(default)]
+    pub only_disabled: Option<bool>,
+    /// 指定排查的凭据 ID 列表（可选，空则根据 only_disabled 规则排查）
+    #[serde(default)]
+    pub credential_ids: Option<Vec<u64>>,
+}
+
+/// 历史日志封号排查结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditSuspendedResponse {
+    /// 扫描的凭据总数
+    pub scanned_count: usize,
+    /// 匹配到封号特征的凭据数
+    pub banned_count: usize,
+    /// 本次新更新为「账号封禁」的凭据数
+    pub updated_count: usize,
+    /// 本次新更新的凭据 ID 列表
+    pub updated_ids: Vec<u64>,
+    /// 匹配到封号特征的全部凭据 ID 列表
+    #[serde(default)]
+    pub banned_ids: Vec<u64>,
+}
+
 // ============ 负载均衡配置 ============
 
 /// 负载均衡模式响应
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadBalancingModeResponse {
     /// 当前模式（"priority" 或 "balanced"）
     pub mode: String,
+    /// 优先级反转开关（默认 false：数字小的优先；true：数字大的优先）
+    #[serde(default)]
+    pub invert_priority: bool,
 }
 
 /// 设置负载均衡模式请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLoadBalancingModeRequest {
-    /// 模式（"priority" 或 "balanced"）
-    pub mode: String,
+    /// 模式（"priority" 或 "balanced"，可选）
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// 优先级反转开关（可选）
+    #[serde(default)]
+    pub invert_priority: Option<bool>,
 }
 
 /// 上游域名配置（GET 响应 / PUT 请求共用）
@@ -662,8 +819,10 @@ pub struct SetQuotaResetRecoveryConfigRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SelfHealConfigResponse {
-    /// 是否识别 403 封禁文案并立即禁用凭据
+    /// 是否识别封禁文案并立即禁用凭据
     pub suspended_detection_enabled: bool,
+    /// 自定义封禁文案关键词（大小写不敏感匹配）
+    pub suspended_ban_keywords: Vec<String>,
     /// 是否启用全账号自愈
     pub enabled: bool,
     /// 两次自愈的最小冷却间隔（秒）
@@ -680,9 +839,12 @@ pub struct SelfHealConfigResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetSelfHealConfigRequest {
-    /// 是否识别 403 封禁文案；缺省表示不修改
+    /// 是否识别封禁文案；缺省表示不修改
     #[serde(default)]
     pub suspended_detection_enabled: Option<bool>,
+    /// 自定义封禁关键词；缺省表示不修改，传空数组清空
+    #[serde(default)]
+    pub suspended_ban_keywords: Option<Vec<String>>,
     /// 是否启用自愈；缺省表示不修改
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -850,6 +1012,8 @@ pub struct ProxyPoolEntry {
     pub quality_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_quality_checked_at: Option<String>,
+    /// 是否由自动检测登记（凭据或全局配置在用、但此前未登记到池内）
+    pub auto_detected: bool,
 }
 
 /// 代理池列表响应
@@ -881,6 +1045,46 @@ pub struct ProxyCheckAllResponse {
     pub healthy: usize,
     pub unhealthy: usize,
     pub auto_disabled: usize,
+    /// 从自动禁用状态恢复启用的代理数
+    pub auto_recovered: usize,
+    /// 本轮自动检测新登记进池的代理数
+    pub detected: usize,
+    /// 本轮代理自动轮换结果
+    pub rotation: ProxyRotationResponse,
+}
+
+/// 代理自动轮换结果
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyRotationResponse {
+    /// 从不可用代理轮换到其它可用代理的凭据数
+    pub rotated: usize,
+    /// 因无可用代理而回退直连的凭据数
+    pub switched_to_direct: usize,
+    /// 已恢复可用代理、从直连改回代理的凭据数
+    pub restored_to_proxy: usize,
+    /// 代理不可用但无处可换、保持原配置的凭据数
+    pub unresolved: usize,
+}
+
+/// 代理故障转移配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyFailoverConfigResponse {
+    /// 是否启用凭据代理的自动检测与轮换
+    pub auto_rotate_enabled: bool,
+    /// 无可用代理时是否允许凭据回退直连
+    pub direct_fallback_enabled: bool,
+}
+
+/// 设置代理故障转移配置请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetProxyFailoverConfigRequest {
+    #[serde(default)]
+    pub auto_rotate_enabled: Option<bool>,
+    #[serde(default)]
+    pub direct_fallback_enabled: Option<bool>,
 }
 
 /// 代理纯净度检查配置。
@@ -1252,7 +1456,72 @@ pub struct ClientKeyItem {
 #[serde(rename_all = "camelCase")]
 pub struct ClientKeysResponse {
     pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filtered_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<usize>,
     pub keys: Vec<ClientKeyItem>,
+}
+
+/// 客户端 Key 列表查询参数
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientKeysQuery {
+    pub page: Option<usize>,
+    #[serde(alias = "page_size", alias = "limit")]
+    pub page_size: Option<usize>,
+    #[serde(alias = "q")]
+    pub search: Option<String>,
+    pub status: Option<String>,
+    pub group: Option<String>,
+    #[serde(alias = "sortBy", alias = "sort_field", alias = "sortField")]
+    pub sort_by: Option<String>,
+    #[serde(alias = "sortDir", alias = "sortOrder", alias = "sort_order")]
+    pub sort_dir: Option<String>,
+}
+
+impl ClientKeysQuery {
+    pub fn effective_page(&self) -> usize {
+        self.page.unwrap_or(1).max(1)
+    }
+
+    pub fn effective_page_size(&self) -> usize {
+        self.page_size.unwrap_or(0)
+    }
+
+    pub fn effective_search(&self) -> Option<&str> {
+        self.search
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_status(&self) -> Option<&str> {
+        self.status
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_group(&self) -> Option<&str> {
+        self.group
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_sort_by(&self) -> Option<&str> {
+        self.sort_by
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_sort_dir(&self) -> &str {
+        self.sort_dir.as_deref().unwrap_or("desc")
+    }
 }
 
 /// 创建客户端 Key 请求
@@ -1564,6 +1833,12 @@ pub struct GroupItem {
     pub credential_count: usize,
     /// 引用计数：有多少把客户端 Key 绑定这个分组
     pub client_key_count: usize,
+    /// 负载均衡模式（None 表示继承全局配置）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_balancing_mode: Option<String>,
+    /// 优先级反转（None 表示继承全局配置）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invert_priority: Option<bool>,
 }
 
 /// 分组列表响应
@@ -1571,7 +1846,24 @@ pub struct GroupItem {
 #[serde(rename_all = "camelCase")]
 pub struct GroupsResponse {
     pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filtered_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<usize>,
     pub groups: Vec<GroupItem>,
+}
+
+/// 分组列表查询参数
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupsQuery {
+    pub page: Option<usize>,
+    #[serde(alias = "page_size", alias = "limit")]
+    pub page_size: Option<usize>,
+    #[serde(alias = "q")]
+    pub search: Option<String>,
 }
 
 /// 创建分组请求
@@ -1581,6 +1873,12 @@ pub struct CreateGroupRequest {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// 负载均衡模式（priority / balanced；None 表示继承全局）
+    #[serde(default)]
+    pub load_balancing_mode: Option<String>,
+    /// 优先级反转（None 表示继承全局）
+    #[serde(default)]
+    pub invert_priority: Option<bool>,
 }
 
 /// 更新分组请求（改名 / 改备注；两者都可选）
@@ -1593,6 +1891,18 @@ pub struct UpdateGroupRequest {
     /// 新备注；传空字符串清除备注；不传字段则保留
     #[serde(default)]
     pub description: Option<String>,
+    /// 负载均衡模式（priority / balanced）
+    #[serde(default)]
+    pub load_balancing_mode: Option<String>,
+    /// 是否重置负载均衡模式为继承全局
+    #[serde(default)]
+    pub reset_load_balancing_mode: Option<bool>,
+    /// 优先级反转开关（true: 数字大优先, false: 数字小优先）
+    #[serde(default)]
+    pub invert_priority: Option<bool>,
+    /// 是否重置优先级反转为继承全局
+    #[serde(default)]
+    pub reset_invert_priority: Option<bool>,
 }
 
 /// 删除分组的可选查询参数
@@ -1709,5 +2019,102 @@ mod tests {
         let value = serde_json::to_value(BillingPolicyDto::from_policy(&legacy)).unwrap();
         assert_eq!(value["mode"], "legacy_multipliers");
         assert_eq!(value["legacyMultipliers"], serde_json::json!([1.2, 1.0, 2.0]));
+    }
+}
+
+// ============ 自定义响应头 ============
+
+/// 自定义响应头配置响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomHeadersConfigResponse {
+    pub headers: Vec<CustomHeaderItem>,
+}
+
+/// 单条自定义响应头条目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomHeaderItem {
+    pub key: String,
+    pub value: String,
+    pub enabled: bool,
+}
+
+impl From<crate::model::custom_headers::CustomHeaderRule> for CustomHeaderItem {
+    fn from(r: crate::model::custom_headers::CustomHeaderRule) -> Self {
+        Self {
+            key: r.key,
+            value: r.value,
+            enabled: r.enabled,
+        }
+    }
+}
+
+impl From<CustomHeaderItem> for crate::model::custom_headers::CustomHeaderRule {
+    fn from(item: CustomHeaderItem) -> Self {
+        Self {
+            key: item.key,
+            value: item.value,
+            enabled: item.enabled,
+        }
+    }
+}
+
+/// 批量设置自定义响应头请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCustomHeadersRequest {
+    pub headers: Vec<CustomHeaderItem>,
+}
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    #[test]
+    fn credentials_query_accepts_camel_and_snake_params() {
+        let camel: CredentialsQuery = serde_json::from_value(serde_json::json!({
+            "page": 2,
+            "pageSize": 20,
+            "search": "abc",
+            "sortField": "priority",
+            "sortDir": "asc"
+        }))
+        .unwrap();
+        assert_eq!(camel.effective_page(), 2);
+        assert_eq!(camel.effective_page_size(), 20);
+        assert_eq!(camel.effective_search(), Some("abc"));
+        assert_eq!(camel.effective_sort_field(), Some("priority"));
+        assert_eq!(camel.effective_sort_dir(), "asc");
+
+        let snake: CredentialsQuery = serde_json::from_value(serde_json::json!({
+            "page_size": 10,
+            "q": "xyz",
+            "sort_by": "id",
+            "sort_order": "desc"
+        }))
+        .unwrap();
+        assert_eq!(snake.effective_page_size(), 10);
+        assert_eq!(snake.effective_search(), Some("xyz"));
+        assert_eq!(snake.effective_sort_field(), Some("id"));
+        assert_eq!(snake.effective_sort_dir(), "desc");
+    }
+
+    #[test]
+    fn client_keys_query_accepts_sort_aliases() {
+        let camel: ClientKeysQuery = serde_json::from_value(serde_json::json!({
+            "sortBy": "name",
+            "sortDir": "asc"
+        }))
+        .unwrap();
+        assert_eq!(camel.effective_sort_by(), Some("name"));
+        assert_eq!(camel.effective_sort_dir(), "asc");
+
+        let snake: ClientKeysQuery = serde_json::from_value(serde_json::json!({
+            "sort_field": "createdAt",
+            "sort_order": "desc"
+        }))
+        .unwrap();
+        assert_eq!(snake.effective_sort_by(), Some("createdAt"));
+        assert_eq!(snake.effective_sort_dir(), "desc");
     }
 }

@@ -33,6 +33,8 @@ mod openai;
 mod pdf_text;
 mod responses;
 mod router;
+mod structured_output;
+mod structured_rewrite;
 pub mod stream;
 mod truncation;
 mod typed_tools;

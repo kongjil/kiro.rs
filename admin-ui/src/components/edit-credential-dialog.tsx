@@ -93,6 +93,7 @@ export function EditCredentialDialog({
   const [proxyPassword, setProxyPassword] = useState('')
   const [groups, setGroups] = useState<string[]>(credential.groups?.length ? credential.groups : ['default'])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
+  const [loadFactor, setLoadFactor] = useState<number>(credential.loadFactor ?? 10)
   const [metadata, setMetadata] = useState<CredentialMetadata>(
     { ...metadataDefaults(metadataSchema), ...metadataValues(credential.metadata) },
   )
@@ -122,6 +123,7 @@ export function EditCredentialDialog({
       setProxyPassword('')
       setGroups(credential.groups?.length ? credential.groups : ['default'])
       setSourceChannel(credential.sourceChannel ?? '')
+      setLoadFactor(credential.loadFactor ?? 10)
       setMetadata({
         ...metadataDefaults(metadataSchema),
         ...metadataValues(credential.metadata),
@@ -171,6 +173,8 @@ export function EditCredentialDialog({
           proxyPassword: proxyPassword || undefined,
           groups: groups,
           sourceChannel: sourceChannel,
+          loadFactor:
+            Number.isFinite(loadFactor) && loadFactor >= 1 ? loadFactor : 10,
           metadata,
           accountCostCny: nextCostCny,
           costMultiplier: nextCostMultiplier,
@@ -322,6 +326,27 @@ export function EditCredentialDialog({
                   </div>
                   <p className="text-xs text-muted-foreground">
                     概览「账号成本」= 原始 credit × 成本倍率，只影响之后的新请求。留空表示不修改。
+                  </p>
+                </div>
+
+                {/* 负载因子（均衡模式下的调度权重） */}
+                <div className="space-y-2">
+                  <label htmlFor="loadFactor" className="text-sm font-medium">
+                    负载因子（调度权重）
+                  </label>
+                  <Input
+                    id="loadFactor"
+                    type="number"
+                    min="1"
+                    placeholder="默认 10"
+                    value={loadFactor}
+                    onChange={(e) =>
+                      setLoadFactor(Math.max(1, parseInt(e.target.value, 10) || 10))
+                    }
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    均衡负载模式下按该权重平滑轮询，数值越大被调度频次越高，默认为 10。
                   </p>
                 </div>
 

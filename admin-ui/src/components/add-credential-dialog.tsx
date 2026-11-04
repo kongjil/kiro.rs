@@ -56,6 +56,7 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
   const [sourceChannel, setSourceChannel] = useState('')
   const [accountCostCny, setAccountCostCny] = useState('')
   const [costMultiplier, setCostMultiplier] = useState('1')
+  const [loadFactor, setLoadFactor] = useState<number>(10)
   const [metadata, setMetadata] = useState<CredentialMetadata>({
     type: 'normal',
     saleStatus: 'not_for_sale',
@@ -91,6 +92,7 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
     setSourceChannel('')
     setAccountCostCny('')
     setCostMultiplier('1')
+    setLoadFactor(10)
     setMetadata(metadataDefaults(metadataSchema))
   }
 
@@ -145,6 +147,7 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
         sourceChannel: sourceChannel.trim() || undefined,
         accountCostCny: accountCostCny.trim() ? Number(accountCostCny) : undefined,
         costMultiplier: costMultiplier.trim() ? Number(costMultiplier) : undefined,
+        loadFactor: Number.isFinite(loadFactor) && loadFactor >= 1 ? loadFactor : 10,
         metadata,
       },
       {
@@ -477,6 +480,27 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
               />
               <p className="text-xs text-muted-foreground">
                 可选。纯备注，标记账号来源/渠道，便于追踪
+              </p>
+            </div>
+
+            {/* 负载因子（均衡模式下的调度权重） */}
+            <div className="space-y-2">
+              <label htmlFor="loadFactor" className="text-sm font-medium">
+                负载因子（调度权重）
+              </label>
+              <Input
+                id="loadFactor"
+                type="number"
+                min="1"
+                placeholder="默认 10"
+                value={loadFactor}
+                onChange={(e) =>
+                  setLoadFactor(Math.max(1, parseInt(e.target.value, 10) || 10))
+                }
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选。均衡负载模式下按该权重平滑轮询，数值越大被调度频次越高，默认为 10。
               </p>
             </div>
 

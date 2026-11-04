@@ -471,6 +471,12 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
 
+    /// 凭据负载因子（均衡模式下的调度权重，数值越大调度频次越高，默认为 10）
+    #[serde(default = "default_load_factor")]
+    #[serde(skip_serializing_if = "is_default_load_factor")]
+    #[serde(alias = "weight", alias = "loadFactor")]
+    pub load_factor: u32,
+
     /// 凭据级默认 Region，作为 auth_region 和 api_region 的共同回退
     /// 未配置时分别使用 config.json 的全局 Auth / API Region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -512,6 +518,17 @@ pub struct KiroCredentials {
     /// 凭据级代理认证密码（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
+
+    /// 当前 `proxy_url` 是否由代理自动轮换写入。
+    ///
+    /// 仅在代理不可用触发自动轮换时置位：轮换到其它代理或回退直连都会标记，
+    /// 便于池内恢复出可用代理后把凭据改回代理。用户手动改代理会清除该标记，
+    /// 此后自动轮换不再覆盖该凭据的手动配置，直到其代理再次被判定不可用。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub proxy_auto_assigned: bool,
+
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub proxy_temporary_direct: bool,
 
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
@@ -597,6 +614,18 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn default_load_factor() -> u32 {
+    10
+}
+
+fn is_default_load_factor(value: &u32) -> bool {
+    *value == 10 || *value == 0
+}
+
 /// 仅显示长度，不暴露明文。例如 `Some(42 chars)` 或 `None`。
 fn fmt_redacted(value: &Option<String>) -> String {
     match value {
@@ -633,6 +662,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("proxy_url", &self.proxy_url)
             .field("proxy_username", &self.proxy_username)
             .field("proxy_password", &fmt_redacted(&self.proxy_password))
+            .field("proxy_auto_assigned", &self.proxy_auto_assigned)
             .field("disabled", &self.disabled)
             .field("disabled_reason", &self.disabled_reason)
             .field(
@@ -814,6 +844,15 @@ impl KiroCredentials {
         "credentials.json"
     }
 
+    /// 获取有效的负载因子（默认 10，最小为 1）
+    pub fn effective_load_factor(&self) -> u32 {
+        if self.load_factor == 0 {
+            10
+        } else {
+            self.load_factor
+        }
+    }
+
     /// 获取有效的 Auth Region（用于 Token 刷新）
     /// 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
     pub fn effective_auth_region<'a>(&'a self, config: &'a Config) -> &'a str {
@@ -870,6 +909,13 @@ impl KiroCredentials {
     /// 优先级：凭据代理 > 全局代理 > 无代理
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
     pub fn effective_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
+        if self.proxy_temporary_direct {
+            return None;
+        }
+        self.configured_proxy(global_proxy)
+    }
+
+    pub fn configured_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
         match self.proxy_url.as_deref() {
             Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
             Some(url) if url.trim().is_empty() => global_proxy.cloned(),
@@ -884,6 +930,14 @@ impl KiroCredentials {
             }
             None => global_proxy.cloned(),
         }
+    }
+
+    /// 判断凭据是否显式配置为直连（`proxy_url == "direct"`）。
+    pub fn is_explicit_direct(&self) -> bool {
+        self.proxy_url
+            .as_deref()
+            .map(|url| url.eq_ignore_ascii_case(Self::PROXY_DIRECT))
+            .unwrap_or(false)
     }
 
     pub fn canonicalize_auth_method(&mut self) {
@@ -1231,6 +1285,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            load_factor: 10,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1240,6 +1295,8 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_auto_assigned: false,
+            proxy_temporary_direct: false,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1510,6 +1567,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            load_factor: 10,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -1519,6 +1577,8 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_auto_assigned: false,
+            proxy_temporary_direct: false,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1557,6 +1617,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            load_factor: 10,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1566,6 +1627,8 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_auto_assigned: false,
+            proxy_temporary_direct: false,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1687,6 +1750,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 3,
+            load_factor: 10,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,
@@ -1696,6 +1760,8 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_auto_assigned: false,
+            proxy_temporary_direct: false,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,

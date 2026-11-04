@@ -39,6 +39,12 @@ import {
   ArrowUp,
   ArrowDown,
   Loader2,
+  ShieldAlert,
+  ShieldX,
+  ShieldCheck,
+  SlidersHorizontal,
+  ExternalLink,
+  Info,
 } from "lucide-react";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -91,6 +97,11 @@ import {
 import { detectTier, type Tier } from "@/components/subscription-badge";
 import { ProxyPoolDialog } from "@/components/proxy-pool-dialog";
 import { ImageUpdateDialog } from "@/components/image-update-dialog";
+import {
+  AuditSuspendedDialog,
+  BanRulesTable,
+  navigateToBanSettings,
+} from "@/components/audit-suspended-dialog";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
   useCredentials,
@@ -100,6 +111,7 @@ import {
   useSetLoadBalancingMode,
   useResetAllSuccessCount,
   useSetPriority,
+  useSelfHealConfig,
 } from "@/hooks/use-credentials";
 import { useUpdateCheck } from "@/hooks/use-update-check";
 import { useFailureStats } from "@/hooks/use-traces";
@@ -128,6 +140,7 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import {
+  getCredentials,
   getCredentialBalance,
   forceRefreshToken,
   disableQuotaExceeded,
@@ -142,7 +155,11 @@ import {
   generateApiKey,
   overageFailureMessage,
 } from "@/lib/utils";
-import type { BalanceResponse, CredentialStatusItem } from "@/types/api";
+import type {
+  BalanceResponse,
+  CredentialQueryParams,
+  CredentialStatusItem,
+} from "@/types/api";
 import { StatusStrip } from "@/components/console/status-strip";
 import { BulkBar } from "@/components/console/bulk-bar";
 import {
@@ -180,6 +197,7 @@ const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const;
 const DEV_PREVIEW_CREDENTIAL: CredentialStatusItem = {
   id: -1,
   priority: 0,
+  loadFactor: 10,
   disabled: false,
   failureCount: 0,
   totalFailureCount: 0,
@@ -270,10 +288,18 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false);
   const [imageUpdateDialogOpen, setImageUpdateDialogOpen] = useState(false);
   const [adminKeyDialogOpen, setAdminKeyDialogOpen] = useState(false);
+  const [auditDialogOpen, setAuditDialogOpen] = useState(false);
+  const [auditTargetIds, setAuditTargetIds] = useState<number[] | undefined>(undefined);
+  const [showBanRules, setShowBanRules] = useState(false);
+  const { data: selfHealConfig } = useSelfHealConfig();
+  const banCustomKeywords = selfHealConfig?.suspendedBanKeywords ?? [];
+  const isBanDetectionEnabled = selfHealConfig?.suspendedDetectionEnabled ?? true;
   const [newAdminKey, setNewAdminKey] = useState("");
   const [updatingAdminKey, setUpdatingAdminKey] = useState(false);
   const [showAdminKeyPlain, setShowAdminKeyPlain] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [selectedFilterIds, setSelectedFilterIds] = useState<number[] | null>(null);
+  const [selectingFiltered, setSelectingFiltered] = useState(false);
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [verifyDeleting, setVerifyDeleting] = useState(false);
@@ -329,33 +355,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
     return false;
   });
-
-  const queryClient = useQueryClient();
-  const { data, isLoading, error, refetch } = useCredentials();
-  const { mutate: deleteCredential } = useDeleteCredential();
-  const { mutate: resetFailure } = useResetFailure();
-  const { data: loadBalancingData, isLoading: isLoadingMode } =
-    useLoadBalancingMode();
-  const { mutate: setLoadBalancingMode, isPending: isSettingMode } =
-    useSetLoadBalancingMode();
-  const resetAllSuccess = useResetAllSuccessCount();
-  const setPriority = useSetPriority();
-  const { data: updateCheck } = useUpdateCheck();
-  const { data: failureStatsMap } = useFailureStats();
-  const groupOptions = useGroupOptions();
-  const allCredentials = import.meta.env.DEV
-    ? [DEV_PREVIEW_CREDENTIAL, ...(data?.credentials ?? [])]
-    : (data?.credentials ?? []);
-
-  // 按 profile 分组：上游 prompt cache 按 profile 隔离，同 profile 的账号共享缓存。
-  // 只有一个 profile 时，会话在账号间换号不会丢缓存；多个 profile 才需要关心粘性路由。
-  const profileSummary = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const c of allCredentials) {
-      if (c.profileArn) counts.set(c.profileArn, (counts.get(c.profileArn) ?? 0) + 1);
-    }
-    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
-  }, [allCredentials]);
 
   // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
   const [groupFilter, setGroupFilter] = useState<string>("");
@@ -437,8 +436,92 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     });
   };
 
-  // 应用分组 + 分级筛选后的凭据全集（分页前先过滤，确保翻页粒度正确）
-  const filteredCredentials = useMemo(() => {
+  // 服务端分页只在「未选分级」或「只选一个分级」时启用：多选分级无法用单个
+  // tier 参数表达，此时回退到前端内存筛选（不传任何查询参数，后端返回全量）。
+  const serverPaginationEligible = tierFilter.size <= 1;
+  const singleTier = tierFilter.size === 1 ? Array.from(tierFilter)[0] : undefined;
+  const filterSelectionKey = JSON.stringify([groupFilter, Array.from(tierFilter).sort(), deferredSearchQuery, stateFilter]);
+  const currentFilterSelectionKey = useRef(filterSelectionKey);
+  currentFilterSelectionKey.current = filterSelectionKey;
+
+  // 服务端查询参数构建
+  const credentialQueryParams = useMemo<CredentialQueryParams | undefined>(() => {
+    if (!serverPaginationEligible) return undefined;
+    return {
+      page: currentPage,
+      pageSize: pageSize === 0 ? 0 : pageSize,
+      search: deferredSearchQuery.trim() || undefined,
+      group: groupFilter || undefined,
+      status: stateFilter || undefined,
+      tier: singleTier,
+      sortField,
+      sortDir,
+    };
+  }, [
+    serverPaginationEligible,
+    currentPage,
+    pageSize,
+    deferredSearchQuery,
+    groupFilter,
+    stateFilter,
+    singleTier,
+    sortField,
+    sortDir,
+  ]);
+
+  const queryClient = useQueryClient();
+  const { data, isLoading, error, refetch } = useCredentials(credentialQueryParams);
+  const { mutate: deleteCredential } = useDeleteCredential();
+  const { mutate: resetFailure } = useResetFailure();
+  const { data: loadBalancingData, isLoading: isLoadingMode } =
+    useLoadBalancingMode();
+  const { mutate: setLoadBalancingMode, isPending: isSettingMode } =
+    useSetLoadBalancingMode();
+  const resetAllSuccess = useResetAllSuccessCount();
+  const setPriority = useSetPriority();
+  const { data: updateCheck } = useUpdateCheck();
+  const { data: failureStatsMap } = useFailureStats();
+  const groupOptions = useGroupOptions();
+  const allCredentials = import.meta.env.DEV
+    ? [DEV_PREVIEW_CREDENTIAL, ...(data?.credentials ?? [])]
+    : (data?.credentials ?? []);
+
+  // 按 profile 分组：上游 prompt cache 按 profile 隔离，同 profile 的账号共享缓存。
+  // 只有一个 profile 时，会话在账号间换号不会丢缓存；多个 profile 才需要关心粘性路由。
+  const profileSummary = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const c of allCredentials) {
+      if (c.profileArn) counts.set(c.profileArn, (counts.get(c.profileArn) ?? 0) + 1);
+    }
+    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+  }, [allCredentials]);
+
+  // 判断后端是否已支持服务端分页（带分页/筛选参数时返回 filteredTotal）
+  const isServerPaginated = data?.filteredTotal !== undefined;
+
+  // 各状态计数（状态账条用）。优先采用后端全局统计，避免当前页数据被筛选/分页截断后账条失真。
+  const stateCounts = useMemo(() => {
+    if (data?.stateCounts) {
+      return {
+        healthy: data.stateCounts.healthy,
+        // 后端统计未单列「当前优先」，该字段仅用于旧版客户端兼容
+        current: 0,
+        throttled: data.stateCounts.throttled,
+        quota: data.stateCounts.quota,
+        dead: data.stateCounts.dead,
+        suspended: data.stateCounts.suspended ?? 0,
+        total: data.stateCounts.total,
+      };
+    }
+    return countByState(
+      data?.credentials ?? [],
+      (c) => balanceMap.get(c.id) ?? c.balance,
+    );
+  }, [data?.stateCounts, data?.credentials, balanceMap]);
+
+  // 当后端未分页时（如连接旧版后端），回退到前端内存筛选与排序
+  const clientFilteredCredentials = useMemo(() => {
+    if (isServerPaginated) return allCredentials;
     const all = allCredentials;
     let out = all;
     if (groupFilter) {
@@ -500,30 +583,31 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       });
     }
     return out;
-  }, [allCredentials, groupFilter, tierFilter, deferredSearchQuery, stateFilter, balanceMap, sortField, sortDir]);
-
-  // 各状态计数（状态账条用）。基于全量凭据而非当前筛选结果 ——
-  // 账条是导航器，点进某一段之后其余段的数字不该跟着变。
-  const stateCounts = countByState(
-    data?.credentials ?? [],
-    (c) => balanceMap.get(c.id) ?? c.balance,
-  );
+  }, [isServerPaginated, allCredentials, groupFilter, tierFilter, deferredSearchQuery, stateFilter, balanceMap, sortField, sortDir]);
 
   // 切换分组 / 分级筛选 / 搜索 / 状态 / 排序时复位到第 1 页，避免空页
   useEffect(() => {
     setCurrentPage(1);
   }, [groupFilter, tierFilter, deferredSearchQuery, stateFilter, sortField, sortDir]);
 
+  // 筛选后的总条数（用于分页计算）：服务端分页时取后端 filteredTotal
+  const totalFilteredCount = isServerPaginated
+    ? (data?.filteredTotal ?? data?.credentials?.length ?? 0) +
+      (import.meta.env.DEV ? 1 : 0)
+    : clientFilteredCredentials.length;
+
   // pageSize === 0 表示“全部”：单页容纳全部已筛选凭据
   const effectivePageSize =
-    pageSize === 0 ? Math.max(filteredCredentials.length, 1) : pageSize;
+    pageSize === 0 ? Math.max(totalFilteredCount, 1) : pageSize;
   const totalPages = Math.max(
     1,
-    Math.ceil(filteredCredentials.length / effectivePageSize),
+    Math.ceil(totalFilteredCount / effectivePageSize),
   );
   const startIndex = (currentPage - 1) * effectivePageSize;
   const endIndex = startIndex + effectivePageSize;
-  const serverPageCreds = filteredCredentials.slice(startIndex, endIndex);
+  const serverPageCreds = isServerPaginated
+    ? allCredentials
+    : clientFilteredCredentials.slice(startIndex, endIndex);
   // 拖拽排序的本地乐观顺序：仅当 id 集合与当前页一致时生效，否则回落到服务端顺序，
   // 避免翻页 / 数据变更后顺序错乱。
   const [pageOrder, setPageOrder] = useState<number[] | null>(null);
@@ -544,10 +628,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const currentPageAllSelected =
     currentPageIds.length > 0 &&
     currentPageIds.every((id) => selectedIds.has(id));
-  const allFilteredIds = filteredCredentials.map((c) => c.id);
+  const allFilteredIds = isServerPaginated
+    ? (selectedFilterIds ?? [])
+    : clientFilteredCredentials.map((c) => c.id);
   const allFilteredSelected =
-    allFilteredIds.length > 0 &&
+    allFilteredIds.length === totalFilteredCount && allFilteredIds.length > 0 &&
     allFilteredIds.every((id) => selectedIds.has(id));
+
+  useEffect(() => {
+    setSelectedFilterIds(null);
+  }, [groupFilter, tierFilter, deferredSearchQuery, stateFilter, totalFilteredCount]);
 
   // 翻页时清掉本地排序覆盖，回到服务端顺序
   useEffect(() => {
@@ -561,7 +651,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   // 字段排序开启时禁止拖拽调优先级（拖拽只在“手动顺序”下有意义）
   const dragDisabled = sortField !== "manual";
 
-  const handleDragEnd = (event: DragEndEvent) => {
+  const handleDragEnd = async (event: DragEndEvent) => {
     if (dragDisabled) return;
     const { active, over } = event;
     if (!over || active.id === over.id) return;
@@ -582,15 +672,31 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     //
     // 正确做法：只在这批被拖动的凭据**原本占据的那些全局槽位**里重新分配。
     // 隐藏的凭据一格都不动，可见的几个在自己已有的槽位之间换位。
-    const queue = [...(data?.credentials ?? [])].sort(
-      (a, b) => a.priority - b.priority || a.id - b.id,
-    );
+    const invertPriority = loadBalancingData?.invertPriority ?? false;
+    const requestedFilter = currentFilterSelectionKey.current;
+    let allCredentials: CredentialStatusItem[];
+    try {
+      allCredentials = (await getCredentials()).credentials;
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+      setPageOrder(null);
+      return;
+    }
+    if (requestedFilter !== currentFilterSelectionKey.current) {
+      setPageOrder(null);
+      toast.error("筛选条件已变化，请重新排序");
+      return;
+    }
+    const queue = [...allCredentials].sort((a, b) => {
+      const pDiff = invertPriority ? b.priority - a.priority : a.priority - b.priority;
+      return pDiff || a.id - b.id;
+    });
     const dragged = new Set(ids);
-    // 这些凭据当前占用的 priority 值，升序 —— 即可供重排的槽位
+    // 这些凭据当前占用的 priority 值（反转时降序，否则升序）—— 即可供重排的槽位
     const slots = queue
       .filter((c) => dragged.has(c.id))
       .map((c) => c.priority)
-      .sort((a, b) => a - b);
+      .sort((a, b) => (invertPriority ? b - a : a - b));
 
     const prevPriority = new Map(queue.map((c) => [c.id, c.priority]));
 
@@ -599,7 +705,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     // 这种情况下退回到"给整个队列重编号"：按当前全局顺序（已含本次拖动）写 0..n-1。
     // 写入量大一些，但只会在第一次拖拽时发生 —— 编号完成后各值互不相同，
     // 后续拖拽都走上面那条只动几格的轻路径。
-    const slotsUsable = slots.every((v, i) => i === 0 || v > slots[i - 1]);
+    const slotsUsable = invertPriority
+      ? slots.every((v, i) => i === 0 || v < slots[i - 1])
+      : slots.every((v, i) => i === 0 || v > slots[i - 1]);
 
     let updates: { id: number; priority: number }[];
     if (slotsUsable) {
@@ -610,7 +718,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       const globalOrder = queue.map((c) =>
         dragged.has(c.id) ? reordered.shift()! : c.id,
       );
-      updates = globalOrder.map((id, i) => ({ id, priority: i }));
+      updates = globalOrder.map((id, i) => ({
+        id,
+        priority: invertPriority ? globalOrder.length - 1 - i : i,
+      }));
     }
     updates = updates.filter(
       (u) => u.priority != null && prevPriority.get(u.id) !== u.priority,
@@ -684,9 +795,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const overageEnableableCount = overageStats.disabledOff;
   const overageRetryableCount = overageStats.disabledOff + overageStats.unknown;
 
+  // 当总页数变小（如删除凭据后）且当前页超出总页数时，自动修正到最后一页，
+  // 避免停留在空页触发反复请求的翻页循环。
   useEffect(() => {
-    setCurrentPage(1);
-  }, [data?.credentials.length]);
+    if (currentPage > totalPages) {
+      setCurrentPage(totalPages);
+    }
+  }, [currentPage, totalPages]);
 
   useEffect(() => {
     if (!data?.credentials) {
@@ -761,16 +876,28 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   /** 全选 / 取消全选所有筛选后的凭据（跨页） */
-  const toggleSelectAllFiltered = () => {
-    if (allFilteredSelected) {
-      // 取消：仅清除筛选范围内的，保留筛选范围外的已选项
-      setSelectedIds((prev) => {
-        const next = new Set(prev);
-        allFilteredIds.forEach((id) => next.delete(id));
+  const toggleSelectAllFiltered = async () => {
+    const requestedFilter = currentFilterSelectionKey.current;
+    setSelectingFiltered(true);
+    try {
+      const ids = isServerPaginated
+        ? (await getCredentials({ ...credentialQueryParams, page: undefined, pageSize: 0 })).credentials.map((credential) => credential.id)
+        : clientFilteredCredentials.map((credential) => credential.id);
+      if (currentFilterSelectionKey.current !== requestedFilter) {
+        toast.error("筛选条件已变化，请重新全选");
+        return;
+      }
+      setSelectedFilterIds(ids);
+      setSelectedIds((previous) => {
+        const next = new Set(previous);
+        const allSelected = ids.length > 0 && ids.every((id) => next.has(id));
+        ids.forEach((id) => allSelected ? next.delete(id) : next.add(id));
         return next;
       });
-    } else {
-      setSelectedIds(new Set(allFilteredIds));
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+    } finally {
+      setSelectingFiltered(false);
     }
   };
 
@@ -828,10 +955,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.error("请先选择要恢复的凭据");
       return;
     }
-    const failedIds = Array.from(selectedIds).filter((id) => {
-      const c = data?.credentials.find((x) => x.id === id);
-      return c && c.failureCount > 0;
-    });
+    let credentials: CredentialStatusItem[];
+    try {
+      credentials = (await getCredentials()).credentials;
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+      return;
+    }
+    const failedIds = credentials.filter((credential) => selectedIds.has(credential.id) && credential.failureCount > 0).map((credential) => credential.id);
     if (failedIds.length === 0) {
       toast.error("选中的凭据中没有失败的凭据");
       return;
@@ -864,10 +995,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.error("请先选择要刷新的凭据");
       return;
     }
-    const enabledIds = Array.from(selectedIds).filter((id) => {
-      const c = data?.credentials.find((x) => x.id === id);
-      return c && !c.disabled;
-    });
+    let credentials: CredentialStatusItem[];
+    try {
+      credentials = (await getCredentials()).credentials;
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+      return;
+    }
+    const enabledIds = credentials.filter((credential) => selectedIds.has(credential.id) && !credential.disabled).map((credential) => credential.id);
     if (enabledIds.length === 0) {
       toast.error("选中的凭据中没有启用的凭据");
       return;
@@ -893,11 +1028,18 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const handleClearAll = async () => {
-    if (!data?.credentials || data.credentials.length === 0) {
+    let credentials: CredentialStatusItem[];
+    try {
+      credentials = (await getCredentials()).credentials;
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+      return;
+    }
+    if (credentials.length === 0) {
       toast.error("没有可清除的凭据");
       return;
     }
-    const disabled = data.credentials.filter((c) => c.disabled);
+    const disabled = credentials.filter((credential) => credential.disabled);
     if (disabled.length === 0) {
       toast.error("没有可清除的已禁用凭据");
       return;
@@ -1174,6 +1316,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     } finally {
       setDisablingQuota(false);
     }
+  };
+
+  // 历史日志封号排查弹窗入口
+  const handleAuditSuspended = (targetIds?: number[]) => {
+    setAuditTargetIds(targetIds && targetIds.length > 0 ? targetIds : undefined);
+    setAuditDialogOpen(true);
   };
 
   // 一键开启超额：调用上游 setUserPreference 把所有"可开启且未开启"的凭据开启
@@ -1795,22 +1943,23 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   {currentPageAllSelected ? "取消全选" : "全选当前页"}
                 </Button>
               )}
-              {filteredCredentials.length > currentCredentials.length && (
+              {totalFilteredCount > currentCredentials.length && (
                 <Button
                   size="sm"
                   variant="outline"
                   className="w-full sm:w-auto"
                   onClick={toggleSelectAllFiltered}
+                  disabled={selectingFiltered}
                   title={
                     allFilteredSelected
                       ? "取消选择全部筛选结果"
-                      : `全选所有 ${filteredCredentials.length} 个筛选结果`
+                      : `全选所有 ${totalFilteredCount} 个筛选结果`
                   }
                 >
                   <CheckSquare className="h-3.5 w-3.5" />
                   {allFilteredSelected
                     ? "取消全选所有页"
-                    : `全选所有页 (${filteredCredentials.length})`}
+                    : `全选所有页 (${totalFilteredCount})`}
                 </Button>
               )}
 
@@ -1989,6 +2138,15 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     一键超额禁用 ({quotaExceededCount})
                   </DropdownMenuItem>
                   <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      handleAuditSuspended();
+                    }}
+                  >
+                    <ShieldAlert className="text-rose-500" />
+                    排查封禁账号
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
                     destructive
                     disabled={disabledCredentialCount === 0}
                     onSelect={(e) => {
@@ -2022,7 +2180,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           改哪个数字影响哪片区域。激活项的底边线用该状态的色轨色，与下方行的左侧色轨
           是同一个信号。
         */}
-        {(data?.credentials.length ?? 0) > 0 && (
+        {(data?.total ?? 0) > 0 && (
           <StatusStrip
             className="mb-2"
             segments={[
@@ -2061,10 +2219,18 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               {
                 label: "禁用",
                 count: stateCounts.dead,
-                tone: "dead",
+                tone: "disabled",
                 active: stateFilter === "dead",
                 onClick: () => setStateFilter("dead"),
-                hint: "鉴权失败 / 封禁 / 手动禁用，需要处置",
+                hint: "手动禁用 / 失败过多 / Token 失效，可尝试自愈或重置",
+              },
+              {
+                label: "封禁",
+                count: stateCounts.suspended,
+                tone: "banned",
+                active: stateFilter === "suspended",
+                onClick: () => setStateFilter("suspended"),
+                hint: "上游官方风控封号锁定（TEMPORARILY_SUSPENDED），不可自愈",
               },
             ]}
             trailing={
@@ -2093,7 +2259,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         )}
 
         {/* 列表 */}
-        {allCredentials.length === 0 ? (
+        {(data?.total ?? 0) === 0 ? (
           <Card>
             <CardContent className="py-16 text-center">
               <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
@@ -2104,34 +2270,142 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </p>
             </CardContent>
           </Card>
-        ) : filteredCredentials.length === 0 ? (
-          /*
-            有凭据但当前筛选下一个都不剩。默认筛「可用」时这很容易发生（全池超额
-            或全被禁用），此时说"暂无凭据，去添加"是假话 —— 凭据在，只是都不健康。
-            空态要说清真实情况，并给出下一步。
-          */
-          <Card>
-            <CardContent className="py-16 text-center">
-              <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
-                <Server className="h-5 w-5" />
-              </div>
-              <p className="text-sm text-muted-foreground">
-                {stateFilter === "healthy" && stateCounts.total > 0
-                  ? `${stateCounts.total} 个凭据里没有可用的：冷却 ${stateCounts.throttled} · 超额 ${stateCounts.quota} · 禁用 ${stateCounts.dead}`
-                  : "当前筛选条件下没有凭据"}
-              </p>
-              <Button
-                size="sm"
-                variant="outline"
-                className="mt-3"
-                onClick={clearAllFilters}
-              >
-                显示全部凭据
-              </Button>
-            </CardContent>
-          </Card>
+        ) : totalFilteredCount === 0 ? (
+          stateFilter === "suspended" ? (
+            <Card className="border-dashed border-rose-500/30 bg-rose-500/[0.02]">
+              <CardContent className="py-10 px-4 sm:px-6 max-w-lg mx-auto text-center space-y-3">
+                <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-rose-500/10 text-rose-500 border border-rose-500/20">
+                  <ShieldCheck className="h-6 w-6" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-foreground">暂无已被标记为封禁的凭据</h3>
+                  <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                    当前凭据池中未发现封禁账号。被标记为封禁的账号将自动隔离且绝不参与池自愈。你可以立即执行特征排查，扫描调用历史日志以检测并识别官方封禁凭据。
+                  </p>
+                </div>
+                <div className="text-left mt-2">
+                  <BanRulesTable
+                    customKeywords={banCustomKeywords}
+                    isDetectionEnabled={isBanDetectionEnabled}
+                    onNavigateToSettings={navigateToBanSettings}
+                  />
+                </div>
+                <div className="pt-2 flex flex-wrap items-center justify-center gap-2.5">
+                  <Button
+                    size="sm"
+                    className="bg-rose-600 hover:bg-rose-700 text-white font-medium gap-1.5 shadow-xs cursor-pointer"
+                    onClick={() => handleAuditSuspended()}
+                  >
+                    <ShieldX className="h-3.5 w-3.5" />
+                    立即排查封禁账号
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="cursor-pointer"
+                    onClick={clearAllFilters}
+                  >
+                    显示全部凭据
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          ) : (
+            /*
+              有凭据但当前筛选下一个都不剩。默认筛「可用」时这很容易发生（全池超额
+              或全被禁用），此时说"暂无凭据，去添加"是假话 —— 凭据在，只是都不健康。
+              空态要说清真实情况，并给出下一步。
+            */
+            <Card>
+              <CardContent className="py-16 text-center">
+                <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
+                  <Server className="h-5 w-5" />
+                </div>
+                <p className="text-sm text-muted-foreground">
+                  {stateFilter === "healthy" && stateCounts.total > 0
+                    ? `${stateCounts.total} 个凭据里没有可用的：冷却 ${stateCounts.throttled} · 超额 ${stateCounts.quota} · 禁用 ${stateCounts.dead} · 封禁 ${stateCounts.suspended}`
+                    : "当前筛选条件下没有凭据"}
+                </p>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="mt-3"
+                  onClick={clearAllFilters}
+                >
+                  显示全部凭据
+                </Button>
+              </CardContent>
+            </Card>
+          )
         ) : (
           <>
+            {/* 封禁状态下的治理面板：无论是否有封禁账号，只要处于封禁筛选状态均默认显示 */}
+            {stateFilter === "suspended" && (
+              <div className="mb-4 rounded-xl border border-rose-500/25 bg-rose-500/[0.03] p-3.5 sm:p-4 text-xs shadow-xs space-y-3">
+                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                  <div className="flex items-start gap-3 min-w-0">
+                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-rose-500/10 text-rose-500 border border-rose-500/20">
+                      <ShieldAlert className="h-4.5 w-4.5" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-semibold text-sm text-foreground">账号封禁治理</span>
+                        <Badge variant="outline" className="border-rose-500/30 bg-rose-500/10 text-rose-600 dark:text-rose-400 font-mono text-[11px] px-1.5 py-0.5">
+                          {stateCounts.suspended} 个已封禁
+                        </Badge>
+                        <span className="text-[11px] text-muted-foreground flex items-center gap-1">
+                          <span className="h-1.5 w-1.5 rounded-full bg-rose-500 inline-block" />
+                          已隔离防自愈
+                        </span>
+                      </div>
+                      <p className="text-muted-foreground mt-0.5 text-xs leading-relaxed">
+                        基于上游官方风控响应特征扫描历史请求日志并精准匹配，将命中账号标记为「账号封禁」并永久排除出自动自愈。
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8 px-2.5 text-xs gap-1.5 text-muted-foreground hover:text-foreground cursor-pointer"
+                      onClick={() => setShowBanRules((prev) => !prev)}
+                    >
+                      <Info className="h-3.5 w-3.5" />
+                      <span>{showBanRules ? "收起规则" : "治理规则"}</span>
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8 px-2.5 text-xs gap-1.5 text-muted-foreground hover:text-foreground cursor-pointer"
+                      onClick={navigateToBanSettings}
+                    >
+                      <SlidersHorizontal className="h-3.5 w-3.5" />
+                      <span>配置规则</span>
+                      <ExternalLink className="h-2.5 w-2.5 opacity-60" />
+                    </Button>
+                    <Button
+                      size="sm"
+                      className="h-8 px-3 text-xs gap-1.5 bg-rose-600 hover:bg-rose-700 text-white font-medium shadow-xs cursor-pointer"
+                      onClick={() => handleAuditSuspended()}
+                    >
+                      <ShieldX className="h-3.5 w-3.5" />
+                      排查封禁账号
+                    </Button>
+                  </div>
+                </div>
+
+                {showBanRules && (
+                  <div className="pt-2 border-t border-rose-500/15 animate-in fade-in-50 duration-200">
+                    <BanRulesTable
+                      customKeywords={banCustomKeywords}
+                      isDetectionEnabled={isBanDetectionEnabled}
+                      onNavigateToSettings={navigateToBanSettings}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
             <DndContext
               sensors={dragSensors}
               collisionDetection={closestCenter}
@@ -2237,6 +2511,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 恢复异常
               </Button>
               <Button
+                onClick={() => handleAuditSuspended(Array.from(selectedIds))}
+                size="sm"
+                variant="ghost"
+                className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent text-rose-500 hover:text-rose-600 dark:hover:text-rose-400"
+                title="通过历史请求日志排查选中的凭据是否被封号"
+              >
+                <ShieldX className="h-3.5 w-3.5" />
+                排查封禁
+              </Button>
+              <Button
                 onClick={handleBatchDelete}
                 size="sm"
                 variant="ghost"
@@ -2257,7 +2541,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </Button>
             </BulkBar>
 
-            {filteredCredentials.length > 0 && (
+            {totalFilteredCount > 0 && (
               <div className="mt-6 flex flex-col items-center justify-center gap-3 sm:mt-8 sm:flex-row sm:gap-5">
                 {/* 每页数量 */}
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -2290,7 +2574,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       variant="outline"
                       size="sm"
                       onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                      disabled={currentPage === 1}
+                      disabled={currentPage <= 1}
                     >
                       <ChevronLeft className="h-3.5 w-3.5" />
                       上一页
@@ -2302,7 +2586,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       </span>{" "}
                       / {totalPages} 页
                       <span className="mx-1.5 text-muted-foreground/50">·</span>
-                      共 {filteredCredentials.length} 个
+                      共 {totalFilteredCount} 个
                     </div>
                     <Button
                       variant="outline"
@@ -2310,7 +2594,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       onClick={() =>
                         setCurrentPage((p) => Math.min(totalPages, p + 1))
                       }
-                      disabled={currentPage === totalPages}
+                      disabled={currentPage >= totalPages}
                     >
                       下一页
                       <ChevronRight className="h-3.5 w-3.5" />
@@ -2393,6 +2677,22 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         <ImageUpdateDialog
           open={imageUpdateDialogOpen}
           onOpenChange={setImageUpdateDialogOpen}
+        />
+      )}
+
+      {auditDialogOpen && (
+        <AuditSuspendedDialog
+          open={auditDialogOpen}
+          onOpenChange={setAuditDialogOpen}
+          targetIds={auditTargetIds}
+          stateCounts={stateCounts}
+          credentials={allCredentials}
+          onSuccess={() => {
+            queryClient.invalidateQueries({ queryKey: ["credentials"] });
+          }}
+          onViewSuspended={() => {
+            setStateFilter("suspended");
+          }}
         />
       )}
 

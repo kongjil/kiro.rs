@@ -60,7 +60,7 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 - **请求链路追踪**：SQLite `traces.db`，记录成功 / 失败请求、尝试链路和错误类型。
 - 客户端 Key 分发：Admin 面板生成 `sk-...` Key，支持独立启停、轮换、分组和统计；鉴权不强制 Key 前缀。
 - **Admin UI**：概览、凭据管理、客户端 Key、请求日志四个主视图。
-- 代理能力：全局代理、凭据级代理、代理池、健康检查、轮询分配。
+- 代理能力：全局代理、凭据级代理、代理池、健康检查、轮询分配、在用代理自动检测与不可用时自动轮换。
 - **在线更新**：从 GitHub Release / Docker Hub 拉取新版本，支持镜像定时自动更新与手动回退。
 - **多平台发布**：GitHub Release 构建 Windows、Linux、macOS 和 Docker Hub 多架构镜像。
 
@@ -323,6 +323,9 @@ codex
 | `/api/admin/stats/*` | 用量统计 |
 | `/api/admin/traces` | 请求链路追踪查询 |
 | `/api/admin/proxy-pool` | 代理池 |
+| `/api/admin/proxy-pool/check-all` | 一轮完整巡检：检测在用代理、健康探测、凭据代理轮换 |
+| `/api/admin/proxy-pool/rotate` | 按当前代理池状态立即轮换凭据代理（不重新探测） |
+| `/api/admin/config/proxy-failover` | 代理自动轮换与直连回退开关 |
 | `/api/admin/config/*` | 运行时配置（含 `GET/PUT /api/admin/config/api-domain` 上游域名） |
 | `/api/admin/auth/*` | Social / IdC 登录流程 |
 | `/api/admin/system/update/*` | 在线更新、回退、版本检查 |
@@ -359,6 +362,7 @@ Admin API 鉴权同样支持：
 | `port` | `8080` | 监听端口。自动生成配置时为 `8990` |
 | `apiKey` | 无 | 配置的 `id=0` 系统 Key；可使用任意非空自定义值，不限制前缀。`/v1` 和 `/cc/v1` 也可使用 Admin 面板创建的客户端 Key |
 | `adminApiKey` | 无 | 设置后启用 `/admin` 和 `/api/admin` |
+| `balanceRefreshIntervalSecs` | `300` | 每轮后台余额刷新完成后的等待秒数；`0` 完全关闭后台余额刷新，仍支持面板/API 按需查询 |
 | `region` | `us-east-1` | 全局默认 Region |
 | `authRegion` | 无 | token 刷新用 Region，未配置时回退 `region` |
 | `apiRegion` | 无 | Kiro API 请求用 Region，未配置时回退 `region` |
@@ -367,6 +371,8 @@ Admin API 鉴权同样支持：
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
+| `proxyAutoRotateEnabled` | `true` | 是否自动检测凭据在用代理，并在代理不可用时轮换受影响的凭据 |
+| `proxyDirectFallbackEnabled` | `false` | 无可用代理时是否允许凭据临时回退直连 |
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
 | `accountThrottleFailover` | `true` | 账号级 429 是否冷却并切换凭据；覆盖 USER/CREDIT 请求限流和 suspicious activity |
 | `accountThrottleCooldownSecs` | `1800` | 账号级 429 限流冷却秒数 |
@@ -392,6 +398,50 @@ Admin API 鉴权同样支持：
 | `updateAutoApplyTime` | `03:00` | 自动更新时间，本地时区 `HH:MM` |
 
 非空的 `config.apiKey` 每次启动都会同步为不可删除、可轮换的系统 Key `id=0`。手动修改配置后，旧系统 Key 立即失效，新值自动启用；已有名称、描述、分组和累计统计会保留。Admin 面板新建或轮换的客户端 Key 统一以 `sk-` 开头，但请求鉴权不会对任何已存储 Key 强制检查前缀。`adminApiKey` 独立用于 Admin UI / Admin API 登录，不参与 `/v1` 业务流量鉴权。
+
+### 后台余额刷新
+
+启用 Admin API 后，默认在启动约 3 秒后执行首次余额刷新，随后每轮刷新完成后等待 300 秒再开始下一轮。可在 `config.json` 设置 `"balanceRefreshIntervalSecs": 1800`（30 分钟）或 `3600`（1 小时）；设为 `0` 时不创建后台任务，也不执行首次刷新。
+
+也支持环境变量 `KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS`：
+
+```bash
+KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS=1800 ./kiro-rs
+```
+
+优先级为 **`config.json` 显式值 > 环境变量 > 默认 300 秒**，修改后需重启。使用环境变量时请省略配置文件中的该字段（包括从 `config.example.json` 复制的值）。值必须是非负整数；配置文件类型错误或实际使用的环境变量值无效时，启动会报错，不会静默回退。
+
+间隔不包含每轮刷新耗时：一轮耗时 2 分钟、间隔设为 30 分钟时，相邻两轮开始时间约相隔 32 分钟。余额缓存 TTL 仍为 5 分钟，面板/API 按需查询和手动刷新不受影响。关闭后台余额刷新也会停止由该任务执行的 `quotaResetRecoveryEnabled` 月度额度恢复检查，不影响其它后台任务。
+
+### 额度阈值告警（飞书）
+
+在 Admin UI 的 **系统设置 → 额度告警** 中配置。单账号和账号池整体模式可分别启用，默认均关闭，阈值默认 `80, 90, 100`（每种模式可配置 1–10 档、1–100 的递增整数）。首次开启会检查最近完成且仍有效的刷新轮次，已达阈值的账号也会通知。
+
+**渠道与安全：** 创建[飞书自定义机器人](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot)，通过部署环境的安全注入机制设置 `KIRO_RS_FEISHU_WEBHOOK` 和可选的 `KIRO_RS_FEISHU_SECRET`，重启生效。仅接受飞书 / Lark 官方 HTTPS 机器人地址，拒绝重定向。面板也支持通过密码输入框临时更新渠道，**只保存在服务端内存**，重启后恢复环境变量值；留空保留原值，也可以显式清除。Webhook 和密钥不回显、不写入配置、数据库或应用日志。远程管理请使用 HTTPS；不要把敏感值放进命令参数、仓库或截图。机器人启用关键词校验时，请允许关键词 `Kiro`。
+
+**统计口径：**
+
+- 所有已禁用账号均排除；启用 overage 的账号仍正常参与。
+- 仅计算 CREDIT 项的订阅额度、有效试用和有效奖励额度及其对应消耗，不计超额付费额度。整体使用率为汇总已用 / 汇总额度，不平均账号百分比。
+- 消息包含触发账号或池整体信息、账号池概况、两组配置阈值并集的累计人数、overage 已开启和未知数量，并说明达到 100% 不一定无法继续使用。
+- 只使用同一完整后台刷新轮次的结果；失败不会复用旧缓存充当本轮成功。缺失、失败、过期、额度无效均单独列出；存在此类账号时暂停整体判断，正常账号仍可触发单账号告警。
+- 默认数据有效期为 900 秒，可在面板调整。大型账号池应覆盖整轮查询耗时；调大刷新间隔后也应按需调整。没有可靠下次重置时间的账号标记“周期未知”，参与有效池统计，但暂停其单账号告警；不会猜测月份作为额度周期。消息的重置时间为 UTC+8，面板时间使用浏览器本地时区。
+
+**发送与去重：**
+
+- 复用后台余额刷新，轮次结束后提交给独立发送任务；不会等待飞书网络响应，不阻塞模型请求。关闭 `balanceRefreshIntervalSecs` 时自动告警也停止，测试发送仍可使用；手动单账号余额查询不触发告警。
+- 单账号以“凭据 ID + 上游下次重置时间 + 阈值”去重；一次跨越多档只发送最高档，并覆盖低档。已确认发送的状态跨重启保留，额度周期变化后可再次通知。
+- 整体告警只在未覆盖的阈值被达到时发送；完整数据确认回落后重新允许跨越，默认全池冷却 3600 秒。冷却内的新跨越若仍持续，会在冷却后的完整轮次发送；持续高位不会重复通知，数据不完整也不会被误当作回落。
+- 单次 HTTP 超时 10 秒，网络错误、429、5xx 等最多尝试 3 次；签名等业务错误不会盲目重试。只有 HTTP 成功且飞书业务码为 0 才记为成功。失败保留档位供后续轮次重试，并展示最近结果。测试在后台发送，不消耗告警档位。
+- 请求超时或“已投递、落盘前崩溃”仍可能重复投递，不能保证 exactly-once。若持久化损坏或写入失败，停止自动发送并明确报错，不静默清空去重状态；修复存储后重启。
+
+设置、去重状态、池冷却及最近发送结果保存在凭据目录的 `quota_alerts.db`（SQLite，包含 WAL 边车文件），部署时须持久化该目录。**多副本请仅指定一个通知实例**：其它副本设置 `KIRO_RS_QUOTA_ALERT_NOTIFIER=false`（或 `0`）；默认 `true`。本实现不提供跨进程选主，不应让多个通知实例共用同一个状态文件。
+
+Admin API（均使用现有 Admin 鉴权）：
+
+- `GET /api/admin/config/quota-alerts`：脱敏配置、完整轮次统计、异常账号及最近发送结果。
+- `PUT /api/admin/config/quota-alerts`：完整 `settings` 对象（`account`、`pool` 各含 `enabled`、`thresholds`；以及 `poolCooldownSecs`、`maxDataAgeSecs`）；可选只写字段 `webhook`、`signingSecret` 为内存覆盖，省略保留、空字符串清除。
+- `POST /api/admin/config/quota-alerts/test`：排队发送测试，返回 `202`；通过 GET 查看最终结果。已有发送任务时返回 `429`。
 
 <a id="credentials"></a>
 ## 🔐 凭据
@@ -519,6 +569,8 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `email` / `subscriptionTitle` | Admin 查询后回填的展示信息 |
 | `proxyUrl` | 凭据级代理；填 `direct` 表示绕过全局代理 |
 | `proxyUsername` / `proxyPassword` | 凭据级代理认证 |
+| `proxyAutoAssigned` | 当前代理状态是否由自动轮换设置；由程序维护，手动改代理时清除 |
+| `proxyTemporaryDirect` | 是否因代理不可用而临时直连；保留原代理及认证，恢复后自动切回 |
 | `disabled` | 是否禁用 |
 | `kiroApiKey` | `ksk_*` Kiro API Key |
 | `endpoint` | `ide` 或 `cli`，未填使用 `config.defaultEndpoint` |
@@ -540,7 +592,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 - `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`：`1_000_000`（静态模型声明最大输出为 `64_000`）
 - 其它 `gpt-5.*`：`272_000`
-- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-sonnet-5.5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-opus-5.5`、`claude-fable-5`：`1_000_000`
+- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-sonnet-5.5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-opus-5.5`、`claude-haiku-5.5`、`claude-fable-5`：`1_000_000`
 - 其它模型：`200_000`
 
 ### 自定义模型
@@ -630,6 +682,16 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 - 如果当前请求没有启用 thinking，明文 reasoning 会降级为普通 text；签名和 redacted 内容不会输出。
 
 非流式响应优先使用原生 reasoning 事件；只有没有原生 reasoning 时，才回退到旧的 `<thinking>...</thinking>` 文本提取路径。
+
+结束原因优先采用上游 `metadataEvent.stopReason`。只有 thinking 的响应不会被自动改写成 `max_tokens`，也不会补造空格正文；真实的输出上限仍按上游事件报告。
+
+上游返回 `CONTENT_FILTERED` 时按拒答处理：Anthropic 响应 `stop_reason` 为 `refusal`（Chat Completions 为 `content_filter`，Responses 为 `incomplete`）。它表示 Kiro 上游终止了生成，不表示客户端用完了输出 Token，也不会被后续的 `max_tokens` 或上下文窗口事件覆盖。
+
+### 结构化输出（`output_config.format`）
+
+Kiro 上游没有原生的结构化输出字段，因此 `output_config.format = {"type":"json_schema","schema":{...}}` 通过「提示词注入 + 响应提取」实现（`/v1/messages`、`/cc/v1/messages`）：schema 以系统提示追加到请求末尾，响应中最后一个合法且符合 schema 的 JSON 会替换 text 内容（模型通常先说明理由再给结论）（校验支持 `type`、`required`、`properties`、`additionalProperties`、`enum`、`const`、`items`、`anyOf`/`oneOf`/`allOf`、本地 `$ref`，其它关键字忽略）。该模式下流式响应会缓冲到结束后再一次性输出；找不到合规 JSON 时原样返回并记录一条不含内容的 warn。`format` 不会转发给 Kiro；未带 `format` 的请求行为不变。暂不覆盖 Chat Completions / Responses 适配层和 web_search（含混合工具循环），带 web_search 工具时原样返回并记录一条 warn。`/v1/messages/count_tokens` 带同样的 `output_config.format` 时，估算会包含注入的 schema 指令。
+
+结构化输出的校验最多执行 100,000 步；超限后停止提取，并返回此前已找到的合规值，若没有则保留原始回复并记录告警。
 
 ### Tool Use
 
@@ -860,6 +922,32 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - `https://host:port`
 - `socks5://host:port`
 
+### 代理自动检测与轮换
+
+代理池巡检每 5 分钟执行一轮，也可在代理池弹窗点「全部检测」手动触发。一轮巡检包含三步：
+
+1. **自动检测**：把凭据实际在用、但未登记到代理池的代理（含全局代理）登记进池，标记为
+   `autoDetected`，纳入后续探测范围。未登记的代理没有探测记录，不会被判定为不可用。
+2. **健康探测**：并发探测所有已启用条目，以及此前被自动禁用的条目。连续失败达 3 次的
+   代理自动禁用；自动禁用的代理恢复连通后自动重新启用。手动禁用的条目不参与探测，
+   也不会被自动启用。
+3. **自动轮换**：使用被判定不可用代理的凭据改用池内其它可用代理。已禁用的凭据不
+   参与调度，因此跳过不轮换。
+
+自动发现的代理按其实际认证信息分别探测；认证信息只保存在运行时，不复制到代理池文件。
+自动发现且需要认证的代理只用于其原有凭据，不会作为可分配代理复制给其他凭据；若要共享，
+请在代理池中显式配置可共享的代理。
+
+`proxyAutoRotateEnabled` 关闭时只做探测，不改写任何凭据。
+
+无可用代理时的行为由 `proxyDirectFallbackEnabled` 决定：
+
+- `false`（默认）：凭据保持原代理配置，请求继续失败直至代理恢复，避免真实出口 IP 意外暴露。
+- `true`：凭据临时直连并保留原代理配置及认证；原代理恢复或池内出现其它可用代理后自动改回代理。管理页面会标记临时直连状态。
+
+手动修改某个凭据的代理会清除自动轮换标记，此后自动轮换不再回收改写该凭据，直到它的
+代理再次被判定不可用。
+
 如果 `rustls` 环境下代理或证书行为异常，可以在 `config.json` 中切到：
 
 ```json
@@ -897,7 +985,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 构建并推送 Docker Hub 多架构镜像。
 - 创建 GitHub Release。
 
-当前稳定版：[v0.9.3](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.9.3)。
+当前稳定版：[v0.9.4](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.9.4)。
 
 Docker 镜像：
 

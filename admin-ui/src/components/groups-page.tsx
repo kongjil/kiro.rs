@@ -1,11 +1,15 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useState, useEffect, useDeferredValue } from 'react'
 import { toast } from 'sonner'
 import {
   Plus, FolderTree, Trash2, Pencil, Users, KeyRound, RefreshCw, Loader2,
+  Search, X, ChevronLeft, ChevronRight,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
 } from '@/components/ui/dialog'
@@ -13,8 +17,9 @@ import {
   useGroups, useCreateGroup, useUpdateGroup, useDeleteGroup,
 } from '@/hooks/use-groups'
 import { useConfirm } from '@/components/ui/confirm-dialog'
+import { listGroups } from '@/api/groups'
 import { extractErrorMessage } from '@/lib/utils'
-import type { GroupItem } from '@/types/api'
+import type { GroupItem, GroupQueryParams } from '@/types/api'
 import { ConsoleTable, type ConsoleColumn } from '@/components/console/data-table'
 import { BulkBar } from '@/components/console/bulk-bar'
 import { PageHeader } from '@/components/console/page-header'
@@ -28,8 +33,99 @@ import { PageHeader } from '@/components/console/page-header'
  * - 改名走级联（后端自动同步所有引用）
  * - 单项删除与批量删除均做引用前置检查
  */
+type DispatchMode = 'inherit' | 'priority' | 'balanced'
+type InvertMode = 'inherit' | 'on' | 'off'
+
+/** 分组级调度策略：负载均衡模式与优先级方向，三态（跟随全局 / 覆盖） */
+function DispatchModeFields({
+  dispatchMode,
+  onDispatchModeChange,
+  invertMode,
+  onInvertModeChange,
+  disabled,
+}: {
+  dispatchMode: DispatchMode
+  onDispatchModeChange: (mode: DispatchMode) => void
+  invertMode: InvertMode
+  onInvertModeChange: (mode: InvertMode) => void
+  disabled?: boolean
+}) {
+  const dispatchOptions: { value: DispatchMode; label: string }[] = [
+    { value: 'inherit', label: '跟随全局' },
+    { value: 'priority', label: '优先级' },
+    { value: 'balanced', label: '负载均衡' },
+  ]
+  const invertOptions: { value: InvertMode; label: string }[] = [
+    { value: 'inherit', label: '跟随全局' },
+    { value: 'off', label: '数字小优先' },
+    { value: 'on', label: '数字大优先' },
+  ]
+  return (
+    <div className="space-y-2 border-t pt-2">
+      <div className="space-y-1">
+        <label className="text-sm font-medium">调度策略</label>
+        <div className="grid grid-cols-3 gap-2">
+          {dispatchOptions.map((opt) => (
+            <Button
+              key={opt.value}
+              type="button"
+              size="sm"
+              variant={dispatchMode === opt.value ? 'default' : 'outline'}
+              className="text-xs"
+              disabled={disabled}
+              onClick={() => onDispatchModeChange(opt.value)}
+            >
+              {opt.label}
+            </Button>
+          ))}
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          {dispatchMode === 'inherit' && '沿用全局设置中的负载均衡模式。'}
+          {dispatchMode === 'priority' && '按优先级顺序耗尽：先用完高优先级账号再切下一个。'}
+          {dispatchMode === 'balanced' && '按负载因子加权平滑轮询，额度消耗更均匀。'}
+        </p>
+      </div>
+      {dispatchMode !== 'balanced' && (
+        <div className="space-y-1 pl-0.5">
+          <label className="text-xs font-medium text-muted-foreground">优先级方向</label>
+          <div className="grid grid-cols-3 gap-2">
+            {invertOptions.map((opt) => (
+              <Button
+                key={opt.value}
+                type="button"
+                size="sm"
+                variant={invertMode === opt.value ? 'secondary' : 'ghost'}
+                className="h-7 text-xs"
+                disabled={disabled}
+                onClick={() => onInvertModeChange(opt.value)}
+              >
+                {opt.label}
+              </Button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function GroupsPage() {
-  const { data, isLoading, isFetching, refetch } = useGroups()
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState<number>(10)
+  const [searchQuery, setSearchQuery] = useState('')
+  const deferredSearch = useDeferredValue(searchQuery)
+
+  useEffect(() => {
+    setPage(1)
+  }, [deferredSearch])
+
+  const groupQueryParams = useMemo<GroupQueryParams>(() => ({
+    page,
+    pageSize: pageSize === 0 ? 0 : pageSize,
+    search: deferredSearch.trim() || undefined,
+  }), [page, pageSize, deferredSearch])
+
+  const { data, isLoading, isFetching, refetch } = useGroups(groupQueryParams)
   const createGroup = useCreateGroup()
   const updateGroup = useUpdateGroup()
   const deleteGroup = useDeleteGroup()
@@ -39,19 +135,56 @@ export function GroupsPage() {
   const [createOpen, setCreateOpen] = useState(false)
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
+  // 分组级调度策略：'inherit' 跟随全局，其余为分组独立覆盖
+  const [createDispatchMode, setCreateDispatchMode] = useState<'inherit' | 'priority' | 'balanced'>('inherit')
+  const [createInvertMode, setCreateInvertMode] = useState<'inherit' | 'on' | 'off'>('inherit')
 
   const [editOpen, setEditOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<GroupItem | null>(null)
   const [editNewName, setEditNewName] = useState('')
   const [editDesc, setEditDesc] = useState('')
+  const [editDispatchMode, setEditDispatchMode] = useState<'inherit' | 'priority' | 'balanced'>('inherit')
+  const [editInvertMode, setEditInvertMode] = useState<'inherit' | 'on' | 'off'>('inherit')
   const [batchDeleting, setBatchDeleting] = useState(false)
   const [deleteProgress, setDeleteProgress] = useState<{ current: number; total: number } | null>(null)
 
-  const groups = useMemo(() => data?.groups ?? [], [data?.groups])
+  const isServerPaginated = data?.filteredTotal !== undefined
+
+  const clientFilteredGroups = useMemo(() => {
+    if (isServerPaginated) return data?.groups ?? []
+    let list = data?.groups ?? []
+    const q = deferredSearch.trim().toLowerCase()
+    if (q) {
+      list = list.filter((g) =>
+        g.name.toLowerCase().includes(q) ||
+        (g.description?.toLowerCase().includes(q) ?? false)
+      )
+    }
+    return list
+  }, [isServerPaginated, data?.groups, deferredSearch])
+
+  const totalFilteredCount = isServerPaginated
+    ? (data?.filteredTotal ?? data?.groups?.length ?? 0)
+    : clientFilteredGroups.length
+
+  const effectivePageSize = pageSize === 0 ? Math.max(totalFilteredCount, 1) : pageSize
+  const totalPages = Math.max(1, Math.ceil(totalFilteredCount / effectivePageSize))
+
+  useEffect(() => {
+    if (data && page > totalPages) setPage(totalPages)
+  }, [data, page, totalPages])
+
+  const groups = useMemo(() => {
+    if (isServerPaginated) return data?.groups ?? []
+    const start = (page - 1) * effectivePageSize
+    return clientFilteredGroups.slice(start, start + effectivePageSize)
+  }, [isServerPaginated, data?.groups, clientFilteredGroups, page, effectivePageSize])
 
   const openCreate = () => {
     setCreateName('')
     setCreateDesc('')
+    setCreateDispatchMode('inherit')
+    setCreateInvertMode('inherit')
     setCreateOpen(true)
   }
 
@@ -65,6 +198,10 @@ export function GroupsPage() {
       await createGroup.mutateAsync({
         name,
         description: createDesc.trim() || undefined,
+        loadBalancingMode:
+          createDispatchMode === 'inherit' ? undefined : createDispatchMode,
+        invertPriority:
+          createInvertMode === 'inherit' ? undefined : createInvertMode === 'on',
       })
       toast.success(`已创建分组：${name}`)
       setCreateOpen(false)
@@ -77,6 +214,10 @@ export function GroupsPage() {
     setEditTarget(g)
     setEditNewName(g.name)
     setEditDesc(g.description ?? '')
+    setEditDispatchMode(g.loadBalancingMode ?? 'inherit')
+    setEditInvertMode(
+      g.invertPriority == null ? 'inherit' : g.invertPriority ? 'on' : 'off',
+    )
     setEditOpen(true)
   }
 
@@ -93,6 +234,12 @@ export function GroupsPage() {
         req: {
           newName: newName !== editTarget.name ? newName : undefined,
           description: editDesc, // 空字符串 → 后端清空
+          loadBalancingMode:
+            editDispatchMode === 'inherit' ? undefined : editDispatchMode,
+          resetLoadBalancingMode: editDispatchMode === 'inherit' ? true : undefined,
+          invertPriority:
+            editInvertMode === 'inherit' ? undefined : editInvertMode === 'on',
+          resetInvertPriority: editInvertMode === 'inherit' ? true : undefined,
         },
       })
       const renamed = newName !== editTarget.name
@@ -150,7 +297,13 @@ export function GroupsPage() {
   const handleBatchDelete = async () => {
     if (selectedNames.size === 0) return
     const names = Array.from(selectedNames) as string[]
-    const selectedGroups = groups.filter((g) => selectedNames.has(g.name))
+    let selectedGroups: GroupItem[]
+    try {
+      selectedGroups = (await listGroups()).groups.filter((group) => selectedNames.has(group.name))
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+      return
+    }
     const referencedGroups = selectedGroups.filter(
       (g) => g.credentialCount > 0 || g.clientKeyCount > 0,
     )
@@ -248,6 +401,39 @@ export function GroupsPage() {
         ),
       },
       {
+        id: 'dispatch',
+        header: '调度策略',
+        cell: (g) => {
+          if (g.loadBalancingMode == null && g.invertPriority == null) {
+            return <span className="text-xs text-muted-foreground">跟随全局</span>
+          }
+          return (
+            <div className="flex flex-col items-start gap-1">
+              {g.loadBalancingMode != null ? (
+                <Badge
+                  variant="outline"
+                  className="border-sky-500/40 bg-sky-500/10 font-normal text-sky-600"
+                  title={
+                    g.loadBalancingMode === 'balanced'
+                      ? '按负载因子加权平滑轮询'
+                      : '按优先级顺序耗尽'
+                  }
+                >
+                  {g.loadBalancingMode === 'balanced' ? '负载均衡' : '优先级'}
+                </Badge>
+              ) : (
+                <span className="text-[11px] text-muted-foreground">模式随全局</span>
+              )}
+              {g.invertPriority != null && (
+                <span className="text-[11px] text-muted-foreground">
+                  {g.invertPriority ? '数字大优先' : '数字小优先'}
+                </span>
+              )}
+            </div>
+          )
+        },
+      },
+      {
         id: 'createdAt',
         header: '创建时间',
         cell: (g) => (
@@ -314,17 +500,100 @@ export function GroupsPage() {
         }
       />
 
-      <ConsoleTable
-        rows={groups}
-        columns={columns}
-        rowKey={(g) => g.name}
-        selectable
-        selected={selectedNames}
-        onSelectedChange={setSelectedNames}
-        rowActions={rowActions}
-        loading={isLoading}
-        empty="暂无分组。点击右上角「新建分组」开始。"
-      />
+      <div className="space-y-3">
+        {/* 搜索工具栏 */}
+        <div className="flex items-center justify-between gap-2.5 rounded-lg border bg-card/50 p-2.5">
+          <div className="relative flex-1 max-w-sm">
+            <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="搜索分组名称 / 备注..."
+              className="h-8 pl-8 pr-8 text-xs"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        <ConsoleTable
+          rows={groups}
+          columns={columns}
+          rowKey={(g) => g.name}
+          selectable
+          selected={selectedNames}
+          onSelectedChange={setSelectedNames}
+          rowActions={rowActions}
+          loading={isLoading}
+          empty={
+            deferredSearch
+              ? '当前筛选条件下没有分组。'
+              : '暂无分组。点击右上角「新建分组」开始。'
+          }
+        />
+
+        {/* 分页控制栏 */}
+        {totalFilteredCount > 0 && (
+          <div className="flex flex-col items-center justify-between gap-3 pt-2 sm:flex-row">
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <span>每页</span>
+              <Select
+                value={String(pageSize)}
+                onValueChange={(v) => {
+                  setPageSize(Number(v))
+                  setPage(1)
+                }}
+              >
+                <SelectTrigger className="h-7 w-[75px] text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="10">10</SelectItem>
+                  <SelectItem value="20">20</SelectItem>
+                  <SelectItem value="50">50</SelectItem>
+                  <SelectItem value="0">全部</SelectItem>
+                </SelectContent>
+              </Select>
+              <span>条 · 共 {totalFilteredCount} 个分组</span>
+            </div>
+
+            {totalPages > 1 && (
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  disabled={page <= 1}
+                >
+                  <ChevronLeft className="h-3.5 w-3.5 mr-1" />
+                  上一页
+                </Button>
+                <span className="text-xs text-muted-foreground tabular-nums">
+                  第 {page} / {totalPages} 页
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={page >= totalPages}
+                >
+                  下一页
+                  <ChevronRight className="h-3.5 w-3.5 ml-1" />
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* 吸底批量操作栏 */}
       <BulkBar
@@ -383,6 +652,13 @@ export function GroupsPage() {
                   disabled={createGroup.isPending}
                 />
               </div>
+              <DispatchModeFields
+                dispatchMode={createDispatchMode}
+                onDispatchModeChange={setCreateDispatchMode}
+                invertMode={createInvertMode}
+                onInvertModeChange={setCreateInvertMode}
+                disabled={createGroup.isPending}
+              />
             </div>
             <DialogFooter>
               <Button variant="outline" onClick={() => setCreateOpen(false)} disabled={createGroup.isPending}>
@@ -424,6 +700,13 @@ export function GroupsPage() {
                   disabled={updateGroup.isPending}
                 />
               </div>
+              <DispatchModeFields
+                dispatchMode={editDispatchMode}
+                onDispatchModeChange={setEditDispatchMode}
+                invertMode={editInvertMode}
+                onInvertModeChange={setEditInvertMode}
+                disabled={updateGroup.isPending}
+              />
               {editTarget && (editTarget.credentialCount > 0 || editTarget.clientKeyCount > 0) && (
                 <p className="text-xs text-amber-600">
                   当前被 {editTarget.credentialCount} 凭据 + {editTarget.clientKeyCount} 客户端 Key 引用，改名会自动同步。
